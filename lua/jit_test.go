@@ -853,6 +853,19 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  -- a[100] is nil: the kernel leaves at the read, with sqrt in its register
 			  return roots(99), pcall(roots, 100)
 			end`},
+		{"an integer constant clamps a float", "int", `
+			function run()
+			  local a, out = f64, f32
+			  for i = 0, 99 do a[i] = i * 0.03 end
+			  for i = 0, 99 do local v = a[i] * 1.5; if v > 1 then v = 1 end; out[i] = v end
+			  return out[5], out[99]
+			end`},
+		{"an integer constant times an integer stays an integer", "", `
+			function run()
+			  local out = f64
+			  for i = 0, 9 do local v = i * 0.5; if v > 2 then v = 3 end; out[i] = v * 2 end
+			  return out[1], out[9]
+			end`},
 		{"float into an integer buffer", "int", `
 			function run()
 			  local i32 = i32

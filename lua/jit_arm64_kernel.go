@@ -508,9 +508,13 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 		}
 	case bytecode.OpLoadConstant:
 		o, _ := c.constant(i.Bx())
-		if isInt {
+		switch v := p.Constants[i.Bx()]; {
+		case isInt:
 			a.Ldr(k.ireg(i.A()), o.base, o.off+offN)
-		} else {
+		case v.isInteger(): // promoted: see promoteConstants
+			a.MovImm(rTmp, math.Float64bits(float64(v.i())))
+			a.FmovToF(k.reg(i.A()), rTmp)
+		default:
 			a.LdrD(k.reg(i.A()), o.base, o.off+offN)
 		}
 	case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv:

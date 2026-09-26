@@ -67,6 +67,11 @@ type kernelPlan struct {
 	bufUses []bufUse    // GETTABLE and SETTABLE pcs, resolved after typing
 	bufFrom map[int]int // a buffer access's hoisted slot, or -1 for a register
 
+	// LOADK pcs of integer constants the kernel loads as floats, which no
+	// use can tell apart, provided the fields in needFloat are floats.
+	promoted  map[int]bool
+	needFloat [][2]int // pc and RK field
+
 	// A register may hold an integer at one pc and a float at another, as
 	// Lua reuses registers for temporaries: at gives each register's type
 	// before each body pc and at the latch, results the type each body
@@ -317,8 +322,14 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			k.types[r] = kindAny // decided by inferTypes
 		}
 	}
+	entry := maps.Clone(k.types)
 	if !k.inferTypes(p) {
-		return nil
+		// Perhaps only because an integer constant meets floats, as in
+		// `if v > 1 then v = 1 end` on a float v.
+		k.types = entry
+		if !k.promoteConstants(p, base) || !k.inferTypes(p) || !k.promotionsHold(p) {
+			return nil
+		}
 	}
 	// Each buffer access reads an upvalue's buffer, which its register
 	// aliases there, or a register's.
@@ -375,6 +386,107 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 		return nil
 	}
 	return k
+}
+
+// promoteConstants marks the body's LOADKs of integer constants that
+// convert to floats exactly, into a body register, whose value no use can
+// tell from the float: until the register is written again, every use
+// stores it into a buffer (which converts it either way), divides by it
+// or into it, or adds, subtracts, multiplies or compares it with a float,
+// which needFloat records for promotionsHold to check once typed. It
+// reports whether it marked any.
+func (k *kernelPlan) promoteConstants(p *prototype, base int) bool {
+	code := p.Code
+	k.promoted = map[int]bool{}
+	for ip := k.start; ip < k.latch; ip++ {
+		i := code[ip]
+		if i.OpCode() != bytecode.OpLoadConstant || i.A() <= base+3 || slices.Contains(k.liveIn, i.A()) {
+			continue
+		}
+		if v := p.Constants[i.Bx()]; !v.isInteger() || !exactFloat(v.i()) {
+			continue
+		}
+		if needs, ok := k.floatUses(p, ip, i.A()); ok {
+			k.promoted[ip] = true
+			k.needFloat = append(k.needFloat, needs...)
+		}
+	}
+	return len(k.promoted) > 0
+}
+
+// floatUses follows the body from after ip until register r is written
+// again, and returns the fields each use needs to be floats for a float
+// in r to act as the integer would, or false for a use that could tell.
+func (k *kernelPlan) floatUses(p *prototype, ip, r int) ([][2]int, bool) {
+	code := p.Code
+	var needs [][2]int
+	seen := map[int]bool{}
+	work := []int{ip + 1}
+	for len(work) > 0 {
+		j := work[len(work)-1]
+		work = work[:len(work)-1]
+		if j >= k.latch || seen[j] {
+			continue // at the latch r is dead: not live in
+		}
+		seen[j] = true
+		i := code[j]
+		reads := func(f int) bool { return !bytecode.IsConstant(f) && f == r }
+		switch op := i.OpCode(); op {
+		case bytecode.OpSetTable, bytecode.OpSetTableUp:
+			if reads(i.B()) || op == bytecode.OpSetTable && i.A() == r {
+				return nil, false
+			}
+		case bytecode.OpDiv:
+		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul,
+			bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
+			switch {
+			case reads(i.B()) && reads(i.C()):
+				return nil, false
+			case reads(i.B()):
+				needs = append(needs, [2]int{j, i.C()})
+			case reads(i.C()):
+				needs = append(needs, [2]int{j, i.B()})
+			}
+		case bytecode.OpMove, bytecode.OpUnaryMinus, bytecode.OpMod, bytecode.OpIDiv,
+			bytecode.OpGetTable, bytecode.OpGetTableUp:
+			if reads(i.B()) || op != bytecode.OpMove && op != bytecode.OpUnaryMinus && reads(i.C()) {
+				return nil, false
+			}
+		case bytecode.OpCall:
+			if i.A()+1 == r {
+				return nil, false
+			}
+		}
+		// The next pcs, unless this one writes r.
+		switch i.OpCode() {
+		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
+			t, _ := kernelJump(code, j, k.latch)
+			work = append(work, j+2, t)
+			continue
+		case bytecode.OpJump:
+			t, _ := kernelJump(code, j, k.latch)
+			work = append(work, t)
+			continue
+		case bytecode.OpSetTable, bytecode.OpSetTableUp:
+		default:
+			if i.A() == r {
+				continue
+			}
+		}
+		work = append(work, j+1)
+	}
+	return needs, true
+}
+
+// promotionsHold reports whether the fields promoteConstants needs to be
+// floats are.
+func (k *kernelPlan) promotionsHold(p *prototype) bool {
+	for _, n := range k.needFloat {
+		if k.kind(p, n[0], n[1]) != kindFloat {
+			return false
+		}
+	}
+	return true
 }
 
 // hoist returns upvalue n's slot in jitContext.hoist, adding it, or -1
@@ -669,6 +781,9 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 			}
 		default:
 			t, ok := result(p, i, cur)
+			if k.promoted[ip] {
+				t = kindFloat
+			}
 			if !ok {
 				return nil, nil, false
 			}

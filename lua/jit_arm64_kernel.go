@@ -201,6 +201,11 @@ func (c *arm64Compiler) kernelSideExit(k *kernel, ip int) Label {
 	c.outOfLine = append(c.outOfLine, func() {
 		a.Bind(l)
 		c.flush(k, k.at[ip-k.start])
+		for _, kc := range k.calleesAt(ip) { // after the flush: it uses kernel registers
+			c.upValueAddr(kc.upValue)
+			c.load(operand{rAddr, 0})
+			c.store(reg(kc.a))
+		}
 		a.B(c.pcs[ip])
 	})
 	return l

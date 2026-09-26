@@ -82,6 +82,20 @@ type kernelPlan struct {
 type kernelCall struct {
 	upValue int
 	fn      uint64
+	get, a  int // the GETUPVAL's pc, and the register it and the CALL name
+}
+
+// calleesAt returns the intrinsic calls whose callee register the
+// ordinary code expects to hold the function at body pc ip: after their
+// GETUPVAL, up to their CALL. A side exit there stores it.
+func (k *kernelPlan) calleesAt(ip int) []kernelCall {
+	var out []kernelCall
+	for call, kc := range k.calls {
+		if kc.get < ip && ip <= call {
+			out = append(out, kc)
+		}
+	}
+	return out
 }
 
 // hoistedUpValue is an upvalue a kernel reads: a number of kind, or a
@@ -237,7 +251,7 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			// kernel loads on entry.
 			if call, ok := intrinsicCall(code, ip, start, latch); ok {
 				if fn, isIntrinsic := intrinsic(i.B()); isIntrinsic {
-					k.calls[call] = kernelCall{upValue: i.B(), fn: fn}
+					k.calls[call] = kernelCall{upValue: i.B(), fn: fn, get: ip, a: i.A()}
 					k.virtual[ip] = true
 					break
 				}
@@ -419,9 +433,10 @@ func upValueKind(cl *luaClosure, n int) (numKind, bool) {
 }
 
 // intrinsicCall returns the pc of the CALL A 2 2 that the GETUPVAL A at ip
-// feeds, when only arithmetic that leaves A alone lies between them, and no
-// jump in the body lands there: nothing between can leave the kernel while
-// A holds the function only in the frame.
+// feeds, when only arithmetic, upvalue loads and buffer reads that leave A
+// alone lie between them, and no jump in the body lands there. A buffer
+// read may leave the kernel; its side exit stores the function in A
+// (calleesAt), as the GETUPVAL would have.
 func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, bool) {
 	a := code[ip].A()
 	for j := ip + 1; j < latch; j++ {
@@ -438,8 +453,12 @@ func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, bool
 			if i.A() == a || i.B() == a {
 				return 0, false
 			}
-		case bytecode.OpLoadConstant:
+		case bytecode.OpLoadConstant, bytecode.OpGetUpValue:
 			if i.A() == a {
+				return 0, false
+			}
+		case bytecode.OpGetTable, bytecode.OpGetTableUp:
+			if i.A() == a || i.C() == a || i.OpCode() == bytecode.OpGetTable && i.B() == a {
 				return 0, false
 			}
 		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpMod, bytecode.OpIDiv:

@@ -845,6 +845,14 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  local ok, e = pcall(fill, 110) -- leaves the kernel at 100, with b set
 			  return ok, e, a[99]
 			end`},
+		{"an intrinsic's argument reads a buffer", "int", `
+			local sqrt, a = math.sqrt, f64
+			local function roots(n) local s = 0.0; for i = 90, n do s = s + sqrt(a[i]) end; return s end
+			function run()
+			  for i = 0, 99 do a[i] = i end
+			  -- a[100] is nil: the kernel leaves at the read, with sqrt in its register
+			  return roots(99), pcall(roots, 100)
+			end`},
 		{"float into an integer buffer", "int", `
 			function run()
 			  local i32 = i32

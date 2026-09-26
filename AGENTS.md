@@ -466,7 +466,8 @@ nothing compiles.
     ends with; one nothing decides takes `guess`'s type, a float only
     when it meets floats more than integers (a time parameter), since a
     wrong guess costs the kernel.
-  - **Intrinsic calls.** `GETUPVAL f; …arithmetic…; CALL f 2 2`, where
+  - **Intrinsic calls.** `GETUPVAL f; …arithmetic and buffer reads…;
+    CALL f 2 2` (a side exit in between stores `f` first, `calleesAt`), where
     the closure being compiled holds `math.sqrt`, `sin` or `cos` in that
     upvalue, compiles inline; the entry check confirms the upvalue still
     holds it. The kernel saves the integer registers trig uses around it

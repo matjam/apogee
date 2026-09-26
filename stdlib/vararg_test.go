@@ -1,6 +1,11 @@
 package stdlib_test
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/matjam/apogee/lua"
+	"github.com/matjam/apogee/stdlib"
+)
 
 // Lua 5.5's named vararg tables; each case was checked against C Lua
 // 5.5.1.
@@ -26,15 +31,29 @@ func TestNamedVarArgs(t *testing.T) {
 		assert(select(2, load("return function(...t) t = 1 end")):find("const variable 't'"))
 		local function e(..._ENV) global a = 10; return a end
 		assert(e() == 10)
-		-- Only indexed, the table is never made.
-		local function view(...t) return t[1], t.n, t.x end
-		view(1, 2)
-		local before = collectgarbage("count")
-		for _ = 1, 100 do view(1, 2) end
-		assert(collectgarbage("count") == before)
 		local function many(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20, ...)
 			local a1, a2, a3, a4, a5, a6, a7
 		end
 		many() -- the parameters move above the arguments: stack for both
 	`)
+}
+
+// A vararg table only indexed is never made. Counted with AllocsPerRun,
+// not collectgarbage("count"), which is Go's whole heap and moves with
+// the runtime's own allocations.
+func TestNamedVarArgViewDoesNotAllocate(t *testing.T) {
+	l := lua.NewState()
+	stdlib.Open(l)
+	if err := l.DoString(`function view(...t) return t[1], t.n, t.x end`); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		l.Global("view")
+		l.PushInteger(1)
+		l.PushInteger(2)
+		l.Call(2, 0)
+	})
+	if allocs != 0 {
+		t.Fatalf("view allocates %v times a call", allocs)
+	}
 }

@@ -132,6 +132,19 @@ func (h hoistedUpValue) kindOf(s int) numKind {
 	return h.kind
 }
 
+// floatModDivisor returns constant v as a float divisor compiled code
+// computes % of floats by: a power of two, 1 to 2^52 either sign. Then
+// a / v and trunc(a / v) * v are exact, so a - trunc(a / v) * v is
+// fmod(a, v) exactly, as FloatMod starts from.
+func floatModDivisor(v value) (float64, bool) {
+	if !v.isNumber() {
+		return 0, false
+	}
+	f := v.toFloat()
+	frac, exp := math.Frexp(math.Abs(f))
+	return f, frac == 0.5 && exp >= 1 && exp <= 53
+}
+
 // kernelDivisor reports whether constant v may divide in a kernel: a
 // nonzero integer small enough for an immediate.
 func kernelDivisor(v value) bool {
@@ -232,8 +245,13 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 				return nil
 			}
 		case bytecode.OpMod:
-			// An integer divided by a constant: never zero, and fixed sign.
-			if !bytecode.IsConstant(i.C()) || !read(i.C()) || !kernelDivisor(p.Constants[bytecode.ConstantIndex(i.C())]) {
+			// By a constant: an integer by a kernelDivisor, never zero and of
+			// fixed sign, or a float by a floatModDivisor. checkTypes tells.
+			if !bytecode.IsConstant(i.C()) || !read(i.C()) {
+				return nil
+			}
+			d := p.Constants[bytecode.ConstantIndex(i.C())]
+			if _, ok := floatModDivisor(d); !ok && !kernelDivisor(d) {
 				return nil
 			}
 			if !read(i.B()) || !write(i.A(), ip) {
@@ -683,10 +701,7 @@ func result(p *prototype, i bytecode.Instruction, state map[int]numKind) (numKin
 		return kindAny, true
 	case bytecode.OpDiv, bytecode.OpCall, bytecode.OpGetTable, bytecode.OpGetTableUp: // intrinsics and buffers of floats
 		return kindFloat, true
-	case bytecode.OpMod:
-		b := state[i.B()]
-		return b, b != kindFloat // float % is fmod, which Go computes
-	case bytecode.OpIDiv:
+	case bytecode.OpMod, bytecode.OpIDiv: // see checkTypes for which divisors
 		b, c := kind(i.B()), kind(i.C())
 		switch {
 		case b == kindFloat || c == kindFloat:
@@ -969,19 +984,30 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 			if !known(i.B()) {
 				return false
 			}
-		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpMod:
+		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv:
 			if !known(i.B(), i.C()) {
 				return false
 			}
-		case bytecode.OpIDiv:
+		case bytecode.OpMod, bytecode.OpIDiv:
+			// Integers by a kernelDivisor; floats by anything for //, and by
+			// a floatModDivisor for %, rounding in one instruction.
 			if !known(i.B(), i.C()) {
 				return false
 			}
-			if k.results[ip] == kindFloat && !k.floor {
-				return false
+			var d value
+			if bytecode.IsConstant(i.C()) {
+				d = p.Constants[bytecode.ConstantIndex(i.C())]
 			}
-			if k.results[ip] == kindInt && (!bytecode.IsConstant(i.C()) || !kernelDivisor(p.Constants[bytecode.ConstantIndex(i.C())])) {
-				return false
+			switch k.results[ip] {
+			case kindInt:
+				if !kernelDivisor(d) {
+					return false
+				}
+			case kindFloat:
+				_, modOK := floatModDivisor(d)
+				if !k.floor || i.OpCode() == bytecode.OpMod && !modOK {
+					return false
+				}
 			}
 		case bytecode.OpBitwise: // bitwiseResult checked the operands
 			if k.results[ip] != kindInt {

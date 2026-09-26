@@ -884,6 +884,29 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  for i = 0, 99 do out[i] = a[i] // 1.0; s = s + a[i] // -2.5 + i // 4.0 + (a[i] // d) end
 			  return s, out[0], out[99], out[50]
 			end`},
+		{"% of floats by powers of two", "int", `
+			local xs = {0.0, -0.0, 4.0, -4.0, 5.5, -5.5, 1e300, -1e300, 2^60 + 2^8, -3e-310, 5e-324, -5e-324,
+			  1/0, -1/0, 0/0, 7, -7, 2^53 + 1, 0.1, -0.1}
+			local a = f64
+			for i, x in ipairs(xs) do a[i - 1] = x end
+			local n = #xs
+			local function show(v) return string.format("%.17g/%s", v, 1/v) end
+			function run()
+			  for i = 0, n - 1 do -- a kernel: a is an upvalue buffer
+			    local x = a[i]
+			    a[20 + i] = x % 2
+			    a[40 + i] = x % -4.0
+			    a[60 + i] = x % 1
+			  end
+			  local out = {}
+			  for i = 0, n - 1 do
+			    out[#out + 1] = show(a[20 + i]) .. show(a[40 + i]) .. show(a[60 + i])
+			  end
+			  for _, x in ipairs(xs) do -- ordinary compiled code
+			    out[#out + 1] = show(x % 2) .. show(x % -0.5) .. show(x % 2^52) .. show(3 % 2.0)
+			  end
+			  return table.concat(out, ";")
+			end`},
 		{"float keys", "int", `
 			function run()
 			  local a, out = f64, f32

@@ -587,6 +587,15 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 			a.MovSD(k.reg(i.A()), 4)
 			break
 		}
+		if !isInt { // floats, by a floatModDivisor
+			if b := c.floatOperand(k, ip, i.B(), 0); b != 0 {
+				a.MovSD(0, b)
+			}
+			d, _ := floatModDivisor(p.Constants[bytecode.ConstantIndex(i.C())])
+			c.floatMod(d, c.kernelSideExit(k, ip))
+			a.MovSD(k.reg(i.A()), 3)
+			break
+		}
 		// By a nonzero constant: floor the quotient toward minus infinity,
 		// and give the modulo the divisor's sign.
 		kk := bytecode.ConstantIndex(i.C())

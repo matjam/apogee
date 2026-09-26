@@ -109,6 +109,13 @@ func TestNarrowElements(t *testing.T) {
 		0x1e624000, 0x1e624125, 0xb98002ad, 0xb9800c82})
 }
 
+func TestFrintz(t *testing.T) {
+	var a Asm
+	a.Frintz(2, 7) // frintz d2, d7
+	a.Frintz(0, 0) // frintz d0, d0
+	check(t, &a, []uint32{0x1e65c0e2, 0x1e65c000})
+}
+
 func TestDivideByConstant(t *testing.T) {
 	var a Asm
 	a.Smulh(3, 20, 9) // smulh x3, x20, x9

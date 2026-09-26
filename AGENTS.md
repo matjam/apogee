@@ -93,9 +93,10 @@ today, the rules it depends on, and where performance work should go next.
 
 - `cmd/apogee` is its own module, so the library's go.mod stays free of
   its dependencies (Bubble Tea v2, Bubbles, Lip Gloss, Chroma). It
-  requires a released apogee pseudo-version; `go install ...@latest`
-  refuses replace directives. To use a newer library, bump it with
-  `cd cmd/apogee && go get github.com/matjam/apogee@<commit on main>`.
+  requires a released apogee version, not a replace directive, which
+  `go install ...@latest` refuses; so CI builds it against that release,
+  not this checkout. After a release, bump it with
+  `cd cmd/apogee && go get github.com/matjam/apogee@vX.Y.Z`.
 - For local development against this checkout, make an untracked
   workspace: `go work init . ./cmd/apogee` (go.work is gitignored; a
   committed one would put the root's `go test ./...` and bench/ in

@@ -3,25 +3,35 @@
 package lua
 
 import (
+	"math"
+
 	"github.com/matjam/apogee/internal/bytecode"
 	. "github.com/matjam/apogee/internal/jit/arm64"
 )
 
 // divide compiles % and // of two integers, as IntMod and IntFloorDiv
-// compute them, and // of floats. A zero divisor exits, for Go to raise
-// the error, as does % of floats, which Go computes with fmod.
+// compute them, // of floats, and % of floats by a constant
+// floatModDivisor accepts. A zero divisor exits, for Go to raise the
+// error, as does % of floats by anything else, which Go computes with
+// fmod.
 func (c *arm64Compiler) divide(ip int, op bytecode.OpCode, i bytecode.Instruction) {
 	a := &c.a
 	b, kb, okB := c.rkArith(i.B())
 	cc, kc, okC := c.rkArith(i.C())
-	if !okB || !okC || op == bytecode.OpMod && (kb == kindFloat || kc == kindFloat) {
+	var modBy float64
+	floatMod := false
+	if op == bytecode.OpMod && bytecode.IsConstant(i.C()) {
+		modBy, floatMod = floatModDivisor(c.p.Constants[bytecode.ConstantIndex(i.C())])
+	}
+	floatsExit := op == bytecode.OpMod && !floatMod
+	if !okB || !okC || floatsExit && (kb == kindFloat || kc == kindFloat) {
 		c.exitAlways(ip)
 		return
 	}
 	dst := reg(i.A())
 	c.guardStore(dst, noReg, ip)
 	floats, done := a.NewLabel(), a.NewLabel()
-	if op == bytecode.OpMod {
+	if floatsExit {
 		floats = c.exit(ip)
 	}
 	if plan, ok := constantDivisor(c.p, i.C()); ok && kb != kindFloat {
@@ -64,14 +74,50 @@ func (c *arm64Compiler) divide(ip int, op bytecode.OpCode, i bytecode.Instructio
 		}
 		a.B(done)
 	}
-	if op == bytecode.OpIDiv {
+	if !floatsExit {
 		a.Bind(floats)
 		c.loadFloat(0, b, kb, false, ip)
-		c.loadFloat(1, cc, kc, false, ip)
-		a.Fdiv(0, 0, 1)
-		a.Frintm(0, 0)
-		c.storeNumber(dst, 0)
+		if op == bytecode.OpMod {
+			c.floatMod(modBy, c.exit(ip))
+			c.storeNumber(dst, 3)
+		} else {
+			c.loadFloat(1, cc, kc, false, ip)
+			a.Fdiv(0, 0, 1)
+			a.Frintm(0, 0)
+			c.storeNumber(dst, 0)
+		}
 	}
+	a.Bind(done)
+}
+
+// floatMod computes D0 % d into D3, as FloatMod does, for d that
+// floatModDivisor accepts: fmod exactly, as a - trunc(a / d) * d, with the
+// sign of a when it is zero, then Lua's correction toward d's sign. An
+// infinite or NaN a goes to nonFinite: Go's NaN may have another sign
+// bit. It uses D1 to D4 and rTmp, which kernels leave free.
+func (c *arm64Compiler) floatMod(d float64, nonFinite Label) {
+	a := &c.a
+	a.MovImm(rTmp, math.Float64bits(d))
+	a.FmovToF(1, rTmp)
+	a.Fdiv(2, 0, 1)
+	a.Frintz(2, 2)
+	a.Fmul(2, 2, 1)
+	a.Fsub(3, 0, 2)
+	a.Fcmp(3, 3)
+	a.BCond(VS, nonFinite) // NaN only from an infinite or NaN a
+	a.FmovToF(4, ZR)
+	nonzero, done := a.NewLabel(), a.NewLabel()
+	a.Fcmp(3, 4)
+	a.BCond(NE, nonzero) // unordered too
+	a.Fmul(3, 0, 4)      // a zero with a's sign, as fmod gives
+	a.Bind(nonzero)
+	a.Fcmp(3, 4)
+	if d > 0 {
+		a.BCond(GE, done) // add d to a negative m
+	} else {
+		a.BCond(LS, done) // add d to a positive m
+	}
+	a.Fadd(3, 3, 1)
 	a.Bind(done)
 }
 

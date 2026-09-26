@@ -3,19 +3,27 @@
 package lua
 
 import (
+	"math"
+
 	"github.com/matjam/apogee/internal/bytecode"
 	. "github.com/matjam/apogee/internal/jit/amd64"
 )
 
 // divide compiles % and // of two integers, as IntMod and IntFloorDiv
-// compute them, and // of floats where ROUNDSD is available. A zero
-// divisor exits, for Go to raise the error, as does % of floats, which Go
+// compute them, and, where ROUNDSD is available, // of floats and % of
+// floats by a constant floatModDivisor accepts. A zero divisor exits, for
+// Go to raise the error, as does % of floats by anything else, which Go
 // computes with fmod. IDIV divides RDX:RAX, so rAddr and rTmp are used.
 func (c *amd64Compiler) divide(ip int, op bytecode.OpCode, i bytecode.Instruction) {
 	a := &c.a
 	b, kb, okB := c.rkArith(i.B())
 	cc, kc, okC := c.rkArith(i.C())
-	floatsExit := op == bytecode.OpMod || !c.sse41
+	var modBy float64
+	floatMod := false
+	if op == bytecode.OpMod && bytecode.IsConstant(i.C()) {
+		modBy, floatMod = floatModDivisor(c.p.Constants[bytecode.ConstantIndex(i.C())])
+	}
+	floatsExit := op == bytecode.OpMod && !floatMod || !c.sse41
 	if !okB || !okC || floatsExit && (kb == kindFloat || kc == kindFloat) {
 		c.exitAlways(ip)
 		return
@@ -73,11 +81,51 @@ func (c *amd64Compiler) divide(ip int, op bytecode.OpCode, i bytecode.Instructio
 	if !floatsExit {
 		a.Bind(floats)
 		c.loadFloat(0, b, kb, false, ip)
-		c.loadFloat(1, cc, kc, false, ip)
-		a.DivSD(0, 1)
-		a.RoundSD(0, 0, 1) // toward minus infinity
-		c.storeNumber(dst, 0)
+		if op == bytecode.OpMod {
+			c.floatMod(modBy, c.exit(ip))
+			c.storeNumber(dst, 3)
+		} else {
+			c.loadFloat(1, cc, kc, false, ip)
+			a.DivSD(0, 1)
+			a.RoundSD(0, 0, 1) // toward minus infinity
+			c.storeNumber(dst, 0)
+		}
 	}
+	a.Bind(done)
+}
+
+// floatMod computes X0 % d into X3, as FloatMod does, for d that
+// floatModDivisor accepts: fmod exactly, as a - trunc(a / d) * d, with the
+// sign of a when it is zero, then Lua's correction toward d's sign. An
+// infinite or NaN a goes to nonFinite: Go's NaN has another sign bit. It
+// uses X1 to X4 and rTmp, which kernels leave free.
+func (c *amd64Compiler) floatMod(d float64, nonFinite Label) {
+	a := &c.a
+	a.MovImm(rTmp, math.Float64bits(d))
+	a.MovqToX(1, rTmp)
+	a.MovSD(2, 0)
+	a.DivSD(2, 1)
+	a.RoundSD(2, 2, 3) // toward zero
+	a.MulSD(2, 1)
+	a.MovSD(3, 0)
+	a.SubSD(3, 2)
+	a.Ucomisd(3, 3)
+	a.J(P, nonFinite) // NaN only from an infinite or NaN a
+	a.XorPD(4, 4)
+	nonzero, done := a.NewLabel(), a.NewLabel()
+	a.Ucomisd(3, 4)
+	a.J(NE, nonzero)
+	a.J(P, nonzero)
+	a.MovSD(3, 0)
+	a.MulSD(3, 4) // a zero with a's sign, as fmod gives
+	a.Bind(nonzero)
+	a.Ucomisd(3, 4)
+	if d > 0 {
+		a.J(AE, done) // add d to a negative m
+	} else {
+		a.J(BE, done) // add d to a positive m
+	}
+	a.AddSD(3, 1)
 	a.Bind(done)
 }
 

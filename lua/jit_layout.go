@@ -15,6 +15,7 @@ const (
 	offBarrier   = uint32(unsafe.Offsetof(jitContext{}.barrier))
 	offKernels   = uint32(unsafe.Offsetof(jitContext{}.kernels))
 	offSpill     = uint32(unsafe.Offsetof(jitContext{}.spill))
+	offHoist     = uint32(unsafe.Offsetof(jitContext{}.hoist))
 	valueSize    = uint32(unsafe.Sizeof(value{}))
 	offP         = uint32(unsafe.Offsetof(value{}.p))
 	offN         = uint32(unsafe.Offsetof(value{}.n))

@@ -823,6 +823,28 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  local ok = pcall(fill, f64)
 			  return ok, get()
 			end`},
+		{"buffers and numbers in upvalues", "int", `
+			local a, out, scale = f64, f32, 0.5
+			function run()
+			  for i = 0, 99 do a[i] = i end
+			  for i = 0, 99 do out[i] = a[i] * scale end
+			  return out[3], out[99], a[50]
+			end`},
+		{"a register holding an upvalue's buffer", "int", `
+			local a = f64
+			local function fill(n)
+			  local s = 0.0
+			  for i = 90, n do
+			    do local b = a; b[i] = i end
+			    local x = i * 2.0 -- in b's register
+			    s = s + x
+			  end
+			  return s
+			end
+			function run()
+			  local ok, e = pcall(fill, 110) -- leaves the kernel at 100, with b set
+			  return ok, e, a[99]
+			end`},
 		{"float into an integer buffer", "int", `
 			function run()
 			  local i32 = i32

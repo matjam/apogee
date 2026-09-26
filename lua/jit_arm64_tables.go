@@ -3,6 +3,7 @@
 package lua
 
 import (
+	"math"
 	"unsafe"
 
 	"github.com/matjam/apogee/internal/bytecode"
@@ -578,12 +579,141 @@ func (c *arm64Compiler) goCallee(ip int, i bytecode.Instruction) {
 	c.branchNumber(rT, notGo) // a number whose bits match the tag
 	a.Ldr(rTmp, rT, offGFNumber)
 	a.Cbnz(rTmp, c.numCallExit(ip)) // runJIT may call it frameless
+	a.Bind(c.plainGoCall(ip))
+	c.mathCall(ip, i)
 	a.B(c.goCallExit(ip))
 	a.Bind(closure)
 	a.Ldr(rT, fn.base, fn.off+offP)
 	c.branchNumber(rT, notGo) // a number whose bits match the tag
 	a.B(c.goCallExit(ip))
 	a.Bind(notGo)
+}
+
+// plainGoCall returns the label in goCallee's code for the CALL at ip
+// when its callee is a Go function but not a number function.
+func (c *arm64Compiler) plainGoCall(ip int) Label {
+	if c.plainGo[ip] < 0 {
+		c.plainGo[ip] = c.a.NewLabel()
+	}
+	return c.plainGo[ip]
+}
+
+// mathCall computes the CALL i at ip inline when its callee, a Go
+// function, is a math function of its arity (see mathFn), writing the
+// result to register A and going on at ip+1. It falls through for other
+// functions, and exits to Go for arguments the function would reject or
+// that it leaves to Go: mixed integers and floats for min and max.
+func (c *arm64Compiler) mathCall(ip int, i bytecode.Instruction) {
+	if i.C() != 2 || i.B() != 2 && i.B() != 3 {
+		return
+	}
+	a := &c.a
+	fn := reg(i.A())
+	a.Ldr(rT, fn.base, fn.off+offP) // the *goFunction
+	a.Ldr(rTmp, rT, 0)              // its Function's code
+	var bodies []func()
+	for _, m := range mathFns {
+		if m.id.unary() != (i.B() == 2) {
+			continue
+		}
+		l := a.NewLabel()
+		a.MovImm(rIdx, m.fn)
+		a.Cmp(rTmp, rIdx)
+		a.BCond(EQ, l)
+		bodies = append(bodies, func() { a.Bind(l); c.mathBody(ip, i, m.id) })
+	}
+	skip := a.NewLabel()
+	a.B(skip)
+	for _, b := range bodies {
+		b()
+	}
+	a.Bind(skip)
+}
+
+// mathBody computes math function m for the CALL i at ip, as mathCall
+// describes.
+func (c *arm64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
+	a := &c.a
+	fn, arg, arg2 := reg(i.A()), reg(i.A()+1), reg(i.A()+2)
+	next, goCall := c.pcs[ip+1], c.goCallExit(ip)
+	isFloat := a.NewLabel()
+	// rTmp: 0 for a float argument, 1 for an integer; anything else calls
+	// Go, which raises the error.
+	a.Ldr(rTmp, arg.base, arg.off+offP)
+	a.Sub(rTmp, rTmp, rNumber)
+	if !m.unary() { // the same type, both
+		a.Ldr(rTmp2, arg2.base, arg2.off+offP)
+		a.Sub(rTmp2, rTmp2, rNumber)
+		a.Cmp(rTmp, rTmp2)
+		a.BCond(NE, goCall)
+	}
+	a.Cbz(rTmp, isFloat)
+	a.CmpImm(rTmp, 1)
+	a.BCond(NE, goCall)
+	c.guardStore(fn, noReg, ip)
+	// Integers.
+	a.Ldr(rN, arg.base, arg.off+offN)
+	switch m {
+	case mathAbs:
+		a.Neg(rTmp, rN) // minint stays minint
+		a.CmpImm(rN, 0)
+		a.Csel(rN, rTmp, rN, LT)
+	case mathMin, mathMax:
+		a.Ldr(rP, arg2.base, arg2.off+offN)
+		if m == mathMin {
+			a.Cmp(rP, rN) // the second if it is less
+		} else {
+			a.Cmp(rN, rP) // the second if the first is less
+		}
+		a.Csel(rN, rP, rN, LT)
+	}
+	c.storeInteger(reg(i.A()), rN) // floor and ceil: the integer itself
+	a.B(next)
+	// Floats.
+	a.Bind(isFloat)
+	c.guardStore(fn, noReg, ip)
+	a.LdrD(0, arg.base, arg.off+offN)
+	switch m {
+	case mathFloor, mathCeil:
+		if m == mathFloor {
+			a.Frintm(0, 0)
+		} else {
+			a.Frintp(0, 0)
+		}
+		// An integer when one holds it, -2^63 <= f < 2^63, as
+		// pushIntegerIfFits decides; otherwise the float.
+		float := a.NewLabel()
+		a.MovImm(rTmp, math.Float64bits(1<<63))
+		a.FmovToF(1, rTmp)
+		a.Fcmp(0, 1)
+		a.BCond(VS, float) // NaN
+		a.BCond(GE, float)
+		a.MovImm(rTmp, math.Float64bits(-(1 << 63)))
+		a.FmovToF(1, rTmp)
+		a.Fcmp(0, 1)
+		a.BCond(MI, float)
+		a.Fcvtzs(rN, 0)
+		c.storeInteger(fn, rN)
+		a.B(next)
+		a.Bind(float)
+	case mathAbs:
+		a.Fabs(0, 0)
+	case mathMin, mathMax:
+		// Lua's <, false for NaN either way: the first unless the second
+		// is less (min), or the first is less than the second (max).
+		keep := a.NewLabel()
+		a.LdrD(1, arg2.base, arg2.off+offN)
+		if m == mathMin {
+			a.Fcmp(1, 0)
+		} else {
+			a.Fcmp(0, 1)
+		}
+		a.BCond(PL, keep) // not less, or unordered
+		a.Fmov(0, 1)
+		a.Bind(keep)
+	}
+	c.storeNumber(fn, 0)
+	a.B(next)
 }
 
 // setList compiles SETLIST of a fixed count of values, as a constructor
@@ -622,7 +752,7 @@ func (c *arm64Compiler) intrinsic(ip int, i bytecode.Instruction, notGo Label) {
 	a.Ldr(rT, fn.base, fn.off+offP)
 	c.branchNumber(rT, notGo) // a number whose bits match the tag
 	a.Ldr(rT, rT, offGFNumber)
-	a.Cbz(rT, c.goCallExit(ip))
+	a.Cbz(rT, c.plainGoCall(ip)) // perhaps a math function
 	a.Ldr(rT, rT, offNFUnary)
 	c.loadFloat(0, arg, kindAny, false, ip) // an integer converts, as for a number function
 	done := a.NewLabel()

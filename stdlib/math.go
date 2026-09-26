@@ -40,59 +40,15 @@ func pushIntegerIfFits(l *lua.State, f float64) {
 	l.PushNumber(f)
 }
 
-// minMax is math.min or math.max: the first argument that no other is
-// less (or greater) than, keeping its type.
-func minMax(max bool) lua.Function {
-	return func(l *lua.State) int {
-		n := l.Top()
-		l.ArgumentCheck(n >= 1, 1, "value expected")
-		best := 1
-		l.CheckNumber(1)
-		for i := 2; i <= n; i++ {
-			l.CheckNumber(i)
-			if max && l.Compare(best, i, lua.OpLT) || !max && l.Compare(i, best, lua.OpLT) {
-				best = i
-			}
-		}
-		l.PushValue(best)
-		return 1
-	}
-}
-
 var mathLibrary = []lua.RegistryFunction{
-	{Name: "abs", Function: func(l *lua.State) int {
-		if l.IsInteger(1) {
-			n, _ := l.ToInteger(1)
-			if n < 0 {
-				n = -n // minint stays minint, as 0u - n does in C
-			}
-			l.PushInteger(n)
-		} else {
-			l.PushNumber(math.Abs(l.CheckNumber(1)))
-		}
-		return 1
-	}},
+	{Name: "abs", Function: lua.MathAbs}, // which compiled code recognises, as floor, ceil, max and min
 	{Name: "atan", Function: func(l *lua.State) int {
 		y, x := l.CheckNumber(1), l.OptNumber(2, 1)
 		l.PushNumber(math.Atan2(y, x))
 		return 1
 	}},
-	{Name: "ceil", Function: func(l *lua.State) int {
-		if l.IsInteger(1) {
-			l.SetTop(1)
-		} else {
-			pushIntegerIfFits(l, math.Ceil(l.CheckNumber(1)))
-		}
-		return 1
-	}},
-	{Name: "floor", Function: func(l *lua.State) int {
-		if l.IsInteger(1) {
-			l.SetTop(1)
-		} else {
-			pushIntegerIfFits(l, math.Floor(l.CheckNumber(1)))
-		}
-		return 1
-	}},
+	{Name: "ceil", Function: lua.MathCeil},
+	{Name: "floor", Function: lua.MathFloor},
 	{Name: "fmod", Function: func(l *lua.State) int {
 		if l.IsInteger(1) && l.IsInteger(2) {
 			a, _ := l.ToInteger(1)
@@ -138,8 +94,8 @@ var mathLibrary = []lua.RegistryFunction{
 		}
 		return 1
 	}},
-	{Name: "max", Function: minMax(true)},
-	{Name: "min", Function: minMax(false)},
+	{Name: "max", Function: lua.MathMax},
+	{Name: "min", Function: lua.MathMin},
 	{Name: "modf", Function: func(l *lua.State) int {
 		if l.IsInteger(1) {
 			l.SetTop(1)     // an integer is its own integral part

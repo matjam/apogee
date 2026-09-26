@@ -446,8 +446,12 @@ nothing compiles.
     registers, or straight from memory into an SSE register: moving them
     between the register files just before the store measured three
     times slower on amd64, fed by sin.
-  - `math.sqrt`, `sin` and `cos` inline. (`floor`, `ceil` and `abs`
-    return integers now, and wait for integers in compiled code.)
+  - `math.sqrt`, `sin` and `cos` inline, as number functions. `floor`,
+    `ceil`, `abs`, `min` and `max` keep integers integers, so are Go
+    functions, not number functions: `lua` defines them (`MathFloor` and
+    the rest, math_functions.go), stdlib registers them, and compiled
+    code tells them by their code pointer (jit_math.go) in `goCallee`'s
+    path for Go functions, where Lua-to-Lua calls never go.
 - **Kernels:** an innermost numeric for loop whose body is only moves,
   number constants, arithmetic (`%` and `//` by a nonzero integer
   constant), number comparisons, and the intrinsic calls and buffer

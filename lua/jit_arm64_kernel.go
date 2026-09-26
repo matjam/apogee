@@ -40,7 +40,13 @@ func (c *arm64Compiler) findKernels(latch int) []*kernel {
 		fns = append(fns, in.fn)
 	}
 	constOK := func(k int) bool { _, ok := c.constant(k); return ok }
-	intrinsic := func(n int) (uint64, bool) { return upValueIntrinsic(c.cl, n, fns) }
+	intrinsic := func(n int) (uint64, mathFn, bool) {
+		if fn, ok := upValueIntrinsic(c.cl, n, fns); ok {
+			return fn, mathNone, true
+		}
+		m, fn := mathFnOf(c.cl, n)
+		return fn, m, m != mathNone
+	}
 	upValue := func(n int) (numKind, bool) { return upValueKind(c.cl, n) }
 	var ks []*kernel
 	for _, intLoop := range []bool{true, false} {
@@ -137,10 +143,15 @@ func (c *arm64Compiler) kernelGuards(k *kernel, normal Label) {
 		a.BCond(NE, normal)
 		a.Ldr(rTmp, rAddr, offP)
 		c.branchNumber(rTmp, normal) // a number whose bits match the tag
-		a.Ldr(rTmp, rTmp, offGFNumber)
-		a.Cbz(rTmp, normal)
-		a.Ldr(rTmp, rTmp, offNFUnary)
-		a.MovImm(rTmp2, k.upValueFn(n))
+		fn, math := k.upValueFn(n)
+		if math {
+			a.Ldr(rTmp, rTmp, 0) // the Function's code
+		} else {
+			a.Ldr(rTmp, rTmp, offGFNumber)
+			a.Cbz(rTmp, normal)
+			a.Ldr(rTmp, rTmp, offNFUnary)
+		}
+		a.MovImm(rTmp2, fn)
 		a.Cmp(rTmp, rTmp2)
 		a.BCond(NE, normal)
 	}
@@ -221,6 +232,10 @@ var intrinsicSaved = []Reg{rTrig, rIdx, rLen}
 func (c *arm64Compiler) kernelCall(k *kernel, ip int, i bytecode.Instruction) {
 	a := &c.a
 	kc := k.calls[ip]
+	if kc.math != mathNone {
+		c.kernelMath(k, ip, i, kc.math)
+		return
+	}
 	var saved []Reg
 	if kc.fn != funcValue(math.Sqrt) { // sqrt is one instruction
 		for _, r := range intrinsicSaved {
@@ -265,6 +280,69 @@ func (c *arm64Compiler) kernelCall(k *kernel, ip int, i bytecode.Instruction) {
 	c.kernelExit = -1
 	restore()
 	a.Fmov(k.reg(i.A()), 0)
+}
+
+// kernelMath compiles the CALL i at ip of math function m on registers,
+// typed as callResult says. floor or ceil of a float leaves the kernel
+// when the result holds no integer, for Go to give the float.
+func (c *arm64Compiler) kernelMath(k *kernel, ip int, i bytecode.Instruction, m mathFn) {
+	a := &c.a
+	dst, arg := i.A(), i.A()+1
+	if k.typeAt(ip, arg) == kindInt {
+		x, d := k.ireg(arg), k.ireg(dst)
+		switch m {
+		case mathFloor, mathCeil:
+			a.Mov(d, x)
+		case mathAbs:
+			a.Neg(rTmp, x) // minint stays minint
+			a.CmpImm(x, 0)
+			a.Csel(d, rTmp, x, LT)
+		case mathMin, mathMax:
+			b := k.ireg(arg + 1)
+			if m == mathMin {
+				a.Cmp(b, x) // the second if it is less
+			} else {
+				a.Cmp(x, b) // the second if the first is less
+			}
+			a.Csel(d, b, x, LT)
+		}
+		return
+	}
+	x := k.reg(arg)
+	switch m {
+	case mathFloor, mathCeil:
+		if m == mathFloor {
+			a.Frintm(0, x)
+		} else {
+			a.Frintp(0, x)
+		}
+		// An integer when -2^63 <= f < 2^63; otherwise Go gives the float.
+		side := c.kernelSideExit(k, ip)
+		a.MovImm(rTmp, math.Float64bits(1<<63))
+		a.FmovToF(1, rTmp)
+		a.Fcmp(0, 1)
+		a.BCond(VS, side) // NaN
+		a.BCond(GE, side)
+		a.MovImm(rTmp, math.Float64bits(-(1 << 63)))
+		a.FmovToF(1, rTmp)
+		a.Fcmp(0, 1)
+		a.BCond(MI, side)
+		a.Fcvtzs(k.ireg(dst), 0)
+	case mathAbs:
+		a.Fabs(k.reg(dst), x)
+	case mathMin, mathMax:
+		keep, b := a.NewLabel(), k.reg(arg+1)
+		a.Fmov(0, x)
+		if m == mathMin {
+			a.Fcmp(b, x)
+		} else {
+			a.Fcmp(x, b)
+		}
+		a.BCond(PL, keep) // Lua's <: not less, or unordered
+		a.Fmov(0, b)
+		a.Bind(keep)
+		a.Fmov(k.reg(dst), 0)
+	}
 }
 
 // kernelBuffer checks that key is inside the buffer the access at ip

@@ -917,6 +917,22 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  local ok, e = pcall(function() for i = 0, 10 do out[i * 0.5] = 1 end end)
 			  return s, out[5], out[98], ok, e
 			end`},
+		{"math functions in kernels", "int", `
+			local floor, ceil, abs, min, max = math.floor, math.ceil, math.abs, math.min, math.max
+			local a, out = f64, f32
+			function run()
+			  for i = 0, 99 do a[i] = (i - 50) * 0.73 end
+			  a[7], a[8], a[9] = 1e300, -1/0, 0/0 -- floor leaves the kernel for these
+			  local s1, s2, s3, t = 0, 0, 0, 0.0
+			  for i = 0, 99 do out[i] = floor(a[i]) end
+			  for i = 0, 99 do s1 = s1 + ceil(i * 0.25) end
+			  for i = 0, 99 do s2 = s2 + abs(i - 50) end
+			  for i = 0, 99 do s3 = s3 + min(i, 60) - max(i, 40) end -- a kernel where registers allow
+			  for i = 10, 99 do t = t + abs(a[i]) end
+			  for i = 10, 99 do t = t + min(a[i], 3.5) end
+			  for i = 10, 99 do t = t - max(a[i], -2.25) end
+			  return s1, s2, s3, t, out[0], out[99], out[7], out[8], out[9]
+			end`},
 		{"float into an integer buffer", "int", `
 			function run()
 			  local i32 = i32

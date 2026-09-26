@@ -907,6 +907,16 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  end
 			  return table.concat(out, ";")
 			end`},
+		{"float keys", "int", `
+			function run()
+			  local a, out = f64, f32
+			  for i = 0, 99 do a[i] = i end
+			  for i = 0, 98 do local k = i * 1.0; out[k] = a[(i + 0.5) // 1] end
+			  local s = 0.0
+			  for i = 0, 99 do s = s + (a[i * 0.5] or 0) end -- fractions leave the kernel
+			  local ok, e = pcall(function() for i = 0, 10 do out[i * 0.5] = 1 end end)
+			  return s, out[5], out[98], ok, e
+			end`},
 		{"float into an integer buffer", "int", `
 			function run()
 			  local i32 = i32

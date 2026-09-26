@@ -286,13 +286,30 @@ func (c *amd64Compiler) kernelBuffer(k *kernel, ip, obj, key int, side Label) (k
 			a.J(BE, side) // unsigned: len <= key
 		}
 	} else {
-		keyReg = k.ireg(key)
+		if k.typeAt(ip, key) == kindFloat {
+			keyReg = c.floatKey(k, key, side)
+		} else {
+			keyReg = k.ireg(key)
+		}
 		a.Cmp(keyReg, DX)
 		a.J(AE, side)
 	}
 	a.Load(DX, rTmp, offBufPtr)
 	a.Load8(rTmp, rTmp, offBufKind)
 	return
+}
+
+// floatKey converts the float key in register key to an integer in the
+// scratch register, leaving by side unless it has an integer value.
+func (c *amd64Compiler) floatKey(k *kernel, key int, side Label) Reg {
+	a := &c.a
+	x, s := k.reg(key), k.ireg(keyScratch)
+	a.Cvttsd2si(s, x)
+	c.toFloat(0, s)
+	a.Ucomisd(0, x)
+	a.J(NE, side)
+	a.J(P, side) // NaN
+	return s
 }
 
 // elementAddr returns the offset from DX of the element of 1<<scale bytes

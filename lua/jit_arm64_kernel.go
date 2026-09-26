@@ -275,9 +275,16 @@ func (c *arm64Compiler) kernelCall(k *kernel, ip int, i bytecode.Instruction) {
 func (c *arm64Compiler) kernelBuffer(k *kernel, ip, obj, key int, side Label) Reg {
 	a := &c.a
 	keyReg := rExitPC
-	if bytecode.IsConstant(key) {
+	switch {
+	case bytecode.IsConstant(key):
 		a.MovImm(rExitPC, uint64(c.p.Constants[bytecode.ConstantIndex(key)].i()))
-	} else {
+	case k.typeAt(ip, key) == kindFloat: // leave unless it has an integer value
+		x := k.reg(key)
+		a.Fcvtzs(rExitPC, x)
+		a.Scvtf(0, rExitPC)
+		a.Fcmp(0, x)
+		a.BCond(NE, side) // NaN too
+	default:
 		keyReg = k.ireg(key)
 	}
 	if s := k.bufFrom[ip]; s >= 0 {

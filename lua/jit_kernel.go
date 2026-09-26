@@ -72,6 +72,7 @@ type kernelPlan struct {
 	// use can tell apart, provided the fields in needFloat are floats.
 	promoted  map[int]bool
 	floor     bool     // // of floats may compile: see planKernel
+	floatKeys bool     // a buffer is indexed by a float: see bufferKey
 	needFloat [][2]int // pc and RK field
 
 	// A register may hold an integer at one pc and a float at another, as
@@ -418,6 +419,9 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 		if t, ok := k.results[ip]; ok {
 			assign(code[ip].A(), t)
 		}
+	}
+	if k.floatKeys {
+		assign(keyScratch, kindInt)
 	}
 	if floats > maxFloats || ints > maxInts {
 		return nil
@@ -927,6 +931,7 @@ func mergeTypes(states []map[int]numKind) (map[int]numKind, bool) {
 // body writes that ends each iteration with the type it starts with.
 func (k *kernelPlan) checkTypes(p *prototype) bool {
 	code := p.Code
+	k.floatKeys = false
 	end := k.at[k.latch-k.start]
 	for _, r := range k.writtenOnce() {
 		if t, ok := k.types[r]; ok && end[r] != t {
@@ -959,12 +964,12 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 		case bytecode.OpJump, bytecode.OpGetUpValue:
 			continue
 		case bytecode.OpSetTable, bytecode.OpSetTableUp:
-			if k.kind(p, ip, i.B()) != kindInt || !known(i.C()) {
+			if !k.bufferKey(p, ip, i.B()) || !known(i.C()) {
 				return false
 			}
 			continue
 		case bytecode.OpGetTable, bytecode.OpGetTableUp:
-			if k.kind(p, ip, i.C()) != kindInt {
+			if !k.bufferKey(p, ip, i.C()) {
 				return false
 			}
 		case bytecode.OpCall:
@@ -1017,6 +1022,25 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 	}
 	return true
 }
+
+// bufferKey reports whether field can key a buffer access at ip: an
+// integer, or a register holding a float, which the kernel converts,
+// leaving it when the float has no integer value. A float key needs the
+// scratch integer register planKernel then reserves.
+func (k *kernelPlan) bufferKey(p *prototype, ip, field int) bool {
+	switch k.kind(p, ip, field) {
+	case kindInt:
+		return true
+	case kindFloat:
+		k.floatKeys = k.floatKeys || !bytecode.IsConstant(field)
+		return !bytecode.IsConstant(field)
+	}
+	return false
+}
+
+// keyScratch is the slots key of the integer register a float key
+// converts into.
+const keyScratch = -1
 
 // typeAt returns register r's type before the body pc ip.
 func (k *kernelPlan) typeAt(ip, r int) numKind { return k.at[ip-k.start][r] }

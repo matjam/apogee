@@ -644,12 +644,155 @@ func (c *amd64Compiler) goCallee(ip int, i bytecode.Instruction) {
 	a.Load(rTmp, rT, offGFNumber)
 	a.Test(rTmp, rTmp)
 	a.J(NE, c.numCallExit(ip)) // runJIT may call it frameless
+	a.Bind(c.plainGoCall(ip))
+	c.mathCall(ip, i)
 	a.Jmp(c.goCallExit(ip))
 	a.Bind(closure)
 	a.Load(rT, fn.base, fn.off+offP)
 	c.branchNumber(rT, notGo) // a number whose bits match the tag
 	a.Jmp(c.goCallExit(ip))
 	a.Bind(notGo)
+}
+
+// plainGoCall returns the label in goCallee's code for the CALL at ip
+// when its callee is a Go function but not a number function.
+func (c *amd64Compiler) plainGoCall(ip int) Label {
+	if c.plainGo[ip] < 0 {
+		c.plainGo[ip] = c.a.NewLabel()
+	}
+	return c.plainGo[ip]
+}
+
+// mathCall computes the CALL i at ip inline when its callee, a Go
+// function, is a math function of its arity (see mathFn), writing the
+// result to register A and going on at ip+1. It falls through for other
+// functions, and exits to Go for arguments the function would reject or
+// that it leaves to Go: mixed integers and floats for min and max, and
+// floats for floor and ceil without ROUNDSD.
+func (c *amd64Compiler) mathCall(ip int, i bytecode.Instruction) {
+	if i.C() != 2 || i.B() != 2 && i.B() != 3 {
+		return
+	}
+	a := &c.a
+	fn := reg(i.A())
+	a.Load(rT, fn.base, fn.off+offP) // the *goFunction
+	a.Load(rTmp, rT, 0)              // its Function's code
+	var bodies []func()
+	for _, m := range mathFns {
+		if m.id.unary() != (i.B() == 2) {
+			continue
+		}
+		l := a.NewLabel()
+		a.MovImm(rIdx, m.fn)
+		a.Cmp(rTmp, rIdx)
+		a.J(E, l)
+		bodies = append(bodies, func() { a.Bind(l); c.mathBody(ip, i, m.id) })
+	}
+	skip := a.NewLabel()
+	a.Jmp(skip)
+	for _, b := range bodies {
+		b()
+	}
+	a.Bind(skip)
+}
+
+// mathBody computes math function m for the CALL i at ip, as mathCall
+// describes.
+func (c *amd64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
+	a := &c.a
+	fn, arg, arg2 := reg(i.A()), reg(i.A()+1), reg(i.A()+2)
+	next, goCall := c.pcs[ip+1], c.goCallExit(ip)
+	isFloat := a.NewLabel()
+	// rTmp: 0 for a float argument, 1 for an integer; anything else calls
+	// Go, which raises the error.
+	a.Load(rTmp, arg.base, arg.off+offP)
+	a.Sub(rTmp, rNumber)
+	if !m.unary() { // the same type, both
+		a.Load(rTmp2, arg2.base, arg2.off+offP)
+		a.Sub(rTmp2, rNumber)
+		a.Cmp(rTmp, rTmp2)
+		a.J(NE, goCall)
+	}
+	a.Test(rTmp, rTmp)
+	a.J(E, isFloat)
+	a.CmpImm(rTmp, 1)
+	a.J(NE, goCall)
+	c.guardStore(fn, noReg, ip)
+	// Integers.
+	a.Load(rN, arg.base, arg.off+offN)
+	switch m {
+	case mathAbs:
+		pos := a.NewLabel()
+		a.Test(rN, rN)
+		a.J(NS, pos)
+		a.Neg(rN) // minint stays minint
+		a.Bind(pos)
+	case mathMin, mathMax:
+		keep := a.NewLabel()
+		a.Load(rP, arg2.base, arg2.off+offN)
+		if m == mathMin {
+			a.Cmp(rP, rN) // the second if it is less
+		} else {
+			a.Cmp(rN, rP) // the second if the first is less
+		}
+		a.J(GE, keep)
+		a.Mov(rN, rP)
+		a.Bind(keep)
+	}
+	c.storeInteger(fn, rN) // floor and ceil: the integer itself
+	a.Jmp(next)
+	// Floats.
+	a.Bind(isFloat)
+	if (m == mathFloor || m == mathCeil) && !c.sse41 {
+		a.Jmp(goCall)
+		return
+	}
+	c.guardStore(fn, noReg, ip)
+	a.LoadSD(0, arg.base, arg.off+offN)
+	switch m {
+	case mathFloor, mathCeil:
+		mode := byte(1) // toward minus infinity
+		if m == mathCeil {
+			mode = 2
+		}
+		a.RoundSD(0, 0, mode)
+		// An integer when one holds it, -2^63 <= f < 2^63, as
+		// pushIntegerIfFits decides; otherwise the float.
+		float := a.NewLabel()
+		a.MovImm(rTmp, math.Float64bits(1<<63))
+		a.MovqToX(1, rTmp)
+		a.Ucomisd(0, 1)
+		a.J(P, float) // NaN
+		a.J(AE, float)
+		a.MovImm(rTmp, math.Float64bits(-(1 << 63)))
+		a.MovqToX(1, rTmp)
+		a.Ucomisd(0, 1)
+		a.J(B, float)
+		a.Cvttsd2si(rN, 0)
+		c.storeInteger(fn, rN)
+		a.Jmp(next)
+		a.Bind(float)
+	case mathAbs:
+		a.MovImm(rTmp, 1<<63-1)
+		a.MovqToX(1, rTmp)
+		a.AndPD(0, 1)
+	case mathMin, mathMax:
+		// Lua's <, false for NaN either way: the first unless the second
+		// is less (min), or the first is less than the second (max).
+		keep := a.NewLabel()
+		a.LoadSD(1, arg2.base, arg2.off+offN)
+		if m == mathMin {
+			a.Ucomisd(1, 0)
+		} else {
+			a.Ucomisd(0, 1)
+		}
+		a.J(P, keep)
+		a.J(AE, keep)
+		a.MovSD(0, 1)
+		a.Bind(keep)
+	}
+	c.storeNumber(fn, 0)
+	a.Jmp(next)
 }
 
 // intrinsic compiles a unary intrinsic call, jumping to notGo when the
@@ -666,7 +809,7 @@ func (c *amd64Compiler) intrinsic(ip int, i bytecode.Instruction, notGo Label) {
 	c.branchNumber(rT, notGo) // a number whose bits match the tag
 	a.Load(rT, rT, offGFNumber)
 	a.Test(rT, rT)
-	a.J(E, c.goCallExit(ip))
+	a.J(E, c.plainGoCall(ip)) // perhaps a math function
 	a.Load(rT, rT, offNFUnary)
 	c.loadFloat(0, arg, kindAny, false, ip) // an integer converts, as for a number function
 	done := a.NewLabel()

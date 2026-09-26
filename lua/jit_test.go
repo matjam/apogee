@@ -976,6 +976,35 @@ func TestJITKernelIntrinsicChanged(t *testing.T) {
 	}
 }
 
+// math.floor, ceil, abs, min and max compile inline, and agree with Go's
+// for every kind of argument.
+func TestJITMathFunctions(t *testing.T) {
+	skipWithoutJIT(t)
+	jit, interp, _ := runBoth(t, `
+		local floor, ceil, abs, min, max = math.floor, math.ceil, math.abs, math.min, math.max
+		local xs = {0, -0.0, 0.0, 1, -1, 7, 2.5, -2.5, 1e308, -1e308, 1/0, -1/0, 0/0,
+		  2^63, -2^63, 2^63 - 1024, math.maxinteger, math.mininteger, 0.49999999999999994, -0.5}
+		local function show(v) return math.type(v) .. ":" .. string.format("%.17g", v) .. ":" .. tostring(1/v) end
+		local n = #xs
+		local fl, ce, ab, mi, ma = {}, {}, {}, {}, {}
+		function run()
+		  for i = 1, n do -- no exits: the calls run in compiled code
+		    local x, y = xs[i], xs[n + 1 - i]
+		    fl[i], ce[i], ab[i], mi[i], ma[i] = floor(x), ceil(x), abs(x), min(x, y), max(x, y)
+		  end
+		  local out = {}
+		  for i = 1, n do
+		    out[i] = show(fl[i]) .. show(ce[i]) .. show(ab[i]) .. show(mi[i]) .. show(ma[i])
+		  end
+		  local e1 = select(2, pcall(function() return floor("x") end))
+		  local e2 = select(2, pcall(function() return min(1, {}) end))
+		  return table.concat(out, ";"), e1, e2, min(1, 2, 0), max(3), floor("3.5")
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q, interpreter %q", jit, interp)
+	}
+}
+
 // A function of a few hundred instructions compiles to more than the 32 KB
 // arm64's test branches reach, and still compiles.
 func TestJITLargeFunction(t *testing.T) {

@@ -120,7 +120,7 @@ the environment variable `APOGEE_JIT=off` does that for every state.
 - It compiles arithmetic, comparisons and branches, loops, upvalues,
   table fields (through the interpreter's inline caches) and arrays, calls
   and returns between compiled Lua functions, and `math.floor`, `ceil`,
-  `sqrt`, `abs`, `sin` and `cos` inline, bit for bit as Go computes them
+  `sqrt`, `abs`, `min`, `max`, `sin` and `cos` inline, bit for bit as Go computes them
   (on amd64, `floor` and `ceil` need SSE4.1, and `sin` and `cos` a
   GOAMD64 level below v3).
   Numeric loops run with their variables in registers.

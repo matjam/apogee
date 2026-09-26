@@ -54,6 +54,7 @@ type arm64Compiler struct {
 	exits   []Label // exit to the interpreter at each pc, created on demand
 	budget  []Label // budget exits by back-edge target pc, created on demand
 	goCall  []Label // exits at a CALL of a Go function, created on demand
+	plainGo []Label // goCallee's code for a Go function no number function (plainGoCall)
 	numCall []Label // exits at a CALL of a number function, created on demand
 	notLua  []Label // a CALL's out-of-line code for callees other than Lua closures
 	strSelf []Label // a SELF's out-of-line code for receivers other than tables
@@ -96,6 +97,7 @@ func compileARM64(p *prototype, g *globalState, cl *luaClosure, longTests bool) 
 	c.exits = make([]Label, len(c.code))
 	c.budget = make([]Label, len(c.code))
 	c.goCall = make([]Label, len(c.code))
+	c.plainGo = make([]Label, len(c.code))
 	c.numCall = make([]Label, len(c.code))
 	c.notLua = make([]Label, len(c.code))
 	c.strSelf = make([]Label, len(c.code))
@@ -103,6 +105,7 @@ func compileARM64(p *prototype, g *globalState, cl *luaClosure, longTests bool) 
 	for i := range c.pcs {
 		c.pcs[i], c.exits[i], c.budget[i] = c.a.NewLabel(), -1, -1
 		c.goCall[i], c.numCall[i], c.notLua[i], c.strSelf[i] = -1, -1, -1, -1
+		c.plainGo[i] = -1
 	}
 	c.prologue()
 	loops := map[int][]*kernel{}

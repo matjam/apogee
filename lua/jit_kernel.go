@@ -36,6 +36,11 @@ import (
 //   - GETTABLE and SETTABLE of a buffer in a register the loop only reads,
 //     at an integer key. The kernel checks on entry that the register holds
 //     a buffer, of floats if the loop reads it.
+//   - Upvalues holding numbers or buffers (GETUPVAL, and GETTABUP and
+//     SETTABUP of a buffer), which nothing in a kernel can change. The
+//     kernel checks them on entry and keeps them in jitContext.hoist; a
+//     register GETUPVAL gives a buffer aliases it there, and gets its value
+//     only when the kernel leaves.
 //
 // Those instructions can find what the kernel cannot handle: a key outside
 // the buffer, or an argument sin or cos leave to Go. They leave the kernel
@@ -55,6 +60,13 @@ type kernelPlan struct {
 	virtual      map[int]bool // GETUPVAL pcs that emit nothing
 	buffers      map[int]bool // registers holding buffers, true for those read
 
+	// Upvalues the body reads, checked and loaded on entry into
+	// jitContext.hoist, by slot; nothing in a kernel can change them.
+	hoisted []hoistedUpValue
+	upLoads map[int]int // GETUPVAL pcs, by pc, and their slots
+	bufUses []bufUse    // GETTABLE and SETTABLE pcs, resolved after typing
+	bufFrom map[int]int // a buffer access's hoisted slot, or -1 for a register
+
 	// A register may hold an integer at one pc and a float at another, as
 	// Lua reuses registers for temporaries: at gives each register's type
 	// before each body pc and at the latch, results the type each body
@@ -72,6 +84,32 @@ type kernelCall struct {
 	fn      uint64
 }
 
+// hoistedUpValue is an upvalue a kernel reads: a number of kind, or a
+// buffer (kindBuffer), which read says the kernel reads from.
+type hoistedUpValue struct {
+	n    int
+	kind numKind
+	read bool
+}
+
+// maxHoisted is how many upvalues jitContext.hoist holds.
+const maxHoisted = 8
+
+// bufUse is a buffer access at ip, of register reg, reading or writing.
+type bufUse struct {
+	ip, reg int
+	read    bool
+}
+
+// kindOf is the type a register loaded from hoisted slot s takes: the
+// upvalue's number kind, or an alias of its buffer.
+func (h hoistedUpValue) kindOf(s int) numKind {
+	if h.kind == kindBuffer {
+		return kindBufferAlias + numKind(s)
+	}
+	return h.kind
+}
+
 // kernelDivisor reports whether constant v may divide in a kernel: a
 // nonzero integer small enough for an immediate.
 func kernelDivisor(v value) bool {
@@ -83,8 +121,10 @@ func kernelDivisor(v value) bool {
 // integer or a float loop, with at most maxFloats float and maxInts
 // integer registers, or nil when its loop does not qualify. constOK
 // reports whether generated code can reach constant k; intrinsic returns
-// the intrinsic upvalue n holds, if it holds one compiled code computes.
-func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, constOK func(k int) bool, intrinsic func(n int) (uint64, bool)) *kernelPlan {
+// the intrinsic upvalue n holds, if it holds one compiled code computes;
+// upValue returns the kind of number, or kindBuffer, upvalue n holds, if
+// it holds one.
+func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, constOK func(k int) bool, intrinsic func(n int) (uint64, bool), upValue func(n int) (numKind, bool)) *kernelPlan {
 	code := p.Code
 	fl := code[latch]
 	start := latch + 1 + fl.SBx()
@@ -92,7 +132,8 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 		return nil
 	}
 	k := &kernelPlan{start: start, latch: latch, intLoop: intLoop, types: map[int]numKind{},
-		calls: map[int]kernelCall{}, virtual: map[int]bool{}, buffers: map[int]bool{}}
+		calls: map[int]kernelCall{}, virtual: map[int]bool{}, buffers: map[int]bool{},
+		upLoads: map[int]int{}, bufFrom: map[int]int{}}
 	wrote := map[int]bool{} // registers the body writes, which cannot hold buffers
 	used := map[int]bool{}  // registers holding numbers
 	base := fl.A()
@@ -191,14 +232,25 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			if _, ok := kernelJump(code, ip, latch); !ok {
 				return nil
 			}
-		case bytecode.OpGetUpValue: // an intrinsic for the CALL it feeds
-			call, ok := intrinsicCall(code, ip, start, latch)
-			fn, isIntrinsic := intrinsic(i.B())
-			if !ok || !isIntrinsic {
+		case bytecode.OpGetUpValue:
+			// An intrinsic for the CALL it feeds, or a number or buffer the
+			// kernel loads on entry.
+			if call, ok := intrinsicCall(code, ip, start, latch); ok {
+				if fn, isIntrinsic := intrinsic(i.B()); isIntrinsic {
+					k.calls[call] = kernelCall{upValue: i.B(), fn: fn}
+					k.virtual[ip] = true
+					break
+				}
+			}
+			kind, ok := upValue(i.B())
+			if !ok || !write(i.A(), ip) {
 				return nil
 			}
-			k.calls[call] = kernelCall{upValue: i.B(), fn: fn}
-			k.virtual[ip] = true
+			s := k.hoist(i.B(), kind)
+			if s < 0 {
+				return nil
+			}
+			k.upLoads[ip] = s
 		case bytecode.OpCall:
 			if _, ok := k.calls[ip]; !ok || !read(i.A()+1) || !write(i.A(), ip) {
 				return nil
@@ -207,33 +259,34 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			if !read(i.C()) || !write(i.A(), ip) {
 				return nil
 			}
-			k.buffers[i.B()] = true
+			k.bufUses = append(k.bufUses, bufUse{ip, i.B(), true})
 		case bytecode.OpSetTable:
 			if !read(i.B()) || !read(i.C()) {
 				return nil
 			}
-			if _, ok := k.buffers[i.A()]; !ok {
-				k.buffers[i.A()] = false
+			k.bufUses = append(k.bufUses, bufUse{ip, i.A(), false})
+		case bytecode.OpGetTableUp, bytecode.OpSetTableUp: // an upvalue buffer's element
+			up, key, get := i.B(), i.C(), i.OpCode() == bytecode.OpGetTableUp
+			if !get {
+				up, key = i.A(), i.B()
 			}
+			if kind, ok := upValue(up); !ok || kind != kindBuffer || !read(key) {
+				return nil
+			}
+			if get && !write(i.A(), ip) || !get && !read(i.C()) {
+				return nil
+			}
+			s := k.hoist(up, kindBuffer)
+			if s < 0 {
+				return nil
+			}
+			k.bufFrom[ip] = s
+			k.hoisted[s].read = k.hoisted[s].read || i.OpCode() == bytecode.OpGetTableUp
 		default:
 			return nil
 		}
 	}
-	for r := range k.buffers {
-		// A buffer register the loop never writes, and not a number.
-		if used[r] || wrote[r] {
-			return nil
-		}
-		// Nor one the function makes a table in: that register is surely
-		// a table, and a kernel whose entry check fails costs the ordinary
-		// loop the check each iteration.
-		for _, i := range code {
-			if i.OpCode() == bytecode.OpNewTable && i.A() == r {
-				return nil
-			}
-		}
-	}
-	if len(k.calls) > 0 || len(k.buffers) > 0 {
+	if len(k.calls) > 0 || len(k.bufUses) > 0 {
 		// A side exit leaves mid-iteration, where the enclosing function's
 		// locals, below the loop's registers, that the body has yet to write
 		// must hold the last iteration's values: an error from there may
@@ -253,13 +306,38 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 	if !k.inferTypes(p) {
 		return nil
 	}
+	// Each buffer access reads an upvalue's buffer, which its register
+	// aliases there, or a register's.
+	for _, u := range k.bufUses {
+		if s, ok := bufferSlot(k.typeAt(u.ip, u.reg)); ok {
+			k.bufFrom[u.ip] = s
+			k.hoisted[s].read = k.hoisted[s].read || u.read
+			continue
+		}
+		k.bufFrom[u.ip] = -1
+		k.buffers[u.reg] = k.buffers[u.reg] || u.read
+	}
+	for r := range k.buffers {
+		// A buffer register the loop never writes, and not a number.
+		if used[r] || wrote[r] {
+			return nil
+		}
+		// Nor one the function makes a table in: that register is surely
+		// a table, and a kernel whose entry check fails costs the ordinary
+		// loop the check each iteration.
+		for _, i := range code {
+			if i.OpCode() == bytecode.OpNewTable && i.A() == r {
+				return nil
+			}
+		}
+	}
 	// A machine register for each type each register takes, in order of
 	// first appearance.
 	k.slots = map[kslot]int{}
 	floats, ints := 0, 0
 	assign := func(r int, t numKind) {
 		s := kslot{r, t}
-		if _, ok := k.slots[s]; ok {
+		if _, ok := k.slots[s]; ok || !isNumKind(t) {
 			return
 		}
 		if t == kindInt {
@@ -285,6 +363,24 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 	return k
 }
 
+// hoist returns upvalue n's slot in jitContext.hoist, adding it, or -1
+// when the slots are full or n holds something else elsewhere.
+func (k *kernelPlan) hoist(n int, kind numKind) int {
+	for s, h := range k.hoisted {
+		if h.n == n {
+			if h.kind != kind {
+				return -1
+			}
+			return s
+		}
+	}
+	if len(k.hoisted) == maxHoisted {
+		return -1
+	}
+	k.hoisted = append(k.hoisted, hoistedUpValue{n: n, kind: kind})
+	return len(k.hoisted) - 1
+}
+
 // kslot is a register holding a type, which has a machine register.
 type kslot struct {
 	r int
@@ -303,6 +399,23 @@ func upValueIntrinsic(cl *luaClosure, n int, fns []uint64) (uint64, bool) {
 	}
 	fn := funcValue(f.number.unary)
 	return fn, slices.Contains(fns, fn)
+}
+
+// upValueKind returns the kind of number cl's upvalue n holds, or
+// kindBuffer for a buffer, when the function compiles.
+func upValueKind(cl *luaClosure, n int) (numKind, bool) {
+	if cl == nil || n >= len(cl.upValues) || cl.upValues[n] == nil {
+		return kindAny, false
+	}
+	switch v := cl.upValues[n].value(); {
+	case v.isFloat():
+		return kindFloat, true
+	case v.isInteger():
+		return kindInt, true
+	case v.userData() != nil && v.userData().buf != nil:
+		return kindBuffer, true
+	}
+	return kindAny, false
 }
 
 // intrinsicCall returns the pc of the CALL A 2 2 that the GETUPVAL A at ip
@@ -405,7 +518,7 @@ func result(p *prototype, i bytecode.Instruction, state map[int]numKind) (numKin
 			return kindInt, true
 		}
 		return kindAny, true
-	case bytecode.OpDiv, bytecode.OpCall, bytecode.OpGetTable: // intrinsics and buffers of floats
+	case bytecode.OpDiv, bytecode.OpCall, bytecode.OpGetTable, bytecode.OpGetTableUp: // intrinsics and buffers of floats
 		return kindFloat, true
 	case bytecode.OpMod, bytecode.OpIDiv:
 		b := state[i.B()]
@@ -528,7 +641,13 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 			t, _ := kernelJump(code, ip, k.latch)
 			incoming[t-k.start] = append(incoming[t-k.start], cur)
 			cur = nil
-		case bytecode.OpGetUpValue, bytecode.OpSetTable: // no number written
+		case bytecode.OpSetTable, bytecode.OpSetTableUp: // nothing written
+		case bytecode.OpGetUpValue: // an intrinsic's writes nothing
+			if s, ok := k.upLoads[ip]; ok {
+				t := k.hoisted[s].kindOf(s)
+				results[ip] = t
+				cur[i.A()] = t
+			}
 		default:
 			t, ok := result(p, i, cur)
 			if !ok {
@@ -579,11 +698,16 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 			return false
 		}
 	}
+	for _, r := range k.liveIn {
+		if !isNumKind(k.types[r]) { // not an alias, checked on entry as a number
+			return false
+		}
+	}
 	for ip := k.start; ip < k.latch; ip++ {
 		i := code[ip]
-		known := func(fields ...int) bool {
+		known := func(fields ...int) bool { // numbers, not aliases
 			for _, f := range fields {
-				if k.kind(p, ip, f) == kindAny {
+				if !isNumKind(k.kind(p, ip, f)) {
 					return false
 				}
 			}
@@ -599,12 +723,12 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 			continue
 		case bytecode.OpJump, bytecode.OpGetUpValue:
 			continue
-		case bytecode.OpSetTable:
+		case bytecode.OpSetTable, bytecode.OpSetTableUp:
 			if k.kind(p, ip, i.B()) != kindInt || !known(i.C()) {
 				return false
 			}
 			continue
-		case bytecode.OpGetTable:
+		case bytecode.OpGetTable, bytecode.OpGetTableUp:
 			if k.kind(p, ip, i.C()) != kindInt {
 				return false
 			}
@@ -612,7 +736,11 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 			if !known(i.A() + 1) {
 				return false
 			}
-		case bytecode.OpMove, bytecode.OpUnaryMinus:
+		case bytecode.OpMove: // of a number or an alias
+			if k.kind(p, ip, i.B()) == kindAny {
+				return false
+			}
+		case bytecode.OpUnaryMinus:
 			if !known(i.B()) {
 				return false
 			}
@@ -692,7 +820,21 @@ const (
 	kindAny numKind = iota
 	kindFloat
 	kindInt
+	kindBuffer // an upvalue holding a buffer, in hoistedUpValue
+
+	// kindBufferAlias + s is a kernel register holding hoisted slot s's
+	// buffer, which the kernel keeps in the context, not the register.
+	kindBufferAlias numKind = 16
 )
+
+// isNumKind reports whether t is a number's type.
+func isNumKind(t numKind) bool { return t == kindFloat || t == kindInt }
+
+// bufferSlot returns the hoisted slot a register of type t aliases, if it
+// is an alias.
+func bufferSlot(t numKind) (int, bool) {
+	return int(t - kindBufferAlias), t >= kindBufferAlias
+}
 
 // constKind is the number type of constant v, or kindAny if it is not a
 // number.

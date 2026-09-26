@@ -473,6 +473,10 @@ nothing compiles.
     writes, with an integer key, reads or writes a buffer's element; the
     entry check confirms a buffer (of floats, if read). A register the
     function puts a new table in is never taken for one.
+  - **Upvalues.** Numbers and buffers in upvalues (GETUPVAL, GETTABUP,
+    SETTABUP) are checked on entry and kept in `jitContext.hoist`
+    (`hoisted`, at most `maxHoisted`). A register holding such a buffer
+    is typed as an alias of it and written back only on the way out.
   - **Side exits.** A key out of range, a float for an integer buffer or
     an argument trig leaves to Go leaves the kernel mid-body
     (`kernelSideExit`): it writes back the registers defined at that pc

@@ -40,9 +40,10 @@ func (c *amd64Compiler) findKernels(latch int) []*kernel {
 	}
 	constOK := func(k int) bool { _, ok := c.constant(k); return ok }
 	intrinsic := func(n int) (uint64, bool) { return upValueIntrinsic(c.cl, n, fns) }
+	upValue := func(n int) (numKind, bool) { return upValueKind(c.cl, n) }
 	var ks []*kernel
 	for _, intLoop := range []bool{true, false} {
-		plan := planKernel(c.p, latch, intLoop, kernelCount, len(kernelInts), constOK, intrinsic)
+		plan := planKernel(c.p, latch, intLoop, kernelCount, len(kernelInts), constOK, intrinsic, upValue)
 		if plan == nil {
 			continue
 		}
@@ -153,6 +154,38 @@ func (c *amd64Compiler) kernelGuards(k *kernel, normal Label) {
 			a.J(A, normal)
 		}
 	}
+	// Upvalues the body reads, into jitContext.hoist: a number's bits, or
+	// a buffer's *buffer.
+	for s, h := range k.hoisted {
+		c.upValueAddr(h.n)
+		if h.kind == kindBuffer {
+			a.Load(rTmp, rAddr, offN)
+			a.MovImm(rTmp2, tagOf(vkUserData))
+			a.Cmp(rTmp, rTmp2)
+			a.J(NE, normal)
+			a.Load(rTmp, rAddr, offP)
+			c.branchNumber(rTmp, normal)
+			a.Load(rTmp, rTmp, offUDBuf)
+			a.Test(rTmp, rTmp)
+			a.J(E, normal)
+			if h.read {
+				a.Load8(rTmp2, rTmp, offBufKind)
+				a.CmpImm(rTmp2, int32(bufferFloat32))
+				a.J(A, normal)
+			}
+		} else {
+			a.Load(rTmp, rAddr, offP)
+			a.Sub(rTmp, rNumber) // 0 for a float, 1 for an integer
+			if h.kind == kindInt {
+				a.CmpImm(rTmp, 1)
+			} else {
+				a.Test(rTmp, rTmp)
+			}
+			a.J(NE, normal)
+			a.Load(rTmp, rAddr, offN)
+		}
+		a.Store(rCtx, offHoist+uint32(s)*8, rTmp)
+	}
 }
 
 // kernelSideExit returns a label that leaves k at ip: it writes k's
@@ -226,13 +259,18 @@ func (c *amd64Compiler) kernelCall(k *kernel, ip int, i bytecode.Instruction) {
 	a.MovSD(k.reg(i.A()), 0)
 }
 
-// kernelBuffer checks that key is inside the buffer in register obj,
-// branching to side otherwise, and leaves the address of its first element
-// in DX and its kind in AX. The key is in keyReg, or a constant.
-func (c *amd64Compiler) kernelBuffer(k *kernel, obj, key int, side Label) (keyReg Reg, keyConst int64, isConst bool) {
+// kernelBuffer checks that key is inside the buffer the access at ip
+// reads, in register obj or hoisted, branching to side otherwise, and
+// leaves the address of its first element in DX and its kind in AX. The
+// key is in keyReg, or a constant.
+func (c *amd64Compiler) kernelBuffer(k *kernel, ip, obj, key int, side Label) (keyReg Reg, keyConst int64, isConst bool) {
 	a := &c.a
-	a.Load(rTmp, rFrame, reg(obj).off+offP) // the userdata
-	a.Load(rTmp, rTmp, offUDBuf)
+	if s := k.bufFrom[ip]; s >= 0 {
+		a.Load(rTmp, rCtx, offHoist+uint32(s)*8) // the *buffer
+	} else {
+		a.Load(rTmp, rFrame, reg(obj).off+offP) // the userdata
+		a.Load(rTmp, rTmp, offUDBuf)
+	}
 	a.Load(DX, rTmp, offBufLen)
 	if bytecode.IsConstant(key) {
 		keyConst, isConst = c.p.Constants[bytecode.ConstantIndex(key)].i(), true
@@ -266,7 +304,7 @@ func (c *amd64Compiler) elementAddr(keyReg Reg, keyConst int64, isConst bool, sc
 func (c *amd64Compiler) kernelGetBuffer(k *kernel, ip int, i bytecode.Instruction) {
 	a := &c.a
 	side := c.kernelSideExit(k, ip)
-	keyReg, keyConst, isConst := c.kernelBuffer(k, i.B(), i.C(), side)
+	keyReg, keyConst, isConst := c.kernelBuffer(k, ip, i.B(), i.C(), side)
 	f32, done := a.NewLabel(), a.NewLabel()
 	a.Test(rTmp, rTmp)
 	a.J(NE, f32)
@@ -285,7 +323,7 @@ func (c *amd64Compiler) kernelGetBuffer(k *kernel, ip int, i bytecode.Instructio
 func (c *amd64Compiler) kernelSetBuffer(k *kernel, ip int, i bytecode.Instruction) {
 	a := &c.a
 	side := c.kernelSideExit(k, ip)
-	keyReg, keyConst, isConst := c.kernelBuffer(k, i.A(), i.B(), side)
+	keyReg, keyConst, isConst := c.kernelBuffer(k, ip, i.A(), i.B(), side)
 	val := i.C()
 	kind := k.kind(c.p, ip, val)
 	var constant value
@@ -393,6 +431,15 @@ func (c *amd64Compiler) flush(k *kernel, types map[int]numKind) {
 			c.storeNumber(reg(r), k.reg(r))
 		}
 	}
+	// A register aliasing a hoisted buffer gets the upvalue's value, as
+	// the ordinary code expects. This uses kernel registers, so comes last.
+	for _, r := range k.writtenOnce() {
+		if s, ok := bufferSlot(types[r]); ok {
+			c.upValueAddr(k.hoisted[s].n)
+			c.load(operand{rAddr, 0})
+			c.store(reg(r))
+		}
+	}
 }
 
 // floatOperand returns an SSE register holding RK field as a float before
@@ -443,6 +490,9 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 	isInt := k.results[ip] == kindInt // what the instruction writes to A
 	switch op := i.OpCode(); op {
 	case bytecode.OpMove:
+		if !isNumKind(k.results[ip]) {
+			break // an alias of a hoisted buffer: nothing to move
+		}
 		if isInt {
 			a.Mov(k.ireg(i.A()), k.ireg(i.B()))
 		} else {
@@ -547,12 +597,21 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 	case bytecode.OpJump:
 		t, _ := kernelJump(p.Code, ip, k.latch)
 		a.Jmp(k.target(t, latch))
-	case bytecode.OpGetUpValue: // the function an intrinsic call checked on entry
+	case bytecode.OpGetUpValue:
+		// The function an intrinsic call checked on entry, or a buffer the
+		// context holds: nothing. A number, from the context.
+		if s, ok := k.upLoads[ip]; ok && isNumKind(k.results[ip]) {
+			if isInt {
+				a.Load(k.ireg(i.A()), rCtx, offHoist+uint32(s)*8)
+			} else {
+				a.LoadSD(k.reg(i.A()), rCtx, offHoist+uint32(s)*8)
+			}
+		}
 	case bytecode.OpCall:
 		c.kernelCall(k, ip, i)
-	case bytecode.OpGetTable:
+	case bytecode.OpGetTable, bytecode.OpGetTableUp: // GETTABUP's B, the upvalue, is hoisted
 		c.kernelGetBuffer(k, ip, i)
-	case bytecode.OpSetTable:
+	case bytecode.OpSetTable, bytecode.OpSetTableUp:
 		c.kernelSetBuffer(k, ip, i)
 	}
 	return 0

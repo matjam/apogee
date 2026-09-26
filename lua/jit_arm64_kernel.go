@@ -41,9 +41,10 @@ func (c *arm64Compiler) findKernels(latch int) []*kernel {
 	}
 	constOK := func(k int) bool { _, ok := c.constant(k); return ok }
 	intrinsic := func(n int) (uint64, bool) { return upValueIntrinsic(c.cl, n, fns) }
+	upValue := func(n int) (numKind, bool) { return upValueKind(c.cl, n) }
 	var ks []*kernel
 	for _, intLoop := range []bool{true, false} {
-		plan := planKernel(c.p, latch, intLoop, kernelCount, len(kernelInts), constOK, intrinsic)
+		plan := planKernel(c.p, latch, intLoop, kernelCount, len(kernelInts), constOK, intrinsic, upValue)
 		if plan == nil {
 			continue
 		}
@@ -159,6 +160,36 @@ func (c *arm64Compiler) kernelGuards(k *kernel, normal Label) {
 			a.BCond(HI, normal)
 		}
 	}
+	// Upvalues the body reads, into jitContext.hoist: a number's bits, or
+	// a buffer's *buffer.
+	for s, h := range k.hoisted {
+		c.upValueAddr(h.n)
+		if h.kind == kindBuffer {
+			a.Ldr(rTmp, rAddr, offN)
+			a.MovImm(rTmp2, tagOf(vkUserData))
+			a.Cmp(rTmp, rTmp2)
+			a.BCond(NE, normal)
+			a.Ldr(rTmp, rAddr, offP)
+			c.branchNumber(rTmp, normal)
+			a.Ldr(rTmp, rTmp, offUDBuf)
+			a.Cbz(rTmp, normal)
+			if h.read {
+				a.Ldrb(rTmp2, rTmp, offBufKind)
+				a.CmpImm(rTmp2, uint32(bufferFloat32))
+				a.BCond(HI, normal)
+			}
+		} else {
+			a.Ldr(rTmp, rAddr, offP)
+			if h.kind == kindInt {
+				a.Cmp(rTmp, rInteger)
+			} else {
+				a.Cmp(rTmp, rNumber)
+			}
+			a.BCond(NE, normal)
+			a.Ldr(rTmp, rAddr, offN)
+		}
+		a.Str(rTmp, rCtx, offHoist+uint32(s)*8)
+	}
 }
 
 // kernelSideExit returns a label that leaves k at ip: it writes k's
@@ -231,11 +262,12 @@ func (c *arm64Compiler) kernelCall(k *kernel, ip int, i bytecode.Instruction) {
 	a.Fmov(k.reg(i.A()), 0)
 }
 
-// kernelBuffer checks that key is inside the buffer in register obj,
-// branching to side otherwise, and leaves the address of its first element
-// in rTmp2 and its kind in rTmp. It returns the register holding the key:
-// its kernel register, or rExitPC for a constant.
-func (c *arm64Compiler) kernelBuffer(k *kernel, obj, key int, side Label) Reg {
+// kernelBuffer checks that key is inside the buffer the access at ip
+// reads, in register obj or hoisted, branching to side otherwise, and
+// leaves the address of its first element in rTmp2 and its kind in rTmp.
+// It returns the register holding the key: its kernel register, or
+// rExitPC for a constant.
+func (c *arm64Compiler) kernelBuffer(k *kernel, ip, obj, key int, side Label) Reg {
 	a := &c.a
 	keyReg := rExitPC
 	if bytecode.IsConstant(key) {
@@ -243,8 +275,12 @@ func (c *arm64Compiler) kernelBuffer(k *kernel, obj, key int, side Label) Reg {
 	} else {
 		keyReg = k.ireg(key)
 	}
-	a.Ldr(rTmp, rFrame, reg(obj).off+offP) // the userdata
-	a.Ldr(rTmp, rTmp, offUDBuf)
+	if s := k.bufFrom[ip]; s >= 0 {
+		a.Ldr(rTmp, rCtx, offHoist+uint32(s)*8) // the *buffer
+	} else {
+		a.Ldr(rTmp, rFrame, reg(obj).off+offP) // the userdata
+		a.Ldr(rTmp, rTmp, offUDBuf)
+	}
 	a.Ldr(rTmp2, rTmp, offBufLen)
 	a.Cmp(keyReg, rTmp2)
 	a.BCond(HS, side) // unsigned: below 0 too
@@ -256,7 +292,7 @@ func (c *arm64Compiler) kernelBuffer(k *kernel, obj, key int, side Label) Reg {
 // kernelGetBuffer compiles GETTABLE A B C in k: a buffer of floats' element.
 func (c *arm64Compiler) kernelGetBuffer(k *kernel, ip int, i bytecode.Instruction) {
 	a := &c.a
-	key := c.kernelBuffer(k, i.B(), i.C(), c.kernelSideExit(k, ip))
+	key := c.kernelBuffer(k, ip, i.B(), i.C(), c.kernelSideExit(k, ip))
 	d := k.reg(i.A())
 	f32, done := a.NewLabel(), a.NewLabel()
 	a.Cbnz(rTmp, f32)
@@ -276,7 +312,7 @@ func (c *arm64Compiler) kernelGetBuffer(k *kernel, ip int, i bytecode.Instructio
 func (c *arm64Compiler) kernelSetBuffer(k *kernel, ip int, i bytecode.Instruction) {
 	a := &c.a
 	side := c.kernelSideExit(k, ip)
-	key := c.kernelBuffer(k, i.A(), i.B(), side)
+	key := c.kernelBuffer(k, ip, i.A(), i.B(), side)
 	val := i.C()
 	kind := k.kind(c.p, ip, val)
 	var constant value
@@ -395,6 +431,15 @@ func (c *arm64Compiler) flush(k *kernel, types map[int]numKind) {
 			c.storeNumber(reg(r), k.reg(r))
 		}
 	}
+	// A register aliasing a hoisted buffer gets the upvalue's value, as
+	// the ordinary code expects. This uses kernel registers, so comes last.
+	for _, r := range k.writtenOnce() {
+		if s, ok := bufferSlot(types[r]); ok {
+			c.upValueAddr(k.hoisted[s].n)
+			c.load(operand{rAddr, 0})
+			c.store(reg(r))
+		}
+	}
 }
 
 // floatOperand returns a floating-point register holding RK field as a
@@ -448,6 +493,9 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 	isInt := k.results[ip] == kindInt // what the instruction writes to A
 	switch op := i.OpCode(); op {
 	case bytecode.OpMove:
+		if !isNumKind(k.results[ip]) {
+			break // an alias of a hoisted buffer: nothing to move
+		}
 		if isInt {
 			a.Mov(k.ireg(i.A()), k.ireg(i.B()))
 		} else {
@@ -539,12 +587,21 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 	case bytecode.OpJump:
 		t, _ := kernelJump(p.Code, ip, k.latch)
 		a.B(k.target(t, latch))
-	case bytecode.OpGetUpValue: // the function an intrinsic call checked on entry
+	case bytecode.OpGetUpValue:
+		// The function an intrinsic call checked on entry, or a buffer the
+		// context holds: nothing. A number, from the context.
+		if s, ok := k.upLoads[ip]; ok && isNumKind(k.results[ip]) {
+			if isInt {
+				a.Ldr(k.ireg(i.A()), rCtx, offHoist+uint32(s)*8)
+			} else {
+				a.LdrD(k.reg(i.A()), rCtx, offHoist+uint32(s)*8)
+			}
+		}
 	case bytecode.OpCall:
 		c.kernelCall(k, ip, i)
-	case bytecode.OpGetTable:
+	case bytecode.OpGetTable, bytecode.OpGetTableUp: // GETTABUP's B, the upvalue, is hoisted
 		c.kernelGetBuffer(k, ip, i)
-	case bytecode.OpSetTable:
+	case bytecode.OpSetTable, bytecode.OpSetTableUp:
 		c.kernelSetBuffer(k, ip, i)
 	}
 	return 0

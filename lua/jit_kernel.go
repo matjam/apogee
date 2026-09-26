@@ -90,7 +90,8 @@ type kernelPlan struct {
 type kernelCall struct {
 	upValue int
 	fn      uint64
-	get, a  int // the GETUPVAL's pc, and the register it and the CALL name
+	get, a  int    // the GETUPVAL's pc, and the register it and the CALL name
+	math    mathFn // a math function, or mathNone for a number function
 }
 
 // calleesAt returns the intrinsic calls whose callee register the
@@ -156,11 +157,12 @@ func kernelDivisor(v value) bool {
 // integer or a float loop, with at most maxFloats float and maxInts
 // integer registers, or nil when its loop does not qualify. constOK
 // reports whether generated code can reach constant k; intrinsic returns
-// the intrinsic upvalue n holds, if it holds one compiled code computes;
+// the intrinsic upvalue n holds, if it holds one compiled code computes: a
+// number function's code, or a math function (mathFn) and its code;
 // upValue returns the kind of number, or kindBuffer, upvalue n holds, if
 // it holds one; floor reports whether the machine rounds a float down in
 // one instruction, for // of floats.
-func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, constOK func(k int) bool, intrinsic func(n int) (uint64, bool), upValue func(n int) (numKind, bool), floor bool) *kernelPlan {
+func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool) *kernelPlan {
 	code := p.Code
 	fl := code[latch]
 	start := latch + 1 + fl.SBx()
@@ -292,9 +294,10 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 		case bytecode.OpGetUpValue:
 			// An intrinsic for the CALL it feeds, or a number or buffer the
 			// kernel loads on entry.
-			if call, ok := intrinsicCall(code, ip, start, latch); ok {
-				if fn, isIntrinsic := intrinsic(i.B()); isIntrinsic {
-					k.calls[call] = kernelCall{upValue: i.B(), fn: fn, get: ip, a: i.A()}
+			if call, args, ok := intrinsicCall(code, ip, start, latch); ok {
+				fn, m, isIntrinsic := intrinsic(i.B())
+				if isIntrinsic && args == 1 == (m == mathNone || m.unary()) {
+					k.calls[call] = kernelCall{upValue: i.B(), fn: fn, get: ip, a: i.A(), math: m}
 					k.virtual[ip] = true
 					break
 				}
@@ -309,7 +312,7 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			}
 			k.upLoads[ip] = s
 		case bytecode.OpCall:
-			if _, ok := k.calls[ip]; !ok || !read(i.A()+1) || !write(i.A(), ip) {
+			if _, ok := k.calls[ip]; !ok || !read(i.A()+1) || i.B() == 3 && !read(i.A()+2) || !write(i.A(), ip) {
 				return nil
 			}
 		case bytecode.OpGetTable: // a buffer's element, at a key checked below
@@ -594,44 +597,41 @@ func upValueKind(cl *luaClosure, n int) (numKind, bool) {
 	return kindAny, false
 }
 
-// intrinsicCall returns the pc of the CALL A 2 2 that the GETUPVAL A at ip
-// feeds, when only arithmetic, upvalue loads and buffer reads that leave A
-// alone lie between them, and no jump in the body lands there. A buffer
-// read may leave the kernel; its side exit stores the function in A
-// (calleesAt), as the GETUPVAL would have.
-func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, bool) {
+// intrinsicCall returns the pc of the CALL A B 2 that the GETUPVAL A at ip
+// feeds, and its argument count, one or two, when only arithmetic,
+// upvalue loads and buffer reads that leave A alone lie between them, and
+// no jump in the body lands there. A buffer read may leave the kernel; its
+// side exit stores the function in A (calleesAt), as the GETUPVAL would
+// have.
+func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, int, bool) {
 	a := code[ip].A()
 	for j := ip + 1; j < latch; j++ {
 		i := code[j]
 		for from := start; from < latch; from++ {
 			if t, ok := kernelJump(code, from, latch); ok && t == j {
-				return 0, false
+				return 0, 0, false
 			}
 		}
+		clobbers := false
 		switch i.OpCode() {
 		case bytecode.OpCall:
-			return j, i.A() == a && i.B() == 2 && i.C() == 2
+			return j, i.B() - 1, i.A() == a && (i.B() == 2 || i.B() == 3) && i.C() == 2
 		case bytecode.OpMove, bytecode.OpUnaryMinus:
-			if i.A() == a || i.B() == a {
-				return 0, false
-			}
+			clobbers = i.A() == a || i.B() == a
 		case bytecode.OpLoadConstant, bytecode.OpGetUpValue:
-			if i.A() == a {
-				return 0, false
-			}
+			clobbers = i.A() == a
 		case bytecode.OpGetTable, bytecode.OpGetTableUp:
-			if i.A() == a || i.C() == a || i.OpCode() == bytecode.OpGetTable && i.B() == a {
-				return 0, false
-			}
+			clobbers = i.A() == a || i.C() == a || i.OpCode() == bytecode.OpGetTable && i.B() == a
 		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpMod, bytecode.OpIDiv:
-			if i.A() == a || i.B() == a || i.C() == a {
-				return 0, false
-			}
+			clobbers = i.A() == a || i.B() == a || i.C() == a
 		default:
-			return 0, false
+			clobbers = true
+		}
+		if clobbers {
+			return 0, 0, false
 		}
 	}
-	return 0, false
+	return 0, 0, false
 }
 
 // guardedUpValues returns the upvalues k's intrinsic calls come from, each
@@ -647,14 +647,44 @@ func (k *kernelPlan) guardedUpValues() []int {
 	return ns
 }
 
-// upValueFn returns the intrinsic upvalue n must hold.
-func (k *kernelPlan) upValueFn(n int) uint64 {
+// upValueFn returns the intrinsic upvalue n must hold: a number
+// function's code, or a math function's, when math is set.
+func (k *kernelPlan) upValueFn(n int) (fn uint64, math bool) {
 	for _, kc := range k.calls {
 		if kc.upValue == n {
-			return kc.fn
+			return kc.fn, kc.math != mathNone
 		}
 	}
-	return 0
+	return 0, false
+}
+
+// callResult returns the type the intrinsic call kc at i gives A with
+// the registers of types state: a number function's float; floor and
+// ceil's integer, which the kernel leaves for Go to make when the float
+// has none; abs's argument's type; and min and max's arguments' type, the
+// same for both. kindAny while an argument's is unknown; false for mixed
+// ones.
+func callResult(kc kernelCall, i bytecode.Instruction, state map[int]numKind) (numKind, bool) {
+	arg := state[i.A()+1]
+	switch kc.math {
+	case mathNone:
+		return kindFloat, true
+	case mathFloor, mathCeil:
+		if arg == kindAny {
+			return kindAny, true
+		}
+		return kindInt, true
+	case mathAbs:
+		return arg, true
+	}
+	arg2 := state[i.A()+2]
+	switch {
+	case arg == kindAny || arg2 == kindAny:
+		return kindAny, true
+	case arg != arg2:
+		return kindAny, false
+	}
+	return arg, true
 }
 
 // bufferRegs returns the registers k indexes as buffers, in order.
@@ -877,6 +907,13 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 			cur[i.A()] = t
 			at[ip+1-k.start] = maps.Clone(cur) // the operator's word
 			ip++
+		case bytecode.OpCall:
+			t, ok := callResult(k.calls[ip], i, cur)
+			if !ok {
+				return nil, nil, false
+			}
+			results[ip] = t
+			cur[i.A()] = t
 		case bytecode.OpSetTable, bytecode.OpSetTableUp: // nothing written
 		case bytecode.OpGetUpValue: // an intrinsic's writes nothing
 			if s, ok := k.upLoads[ip]; ok {
@@ -973,7 +1010,11 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 				return false
 			}
 		case bytecode.OpCall:
-			if !known(i.A() + 1) {
+			if !known(i.A()+1) || i.B() == 3 && !known(i.A()+2) {
+				return false
+			}
+			m := k.calls[ip].math
+			if (m == mathFloor || m == mathCeil) && k.typeAt(ip, i.A()+1) == kindFloat && !k.floor {
 				return false
 			}
 		case bytecode.OpMove: // of a number or an alias

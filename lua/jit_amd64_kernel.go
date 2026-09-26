@@ -43,7 +43,7 @@ func (c *amd64Compiler) findKernels(latch int) []*kernel {
 	upValue := func(n int) (numKind, bool) { return upValueKind(c.cl, n) }
 	var ks []*kernel
 	for _, intLoop := range []bool{true, false} {
-		plan := planKernel(c.p, latch, intLoop, kernelCount, len(kernelInts), constOK, intrinsic, upValue)
+		plan := planKernel(c.p, latch, intLoop, kernelCount, len(kernelInts), constOK, intrinsic, upValue, c.sse41)
 		if plan == nil {
 			continue
 		}
@@ -535,7 +535,41 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 		b, cc := c.floatOperand(k, ip, i.B(), 0), c.floatOperand(k, ip, i.C(), 1)
 		c.arith(op, 4, b, cc) // in X4, as the destination may be an operand
 		a.MovSD(k.reg(i.A()), 4)
-	case bytecode.OpMod, bytecode.OpIDiv:
+	case bytecode.OpBitwise:
+		op := bytecode.ArithOp(p.Code[ip+1].Ax())
+		if b := c.intOperand(k, i.B(), AX); b != AX {
+			a.Mov(AX, b)
+		}
+		switch op {
+		case bytecode.ArithBAnd:
+			a.And(AX, c.intOperand(k, i.C(), DX))
+		case bytecode.ArithBOr:
+			a.Or(AX, c.intOperand(k, i.C(), DX))
+		case bytecode.ArithBXor:
+			a.Xor(AX, c.intOperand(k, i.C(), DX))
+		case bytecode.ArithBNot:
+			a.Not(AX)
+		case bytecode.ArithShl, bytecode.ArithShr:
+			n := p.Constants[bytecode.ConstantIndex(i.C())].i()
+			switch count, zero := constantShift(n, op == bytecode.ArithShr); {
+			case zero:
+				a.MovImm(AX, 0)
+			case count >= 0:
+				a.Shl(AX, uint8(count))
+			default:
+				a.Shr(AX, uint8(-count))
+			}
+		}
+		a.Mov(k.ireg(i.A()), AX)
+		return 1 // the operator's word
+	case bytecode.OpIDiv, bytecode.OpMod:
+		if op == bytecode.OpIDiv && !isInt { // floats: floor(b / c)
+			b, cc := c.floatOperand(k, ip, i.B(), 0), c.floatOperand(k, ip, i.C(), 1)
+			c.arith(bytecode.OpDiv, 4, b, cc)
+			a.RoundSD(4, 4, 1)
+			a.MovSD(k.reg(i.A()), 4)
+			break
+		}
 		// By a nonzero constant: floor the quotient toward minus infinity,
 		// and give the modulo the divisor's sign.
 		kk := bytecode.ConstantIndex(i.C())

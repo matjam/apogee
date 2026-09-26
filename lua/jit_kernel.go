@@ -4,6 +4,7 @@ package lua
 
 import (
 	"maps"
+	"math"
 	"slices"
 
 	"github.com/matjam/apogee/internal/bytecode"
@@ -70,6 +71,7 @@ type kernelPlan struct {
 	// LOADK pcs of integer constants the kernel loads as floats, which no
 	// use can tell apart, provided the fields in needFloat are floats.
 	promoted  map[int]bool
+	floor     bool     // // of floats may compile: see planKernel
 	needFloat [][2]int // pc and RK field
 
 	// A register may hold an integer at one pc and a float at another, as
@@ -142,8 +144,9 @@ func kernelDivisor(v value) bool {
 // reports whether generated code can reach constant k; intrinsic returns
 // the intrinsic upvalue n holds, if it holds one compiled code computes;
 // upValue returns the kind of number, or kindBuffer, upvalue n holds, if
-// it holds one.
-func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, constOK func(k int) bool, intrinsic func(n int) (uint64, bool), upValue func(n int) (numKind, bool)) *kernelPlan {
+// it holds one; floor reports whether the machine rounds a float down in
+// one instruction, for // of floats.
+func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, constOK func(k int) bool, intrinsic func(n int) (uint64, bool), upValue func(n int) (numKind, bool), floor bool) *kernelPlan {
 	code := p.Code
 	fl := code[latch]
 	start := latch + 1 + fl.SBx()
@@ -152,7 +155,7 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 	}
 	k := &kernelPlan{start: start, latch: latch, intLoop: intLoop, types: map[int]numKind{},
 		calls: map[int]kernelCall{}, virtual: map[int]bool{}, buffers: map[int]bool{},
-		upLoads: map[int]int{}, bufFrom: map[int]int{}}
+		upLoads: map[int]int{}, bufFrom: map[int]int{}, floor: floor}
 	wrote := map[int]bool{} // registers the body writes, which cannot hold buffers
 	used := map[int]bool{}  // registers holding numbers
 	base := fl.A()
@@ -227,7 +230,7 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			if !read(i.B()) || !read(i.C()) || !write(i.A(), ip) {
 				return nil
 			}
-		case bytecode.OpMod, bytecode.OpIDiv:
+		case bytecode.OpMod:
 			// An integer divided by a constant: never zero, and fixed sign.
 			if !bytecode.IsConstant(i.C()) || !read(i.C()) || !kernelDivisor(p.Constants[bytecode.ConstantIndex(i.C())]) {
 				return nil
@@ -235,6 +238,22 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			if !read(i.B()) || !write(i.A(), ip) {
 				return nil
 			}
+		case bytecode.OpIDiv:
+			// Of integers by such a constant, or of floats by anything: the
+			// floor of the quotient. checkTypes tells which.
+			if !read(i.B()) || !read(i.C()) || !write(i.A(), ip) {
+				return nil
+			}
+		case bytecode.OpBitwise: // on integers; a shift by a constant
+			op := bytecode.ArithOp(code[ip+1].Ax())
+			shift := op == bytecode.ArithShl || op == bytecode.ArithShr
+			if shift && (!bytecode.IsConstant(i.C()) || !p.Constants[bytecode.ConstantIndex(i.C())].isInteger()) {
+				return nil
+			}
+			if !read(i.B()) || op != bytecode.ArithBNot && !read(i.C()) || !write(i.A(), ip) {
+				return nil
+			}
+			ip++ // the operator's word
 		case bytecode.OpUnaryMinus:
 			if !read(i.B()) || !write(i.A(), ip) {
 				return nil
@@ -456,9 +475,18 @@ func (k *kernelPlan) floatUses(p *prototype, ip, r int) ([][2]int, bool) {
 			if i.A()+1 == r {
 				return nil, false
 			}
+		case bytecode.OpBitwise:
+			if reads(i.B()) || reads(i.C()) {
+				return nil, false
+			}
 		}
 		// The next pcs, unless this one writes r.
 		switch i.OpCode() {
+		case bytecode.OpBitwise: // past the operator's word
+			if i.A() != r {
+				work = append(work, j+2)
+			}
+			continue
 		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
 			t, _ := kernelJump(code, j, k.latch)
 			work = append(work, j+2, t)
@@ -651,11 +679,60 @@ func result(p *prototype, i bytecode.Instruction, state map[int]numKind) (numKin
 		return kindAny, true
 	case bytecode.OpDiv, bytecode.OpCall, bytecode.OpGetTable, bytecode.OpGetTableUp: // intrinsics and buffers of floats
 		return kindFloat, true
-	case bytecode.OpMod, bytecode.OpIDiv:
+	case bytecode.OpMod:
 		b := state[i.B()]
 		return b, b != kindFloat // float % is fmod, which Go computes
+	case bytecode.OpIDiv:
+		b, c := kind(i.B()), kind(i.C())
+		switch {
+		case b == kindFloat || c == kindFloat:
+			return kindFloat, true
+		case b == kindInt && c == kindInt:
+			return kindInt, true
+		}
 	}
 	return kindAny, true
+}
+
+// constantShift folds a shift by constant n, right when right is set, as
+// ShiftLeft does: left by count, right by -count when it is negative, and
+// zero for 64 or more either way.
+func constantShift(n int64, right bool) (count int, zero bool) {
+	if right {
+		if n == math.MinInt64 {
+			return 0, true
+		}
+		n = -n
+	}
+	if n >= 64 || n <= -64 {
+		return 0, true
+	}
+	return int(n), false
+}
+
+// bitwiseResult returns the type OpBitwise i, of operator op, gives A:
+// an integer of integers, kindAny while an operand's type is unknown,
+// and false for a float operand, which must convert exactly first.
+func bitwiseResult(p *prototype, i bytecode.Instruction, op bytecode.ArithOp, state map[int]numKind) (numKind, bool) {
+	fields := []int{i.B(), i.C()}
+	if op == bytecode.ArithBNot {
+		fields = fields[:1]
+	}
+	t := kindInt
+	for _, f := range fields {
+		k := state[f]
+		if bytecode.IsConstant(f) {
+			k = constKind(p.Constants[bytecode.ConstantIndex(f)])
+		}
+		switch k {
+		case kindAny:
+			t = kindAny
+		case kindInt:
+		default:
+			return kindAny, false
+		}
+	}
+	return t, true
 }
 
 // inferTypes types each register at each pc of the body, choosing the
@@ -772,6 +849,15 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 			t, _ := kernelJump(code, ip, k.latch)
 			incoming[t-k.start] = append(incoming[t-k.start], cur)
 			cur = nil
+		case bytecode.OpBitwise:
+			t, ok := bitwiseResult(p, i, bytecode.ArithOp(code[ip+1].Ax()), cur)
+			if !ok {
+				return nil, nil, false
+			}
+			results[ip] = t
+			cur[i.A()] = t
+			at[ip+1-k.start] = maps.Clone(cur) // the operator's word
+			ip++
 		case bytecode.OpSetTable, bytecode.OpSetTableUp: // nothing written
 		case bytecode.OpGetUpValue: // an intrinsic's writes nothing
 			if s, ok := k.upLoads[ip]; ok {
@@ -878,10 +964,26 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 			if !known(i.B()) {
 				return false
 			}
-		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpMod, bytecode.OpIDiv:
+		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpMod:
 			if !known(i.B(), i.C()) {
 				return false
 			}
+		case bytecode.OpIDiv:
+			if !known(i.B(), i.C()) {
+				return false
+			}
+			if k.results[ip] == kindFloat && !k.floor {
+				return false
+			}
+			if k.results[ip] == kindInt && (!bytecode.IsConstant(i.C()) || !kernelDivisor(p.Constants[bytecode.ConstantIndex(i.C())])) {
+				return false
+			}
+		case bytecode.OpBitwise: // bitwiseResult checked the operands
+			if k.results[ip] != kindInt {
+				return false
+			}
+			ip++
+			continue
 		}
 		if k.results[ip] == kindAny {
 			return false

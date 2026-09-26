@@ -342,6 +342,13 @@ cd bench && go test -bench . -benchmem
 C Lua 5.5 (`brew install lua`) is the reference for behaviour the suites
 do not pin down.
 
+## Contributing
+
+Issues and pull requests are welcome, from people and from agents.
+[AGENTS.md](AGENTS.md) describes how the implementation works, the checks
+to run, and how to contribute. Please send a few focused issues and PRs
+rather than many.
+
 ## Licence
 
 MIT, with Shopify's original go-lua copyright retained. See [LICENSE](LICENSE).

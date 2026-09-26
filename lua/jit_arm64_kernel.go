@@ -581,6 +581,15 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 			a.Frintm(d, d)
 			break
 		}
+		if !isInt { // floats, by a floatModDivisor
+			if b := c.floatOperand(k, ip, i.B(), 0); b != 0 {
+				a.Fmov(0, b)
+			}
+			d, _ := floatModDivisor(p.Constants[bytecode.ConstantIndex(i.C())])
+			c.floatMod(d, c.kernelSideExit(k, ip))
+			a.Fmov(k.reg(i.A()), 3)
+			break
+		}
 		// By a nonzero constant: floor the quotient toward minus infinity,
 		// and give the modulo the divisor's sign.
 		divisor := p.Constants[bytecode.ConstantIndex(i.C())].i()

@@ -360,6 +360,9 @@ func (a *Asm) Frintm(fd, fn FReg) { a.emit(0x1e654000 | fn.u()<<5 | fd.u()) }
 // Frintp rounds fn toward plus infinity.
 func (a *Asm) Frintp(fd, fn FReg) { a.emit(0x1e64c000 | fn.u()<<5 | fd.u()) }
 
+// Frintz rounds fn toward zero into fd.
+func (a *Asm) Frintz(fd, fn FReg) { a.emit(0x1e65c000 | fn.u()<<5 | fd.u()) }
+
 // Fcmp compares fn with fm. After it, MI means less, LS less or equal, GT
 // greater and GE greater or equal, all false when either is NaN; EQ is
 // equal and NE is not equal or unordered.

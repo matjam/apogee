@@ -33,6 +33,11 @@ var jitDefault = true
 // the interpreter before it is compiled. Tests set it to zero.
 var jitThreshold int32 = 1000
 
+// jitExitHook, when tests set it, sees every exit from compiled code: the
+// prototype, the pc and the reason. It finds instructions that leave
+// compiled code in hot paths.
+var jitExitHook func(p *prototype, ip int, reason uint64)
+
 // jitBudget is how many loop back-edges compiled code runs before it
 // returns to Go, so the goroutine can be preempted.
 const jitBudget = 1 << 16
@@ -392,6 +397,9 @@ func (l *State) runJIT(ci *callInfo, ip pc, bottom *callInfo) bool {
 			p = c.prototype
 		}
 		ip = pc(l.jitCtx.exitPC)
+		if jitExitHook != nil {
+			jitExitHook(p, int(ip), l.jitCtx.reason)
+		}
 		switch l.jitCtx.reason {
 		case jitExitBudget:
 			if l.global.interrupt.Load() {

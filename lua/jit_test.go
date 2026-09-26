@@ -933,6 +933,14 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  for i = 10, 99 do t = t - max(a[i], -2.25) end
 			  return s1, s2, s3, t, out[0], out[99], out[7], out[8], out[9]
 			end`},
+		{"min of a float and an integer constant keeps the integer", "int", `
+			local min, a = math.min, f64
+			function run()
+			  for i = 0, 99 do a[i] = i * 0.5 end
+			  local v
+			  for i = 0, 99 do v = min(a[i], 1) end
+			  return v, math.type(v)
+			end`},
 		{"float into an integer buffer", "int", `
 			function run()
 			  local i32 = i32

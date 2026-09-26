@@ -496,8 +496,8 @@ func (k *kernelPlan) floatUses(p *prototype, ip, r int) ([][2]int, bool) {
 			if reads(i.B()) || op != bytecode.OpMove && op != bytecode.OpUnaryMinus && reads(i.C()) {
 				return nil, false
 			}
-		case bytecode.OpCall:
-			if i.A()+1 == r {
+		case bytecode.OpCall: // any argument: min(x, 1) returns the integer
+			if r > i.A() && (i.B() == 0 || r < i.A()+i.B()) {
 				return nil, false
 			}
 		case bytecode.OpBitwise:

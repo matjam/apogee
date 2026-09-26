@@ -74,7 +74,9 @@ the project with them: send a few that matter rather than many.
   Every performance PR includes a full benchmark run (bench/README.md,
   Reproducing), saved as the results file for its machine
   (`bench/suite-results-amd64.txt`, or `bench/suite-results.txt` for
-  Apple M1). `bench/chart` redraws that
+  Apple M1). The C interpreters' rows may be carried over from the last
+  run when nothing changed them; say so in bench/README.md.
+  `bench/chart` redraws that
   machine's charts and rewrites its tables in bench/README.md, and
   `-summary` rewrites the root README's table of geometric means from
   both files (bench/README.md, Reproducing).

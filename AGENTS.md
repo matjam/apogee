@@ -802,15 +802,16 @@ In order of expected payoff for real-time scripts such as visualisers:
    vararg; LEN of a table; GETTABLE and SETTABLE with string keys in
    registers.
 
-Each of these is worth a few percent on one or two benchmarks, not more:
-after #116, profiling found no single cause left as large as those the
-rounds above removed.
 7. **The barrier and budget in registers on amd64**, where they live in
    the context: unmeasured.
 8. **The interpreter's placement.** Interpreted Json and string building
    vary by 20% with the address of `executeSwitch` alone; a layout that
    is good wherever the linker puts it would help every build without the
    JIT, Windows included.
+
+Each of these is worth a few percent on one or two benchmarks, not more:
+after #116, profiling found no single cause left as large as those the
+rounds above removed.
 
 Measured and not worth it for now: loop-invariant global loads (plasma
 runs the same with `set` global or local), putting `sin` and `cos`

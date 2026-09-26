@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "333113e01fa8c69d1869ac56dbff9c41af80c749",
+  "include-component-in-tag": false,
+  "packages": {
+    ".": {
+      "release-type": "go",
+      "exclude-paths": ["bench", "cmd/apogee"]
+    }
+  }
+}

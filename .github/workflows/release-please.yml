@@ -1,0 +1,24 @@
+name: release-please
+
+# Keeps a release PR open with the next version and its changelog, from
+# the conventional commits merged since the last release, and tags the
+# release when that PR merges. It runs with RELEASE_PLEASE_KEY, a token
+# rather than GITHUB_TOKEN, so that CI runs on the release PR.
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_KEY }}

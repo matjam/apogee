@@ -74,7 +74,9 @@ the project with them: send a few that matter rather than many.
   Every performance PR includes a full benchmark run (bench/README.md,
   Reproducing), saved as the results file for its machine
   (`bench/suite-results-amd64.txt`, or `bench/suite-results.txt` for
-  Apple M1). `bench/chart` redraws that
+  Apple M1). The C interpreters' rows may be carried over from the last
+  run when nothing changed them; say so in bench/README.md.
+  `bench/chart` redraws that
   machine's charts and rewrites its tables in bench/README.md, and
   `-summary` rewrites the root README's table of geometric means from
   both files (bench/README.md, Reproducing).
@@ -800,15 +802,16 @@ In order of expected payoff for real-time scripts such as visualisers:
    vararg; LEN of a table; GETTABLE and SETTABLE with string keys in
    registers.
 
-Each of these is worth a few percent on one or two benchmarks, not more:
-after #116, profiling found no single cause left as large as those the
-rounds above removed.
 7. **The barrier and budget in registers on amd64**, where they live in
    the context: unmeasured.
 8. **The interpreter's placement.** Interpreted Json and string building
    vary by 20% with the address of `executeSwitch` alone; a layout that
    is good wherever the linker puts it would help every build without the
    JIT, Windows included.
+
+Each of these is worth a few percent on one or two benchmarks, not more:
+after #116, profiling found no single cause left as large as those the
+rounds above removed.
 
 Measured and not worth it for now: loop-invariant global loads (plasma
 runs the same with `set` global or local), putting `sin` and `cos`

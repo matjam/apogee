@@ -866,6 +866,24 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  for i = 0, 9 do local v = i * 0.5; if v > 2 then v = 3 end; out[i] = v * 2 end
 			  return out[1], out[9]
 			end`},
+		{"bitwise operators", "int", `
+			function run()
+			  local i32, s = i32, 0
+			  for i = 0, 99 do i32[i] = (i - 50) & 0xff | 3 end
+			  for i = -50, 49 do s = s + ((i << 3) ~ (i >> 2)) end
+			  for i = -50, 49 do s = s + (~i) + (i << 64) end
+			  for i = -50, 49 do s = s + (i >> -3) + (i >> 70) end
+			  for i = -50, 49 do s = s + (i << -2) end
+			  return s, i32[0], i32[37], i32[99]
+			end`},
+		{"// of floats", "int", `
+			function run()
+			  local a, out, d = f64, f32, 0.0
+			  for i = 0, 99 do a[i] = (i - 50) * 0.37 end
+			  local s = 0.0
+			  for i = 0, 99 do out[i] = a[i] // 1.0; s = s + a[i] // -2.5 + i // 4.0 + (a[i] // d) end
+			  return s, out[0], out[99], out[50]
+			end`},
 		{"float into an integer buffer", "int", `
 			function run()
 			  local i32 = i32

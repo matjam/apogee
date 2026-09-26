@@ -4,6 +4,23 @@ Notes for anyone, human or agent, changing apogee. The README describes the
 project's goals and API; this file describes how the implementation works
 today, the rules it depends on, and where performance work should go next.
 
+## Contributing
+
+Issues and pull requests from agents are welcome, but please do not flood
+the project with them: send a few that matter rather than many.
+
+- **Search first.** Check open issues and PRs before filing; add to an
+  existing one rather than opening a duplicate.
+- **Issues:** one per distinct problem, with the smallest Lua script or Go
+  program that shows it, what apogee does, and what C Lua 5.5 does. Put
+  related findings in one issue rather than one each.
+- **Pull requests:** one focused change each, verified with the checks in
+  Working on the repository below, with a conventional-commit title (see
+  Releases) and a description of what changed and how it was verified. A
+  behaviour change comes with a test that fails without it; a performance
+  change comes with its measurements. Leave out unrelated cleanups and
+  sweeping reformatting.
+
 ## Working on the repository
 
 - Go 1.27.1, `CGO_ENABLED=0`. Workflows pin every action to a full commit
@@ -30,9 +47,14 @@ today, the rules it depends on, and where performance work should go next.
   - `go test ./...`, which runs with the JIT at its normal threshold;
     again with `APOGEE_JIT_TEST=1`, which compiles every function on first
     use; again with `APOGEE_JIT=off`, which only interprets; and
-    `-race -run JIT`.
+    `-race -run JIT`. CI also runs the JIT tests with `GOAMD64=v3`, where
+    `sin` and `cos` are left to Go (`trigInline` is false).
+  - `go vet ./...` with `GOOS`/`GOARCH` set for each of windows/amd64,
+    windows/arm64, linux/386, darwin/amd64, darwin/arm64 and linux/arm64,
+    which compiles the tests where the JIT does not exist.
   - `cd bench && APOGEE_JIT_TEST=1 go test -run 'TestSuiteAgrees|TestStandardAgrees' .`,
     and with `-tags clua55` or `-tags luajit` where those are installed.
+  - For `cmd/apogee`, its own `go vet ./...` and `go test -race ./...`.
 - On an Apple silicon Mac, `GOARCH=amd64 go test ./...` runs the amd64 JIT
   under Rosetta. A `GOAMD64=v3` binary cannot run there; CI covers it on
   linux/amd64.
@@ -49,9 +71,10 @@ today, the rules it depends on, and where performance work should go next.
   changes move the interpreter loop's alignment and its timings by 5–10%.
   Compare back to back on an idle machine; on a CPU with more than one
   core complex, pin A/B runs to one (`taskset -c 0-5` on the 9900X3D).
-  Every performance PR includes a full run of `bench/suite_test.go`, saved
-  as the results file for its machine (`bench/suite-results-amd64.txt`,
-  or `bench/suite-results.txt` for Apple M1). `bench/chart` redraws that
+  Every performance PR includes a full benchmark run (bench/README.md,
+  Reproducing), saved as the results file for its machine
+  (`bench/suite-results-amd64.txt`, or `bench/suite-results.txt` for
+  Apple M1). `bench/chart` redraws that
   machine's charts and rewrites its tables in bench/README.md, and
   `-summary` rewrites the root README's table of geometric means from
   both files (bench/README.md, Reproducing).
@@ -128,10 +151,10 @@ today, the rules it depends on, and where performance work should go next.
   sentinels first. Numbers and booleans never allocate. `value` is not
   comparable; use `rawEqual`, `hashKey` and `identical`. Table keys are
   normalised: a float with an integer value is stored as the integer.
-- Numbers follow Lua 5.4: integers wrap around, `/` and `^` give floats,
-  `//` and `%` floor, comparisons between integers and floats are exact
-  (numbers.go), and a numeric for loop whose start and step are integers
-  counts on integers (`forPrep`), never wrapping.
+- Numbers follow Lua 5.5, as 5.4 defined them: integers wrap around, `/`
+  and `^` give floats, `//` and `%` floor, comparisons between integers
+  and floats are exact (numbers.go), and a numeric for loop whose start
+  and step are integers counts on integers (`forPrep`), never wrapping.
 - `executeSwitch` (vm.go) is the interpreter loop. Keep rare work out of
   it, behind a call: one extra branch and a load in VARARG, or the
   to-be-closed code in RETURN, measured 10–20% slower on fib and closures,
@@ -204,11 +227,10 @@ TBC with B set swaps it below the control variable (5.5's TFORPREP).
 - **Coroutines.** One that dies by error keeps its variables pending;
   `CloseThread` (coroutine.close, and coroutine.wrap on an error) closes
   them. `CloseRunning` is 5.5's `coroutine.close()` of itself.
-- **JIT.** TBC exits, and RETURN in a prototype with TBC always exits, so
-  compiled code never returns past a pending variable. This costs about
-  2% on the standard benchmarks with the JIT (every generic for has a
-  TBC); compiling TBC for a nil closing value, and RETURN and closing
-  JMPs when nothing is pending, would win it back.
+- **JIT.** Compiled code runs TBC for a nil closing value, which closes
+  nothing (a generic for over `pairs` has one), and exits for any other.
+  RETURN in a prototype with TBC checks `jitContext.tbc` and exits while
+  a variable is pending, so compiled code never returns past one.
 
 ## Buffers
 
@@ -345,8 +367,9 @@ nothing compiles.
     check sits out of line, after the Lua closure check, so Lua-to-Lua
     calls neither run it nor have it in their code path.
   - Other exits at CALL and at RETURN are run by the driver, as are
-    CLOSURE, NEWTABLE, LEN, generic table access and upvalue-closing JMPs
-    (`jitStep`). Compiled code then carries on after the instruction.
+    CLOSURE, NEWTABLE, LEN, generic table access, SETLIST into a short
+    array and upvalue-closing JMPs (`jitStep`). Compiled code then carries
+    on after the instruction.
   - `runJIT` reloads the closure and prototype only when `l.callInfo`
     changes. The chain of loads from a callInfo to its prototype is most
     of a crossing's cost otherwise.
@@ -407,23 +430,27 @@ nothing compiles.
   - `#` of strings.
   - Native calls, tail calls and returns between compiled
     fixed-parameter Lua functions. A tail call replaces the frame as the
-    interpreter's does (`tailCallLua`), keeping its base; a function with
-    nested functions, whose upvalues must close first, exits instead.
+    interpreter's does (`tailCallLua`), keeping its base. A function with
+    nested functions returns and tail calls natively too, unless an
+    upvalue over its frame is still open (`exitIfUpValuesOpen`); then it
+    exits, for Go to close it.
   - SETLIST of a fixed count into the array NEWTABLE sized
     (`setList`), and nil for an integer key past the array of a table
     with no hash part or metatable.
   - Buffers' elements (see Buffers): GETTABLE and SETTABLE branch out of
-    line (`bufferPaths`, emitted with the stubs) when the object is not a
-    table, so table code pays one untaken branch. A float's bits go to
-    and from memory through general registers, or straight from memory
-    into an SSE register: moving them between the register files just
-    before the store measured three times slower on amd64, fed by sin.
+    line (`outOfLine`, emitted with the stubs, as kernels' side exits are)
+    when the object is not a table, so table code pays one untaken
+    branch. A float's bits go to and from memory through general
+    registers, or straight from memory into an SSE register: moving them
+    between the register files just before the store measured three
+    times slower on amd64, fed by sin.
   - `math.sqrt`, `sin` and `cos` inline. (`floor`, `ceil` and `abs`
     return integers now, and wait for integers in compiled code.)
 - **Kernels:** an innermost numeric for loop whose body is only moves,
   number constants, arithmetic (`%` and `//` by a nonzero integer
-  constant) and number comparisons keeps every Lua register it uses in a
-  machine register for the whole loop (`emitKernel`): integers in
+  constant), number comparisons, and the intrinsic calls and buffer
+  accesses below keeps every Lua register it uses in a machine register
+  for the whole loop (`emitKernel`): integers in
   general-purpose registers, floats in FP registers. A loop gets an
   integer and a float kernel where both type; each checks its live-in
   types on entry and falls through to the next, then to ordinary code,
@@ -500,9 +527,16 @@ nothing compiles.
 
 - `runBoth` in jit_test.go runs a script with and without the JIT and
   compares the results; add cases there for new instructions.
-- `TestJITKernels` asserts how many kernels a function compiles.
+- `TestJITKernels` and `TestJITKernelCallsAndBuffers` assert which kinds
+  of kernel ran (`jitContext.kernels`), so a loop that silently stops
+  being a kernel fails. Where `trigInline` is false, loops calling `sin`
+  or `cos` are expected not to be kernels.
 - To prove a test exercises generated code, break the generated code on
   purpose (for example, emit a subtract for ADD) and check the tests fail.
+  A break that hangs rather than fails counts as caught; kill the test
+  binary afterwards.
+- `TestJITLargeFunction` compiles past arm64's 32 KB test-branch reach;
+  run it with `GOARCH=arm64` after changing branches or code size there.
 
 ## Gaps with C Lua 5.5 and LuaJIT
 
@@ -547,25 +581,24 @@ remains follows from running on Go.
     last bit.
 - **The JIT compiles only on linux and darwin, arm64 and amd64.**
   Elsewhere, Windows included, states interpret.
-- **Speed.** With the JIT, apogee takes 0.79 times C Lua 5.5's time on
+- **Speed.** With the JIT, apogee takes 0.73 times C Lua 5.5's time on
   the standard benchmarks on the 9900X3D; without it, 1.8 times. It is
-  slower on CD and binary-trees (1.2 times). The M1's results are still
-  against 5.4; re-measure there with `-tags clua55` (bench/README.md,
-  "Reproducing").
+  slower only on CD (1.1 times), and level on Json. The M1's results are
+  still against 5.4; re-measure there with `-tags clua55`
+  (bench/README.md, "Reproducing").
 
 ### LuaJIT
 
-**Speed is the main gap.** On the standard benchmarks LuaJIT takes about
-0.20 times C Lua 5.4's time on the M1, against apogee's 0.75: roughly
+**Speed is the main gap.** On the standard benchmarks on the 9900X3D,
+LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.73: roughly
 four times faster.
-- Numeric loops: 10–30 times faster (spectral-norm, NBody, Permute,
+- Numeric loops: 5–16 times faster (spectral-norm, Permute, NBody,
   Towers).
-- Object-heavy code: two to four times faster (DeltaBlue, Richards,
-  Havlak).
-- apogee is faster on CD (58 ms against 329 ms) and Json (6 ms against
-  19 ms).
-- On the embedding workloads LuaJIT takes 2.6 times native Go's time,
-  apogee 6.9.
+- Object-heavy code: 1.2–2.6 times faster (Havlak, DeltaBlue, Richards).
+- On the embedding workloads LuaJIT takes 2.3 times native Go's time,
+  apogee 5.8; with a buffer, apogee's plasma beats both.
+- On the M1, Homebrew's LuaJIT is slower than apogee on CD (329 ms
+  against 58) and Json (19 ms against 6); on amd64 it is faster on both.
 
 The gap is architectural:
 - LuaJIT is a tracing JIT. It keeps values unboxed in registers across
@@ -575,16 +608,17 @@ The gap is architectural:
   frames. Every value is a 16-byte stack slot. Kernels (simple numeric
   loops) are the only code that keeps values in registers.
 - apogee's compiled code exits to Go for:
-  - calls into Go;
+  - calls into Go, including a tail call of one, such as
+    `return setmetatable(obj, mt)`;
   - NEWTABLE and CLOSURE;
-  - TAILCALL, CONCAT and table LEN;
+  - CONCAT and table LEN;
   - GETTABLE and SETTABLE with keys other than constant strings and
     array indices;
   - the generic for's TFORCALL.
 
 Closing most of the speed gap means a tracing or register-allocating
 JIT: a project, not tuning. The cheaper steps are in Next below (exits,
-kernels with calls, registers across ordinary code).
+more in kernels, registers across ordinary code).
 
 **Language and libraries favour apogee.** LuaJIT is Lua 5.1 with a few
 5.2 extensions. apogee has what it lacks:
@@ -594,7 +628,8 @@ kernels with calls, registers across ordinary code).
 - 5.5's metamethod rules.
 
 LuaJIT has what apogee lacks:
-- the FFI (C types and calls);
+- the FFI (C types and calls); apogee's buffers cover its typed arrays
+  of numbers, not structs or calls;
 - the `bit` and `jit.*` modules;
 - `string.buffer` and `table.new`.
 
@@ -610,16 +645,17 @@ Windows. apogee's JIT covers linux and darwin on arm64 and amd64.
 bench/README.md has the current tables and charts, generated from the raw
 results: AMD Ryzen 9 9900X3D (linux/amd64) and Apple M1 Pro (arm64). On
 the standard benchmarks (Are We Fast Yet and three from the Benchmarks
-Game) apogee with the JIT takes 0.79 times as long as C Lua 5.5 on amd64,
-and 1.8 times without it. The M1's results (0.75 and 1.5 times) are still
-against C Lua 5.4, from before the port to 5.5.
+Game) apogee with the JIT takes 0.73 times as long as C Lua 5.5 on amd64
+(v1.0.0, pinned to one CCD), and 1.8 times without it. The M1's results
+(0.75 and 1.5 times) are still against C Lua 5.4, from before the port to
+5.5, and before the arm64 fix that compiles functions past 32 KB of code.
 
-The amd64 run at 3d3b49e is the first since the port to 5.5 (#86–#101).
-Against the run before it (e5ed0e4), with the JIT, the numeric loop is
-0.95 to 1.53 ms, closures 4.7 to 7.9 ms (now slower than interpreted),
-plasma 0.75 to 0.87 ms, and CD 37 to 41 ms; interpreted, the numeric loop
-is 9.2 to 11.3 ms and plasma 1.37 to 1.74 ms. The cause is not yet
-known.
+The slowdowns after the port to 5.5 are explained. The numeric loop's
+`(i*i) % 7` became an integer division each iteration, now a multiply
+(#109: 1.53 to 0.79 ms). Closures' 7.9 ms was an unpinned run: pinned,
+the same commit takes 4.7. Interpreted, the numeric loop is still 11.6 ms
+against 9.2 before the port; the same integer division is the likely
+cause, not yet confirmed.
 
 To find where a workload leaves compiled code, count exits: log
 `p.jitOrig[ip]` and `l.jitCtx.reason` after each `enterJIT` in `runJIT`
@@ -642,10 +678,11 @@ every few instructions. A bare `call.Call` round trip costs about 2 ns
 now costs about 12.5 ns in all, against 17.3 ns interpreted; about 4.5
 ns of that is compiled code around the call.
 
-On amd64 most of plasma's JIT time (about 80%) is in compiled code, not
-in calls to `set`: every Lua register lives in memory, each store
-re-reads the barrier flag from the context, and an intrinsic call
-compares the callee against each intrinsic in turn (`sin` is fifth).
+On amd64 most of plasma's JIT time is in compiled code, not in calls to
+`set`: every Lua register lives in memory, and each store re-reads the
+barrier flag from the context. Given the canvas as a buffer instead, its
+inner loop runs as a kernel, in registers with `sin` inline, and takes
+0.25 ms to native Go's 0.30.
 
 ## Recommended next steps
 
@@ -653,20 +690,26 @@ compares the callee against each intrinsic in turn (`sin` is fifth).
 
 Measured on the 9900X3D with the JIT on (bench/README.md):
 
-- Exits are most of what is left. A call into Go costs about 12.5 ns, of
+- Exits and the allocation behind many of them are most of what is left.
+  A call into Go costs about 12.5 ns, of
   which about 4.5 ns is compiled code around it, and the rest is the
   API's Go frame and the round trip. The other exits left on every
-  iteration are allocations (`NEWTABLE`, `CLOSURE`), TAILCALL (every
-  `return setmetatable(obj, mt)` constructor), GETTABLE and SETTABLE with
-  keys that are not constant strings or array indices, LEN of a table,
-  CONCAT, and the sort comparator's return to Go. Havlak exits 24 million
-  times an iteration, most of them at NEWTABLE, CALL and TAILCALL.
-- binary-trees, one of the two standard benchmarks slower than C Lua 5.5,
-  is allocation: a NEWTABLE exit and Go's allocator for every node.
-- Plasma takes about 37 ns a pixel against Go's 15: about 12 ns for the
-  call to `set`, about 6 ns for each of three `sin`s (Go's `math.Sin` is
-  about 4), and the rest in ordinary compiled code, which keeps every Lua
-  register in memory.
+  iteration are allocations (`NEWTABLE`, `CLOSURE`), tail calls of Go
+  functions (every `return setmetatable(obj, mt)` constructor), CALL
+  with a variable number of results, GETTABLE and SETTABLE with keys that
+  are not constant strings or array indices, LEN of a table, CONCAT, and
+  the sort comparator's return to Go.
+- CD, the one standard benchmark slower than C Lua 5.5, spends about a
+  fifth of its time in `jitStep`, most of that creating tables
+  (`newTableAt`) and storing into their hash parts (`setTableAt`): the
+  exit itself is the smaller part.
+  binary-trees and Havlak are likewise allocation-bound.
+- array-fill-sum takes about twice C Lua's time, mostly growing the array:
+  Go's collector scanning and its write barriers while copying, not
+  compiled code (about 13% of its time).
+- Plasma calling `set` takes about 38 ns a pixel against Go's 15, mostly
+  the call to `set` and ordinary compiled code, which keeps every Lua
+  register in memory. With a buffer it is a kernel at 12.5 ns.
 - fib, records and particles are limited by ordinary compiled code:
   values in memory, a type check on every read and a barrier check on
   every store.
@@ -675,7 +718,29 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
 
 ### Done in the last rounds
 
-Measured against the standard benchmarks, which found most of them:
+Measured against the standard benchmarks, which found most of them.
+Newest first, the rounds after the 5.5 port (#109–#116), each found by
+counting exits or profiling:
+
+- `%` and `//` by a constant without a divide instruction (#109; numeric
+  loop −47%).
+- A backward JMP after TEST or TESTSET, as repeat-until compiles, branches
+  in compiled code instead of exiting (#110; fannkuch −40%).
+- SETLIST of a fixed count, and nil past the array of a table without a
+  hash part (#111; binary-trees −27%).
+- Tail calls between compiled Lua functions replace the frame in compiled
+  code (#112; Richards −22%, CD −12%).
+- Buffers (#113; plasma writing into one instead of calling `set`, −43%),
+  and functions with nested functions returning natively unless an
+  upvalue is open (#114; CD and Richards −2%).
+- Kernels with intrinsic calls, buffers, side exits and per-pc types, and
+  `toFloat` (#115; plasma into a buffer −51%, to below native Go; plasma
+  calling `set` −13%; numeric loop −5%).
+- arm64 functions past 32 KB of code compile (#116): four of CD's and
+  Havlak's hottest functions were interpreted there. Unmeasured on
+  hardware.
+
+Earlier:
 
 - Loop heads count toward compiling (#70): a function run once with a
   hot `while` loop never compiled before (Mandelbrot −53%).
@@ -704,12 +769,12 @@ Measured against the standard benchmarks, which found most of them:
 
 In order of expected payoff for real-time scripts such as visualisers:
 
-1. **Fewer, cheaper exits.** The exit itself is the cost: handling
-   TAILCALL in `runJIT` instead of the interpreter measured no gain.
-   Compiling a TAILCALL to a compiled Lua function as the frame
-   replacement the interpreter does, and a CALL of `setmetatable` as an
-   intrinsic, would remove most of the TAILCALL exits; allocating tables
-   and closures from compiled code would remove the rest.
+1. **Fewer, cheaper exits.** Tail calls between compiled Lua functions
+   no longer exit (#112). A CALL or TAILCALL of `setmetatable` as an
+   intrinsic would remove most of the remaining tail-call exits, and CALL
+   with a variable number of results (Havlak) could run natively.
+   Allocation itself stays in Go, so NEWTABLE and CLOSURE exits can only
+   get cheaper, and in CD most of their cost is the allocation.
 2. **More in kernels.** Kernels call intrinsics and index buffers; a Go
    or number function could be called by writing the kernel's registers
    back, exiting, and re-entering after the call, and table arrays read
@@ -732,8 +797,12 @@ In order of expected payoff for real-time scripts such as visualisers:
    compiled code from a pre-allocated pool.
 6. **More native instructions:** TFORCALL/TFORLOOP with fast paths for
    `ipairs` and `pairs` over array parts; CONCAT into a reusable buffer;
-   SETLIST; vararg; LEN of a table; GETTABLE and SETTABLE with string keys
-   in registers.
+   vararg; LEN of a table; GETTABLE and SETTABLE with string keys in
+   registers.
+
+Each of these is worth a few percent on one or two benchmarks, not more:
+after #116, profiling found no single cause left as large as those the
+rounds above removed.
 7. **The barrier and budget in registers on amd64**, where they live in
    the context: unmeasured.
 8. **The interpreter's placement.** Interpreted Json and string building

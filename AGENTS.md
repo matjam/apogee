@@ -6,7 +6,19 @@ today, the rules it depends on, and where performance work should go next.
 
 ## Working on the repository
 
-- Go 1.27.1, `CGO_ENABLED=0`. CI pins every action to a full commit SHA.
+- Go 1.27.1, `CGO_ENABLED=0`. Workflows pin every action to a full commit
+  SHA with its version in a comment; Dependabot keeps them current.
+- **Releases.** PRs are squash-merged, and the PR title becomes the commit
+  release-please reads, so it is a conventional commit (`fix(jit): …`,
+  `perf(lua): …`, `feat(stdlib): …`, `docs: …`); the pr-title workflow
+  checks it. `feat`, `fix` and `perf` go in the changelog and bring a
+  release; `docs`, `test`, `ci`, `chore` and `refactor` do not.
+  release-please keeps a release PR open, and merging it tags the version
+  (`vX.Y.Z`) and publishes the GitHub release. Only the root module is
+  released; `bench` and `cmd/apogee` are separate modules, left out.
+- **apogee is v1.** Its Go API is stable: a breaking change would need a
+  `/v2` module path, so fix and extend without breaking it. Mark a
+  deliberate break with `!` (`feat!: …`).
 - Go has generics: generic types, and since Go 1.27 generic methods, on
   generic types too. Reach for them before writing one function per
   numeric type (`PushInteger[T Integer]`, `Arg[T]`, `RawGetInt[T]`).

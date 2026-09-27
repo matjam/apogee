@@ -460,6 +460,12 @@ nothing compiles.
     where string keys or a hash part follow, or for `__index`. The JMP
     that closes the loop jumps when nothing at or above it is open
     (`closeJump`).
+  - **`setmetatable`** too (`BaseSetMetatable`), called or tail called,
+    of a table that has no metatable yet, to one whose shape has never
+    held `__gc` or `__mode` (`shape.collects`, set as keys are added), so
+    the collector needs to hear of nothing (`setMetaTable`); that includes
+    the fresh `{__index = C}` many constructors make. A tail call then
+    returns the table (`tailSetMeta`).
 - **Kernels:** an innermost numeric for loop whose body is only moves,
   number constants, arithmetic (`%` and `//` by a nonzero integer
   constant), number comparisons, and the intrinsic calls and buffer
@@ -608,16 +614,16 @@ remains follows from running on Go.
     last bit.
 - **The JIT compiles only on linux and darwin, arm64 and amd64.**
   Elsewhere, Windows included, states interpret.
-- **Speed.** With the JIT, apogee takes 0.73 times C Lua 5.5's time on
+- **Speed.** With the JIT, apogee takes 0.70 times C Lua 5.5's time on
   the standard benchmarks on the 9900X3D; without it, 1.8 times. It is
-  slower only on CD (1.1 times), and level on Json. The M1's results are
+  faster on all 17, least on CD (0.83 times) and Json (0.90). The M1's results are
   still against 5.4; re-measure there with `-tags clua55`
   (bench/README.md, "Reproducing").
 
 ### LuaJIT
 
 **Speed is the main gap.** On the standard benchmarks on the 9900X3D,
-LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.73: roughly
+LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.70: roughly
 four times faster.
 - Numeric loops: 5–16 times faster (spectral-norm, Permute, NBody,
   Towers).
@@ -635,8 +641,8 @@ The gap is architectural:
   frames. Every value is a 16-byte stack slot. Kernels (simple numeric
   loops) are the only code that keeps values in registers.
 - apogee's compiled code exits to Go for:
-  - calls into Go, including a tail call of one, such as
-    `return setmetatable(obj, mt)`;
+  - calls into Go, including a tail call of one, other than the math
+    functions, `pairs`, `ipairs` and `setmetatable` of a new table;
   - NEWTABLE and CLOSURE;
   - CONCAT, and LEN of a table with a hash part or `__len`;
   - GETTABLE and SETTABLE with keys other than constant strings and
@@ -673,8 +679,8 @@ Windows. apogee's JIT covers linux and darwin on arm64 and amd64.
 bench/README.md has the current tables and charts, generated from the raw
 results: AMD Ryzen 9 9900X3D (linux/amd64) and Apple M1 Pro (arm64). On
 the standard benchmarks (Are We Fast Yet and three from the Benchmarks
-Game) apogee with the JIT takes 0.73 times as long as C Lua 5.5 on amd64
-(v1.0.0, pinned to one CCD), and 1.8 times without it. The M1's results
+Game) apogee with the JIT takes 0.70 times as long as C Lua 5.5 on amd64
+(pinned to one CCD), and 1.8 times without it. The M1's results
 (0.75 and 1.5 times) are still against C Lua 5.4, from before the port to
 5.5, and before the arm64 fix that compiles functions past 32 KB of code.
 
@@ -723,12 +729,13 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
   which about 4.5 ns is compiled code around it, and the rest is the
   API's Go frame and the round trip. The other exits left on every
   iteration are allocations (`NEWTABLE`, `CLOSURE`), tail calls of Go
-  functions (every `return setmetatable(obj, mt)` constructor), calls of
+  functions other than `setmetatable`, calls of
   vararg functions, GETTABLE and SETTABLE with keys that are not constant
   strings or array indices, CONCAT, and the sort comparator's return to
   Go.
-- CD, the one standard benchmark slower than C Lua 5.5, spends about a
-  fifth of its time in `jitStep`, most of that creating tables
+- CD, the standard benchmark closest to C Lua 5.5 (0.83 times), spent
+  about a fifth of its time in `jitStep` before constructors' setmetatable
+  compiled, most of that creating tables
   (`newTableAt`) and storing into their hash parts (`setTableAt`): the
   exit itself is the smaller part.
   binary-trees and Havlak are likewise allocation-bound.
@@ -798,9 +805,9 @@ Earlier:
 In order of expected payoff for real-time scripts such as visualisers:
 
 1. **Fewer, cheaper exits.** Tail calls between compiled Lua functions
-   no longer exit (#112). A CALL or TAILCALL of `setmetatable` as an
-   intrinsic would remove most of the remaining tail-call exits, and CALL
-   with a variable number of results (Havlak) could run natively.
+   no longer exit (#112), nor do constructors' `return
+   setmetatable(obj, mt)` (`tailSetMeta`) or CALL with a variable number
+   of results (#143).
    Allocation itself stays in Go, so NEWTABLE and CLOSURE exits can only
    get cheaper, and in CD most of their cost is the allocation.
 2. **More in kernels.** Kernels call intrinsics and index buffers; a Go

@@ -61,3 +61,18 @@ func BaseIPairsIterator(l *State) int {
 	}
 	return 2
 }
+
+// BaseSetMetatable is setmetatable, which the standard library registers.
+// Compiled code sets the metatable of a table that has none itself, when
+// the new one's shape has never held __gc or __mode (shape.collects).
+func BaseSetMetatable(l *State) int {
+	t := l.TypeOf(2)
+	l.CheckType(1, TypeTable)
+	l.ArgumentCheck(t == TypeNil || t == TypeTable, 2, "nil or table expected")
+	if l.MetaField(1, "__metatable") != TypeNil {
+		l.Errorf("cannot change a protected metatable")
+	}
+	l.SetTop(2)
+	l.SetMetaTable(1)
+	return 1
+}

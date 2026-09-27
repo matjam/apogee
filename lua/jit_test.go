@@ -1072,6 +1072,8 @@ func TestJITKernelIntrinsicChanged(t *testing.T) {
 // without leaving it each iteration.
 func TestJITOpenCalls(t *testing.T) {
 	skipWithoutJIT(t)
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // calls exit while the barrier is on
 	jit, interp, lj := runBoth(t, `
 		local floor, min, byte, select = math.floor, math.min, string.byte, select
 		local function none() end
@@ -1254,6 +1256,55 @@ func TestJITNilArrayStores(t *testing.T) {
 	}
 	if len(exits) != 0 {
 		t.Fatalf("exits: %v", exits)
+	}
+}
+
+// setmetatable of a new table, called or tail called as constructors do,
+// runs in compiled code when the metatable is known to lack __gc and
+// __mode; anything else goes to Go, and agrees.
+func TestJITSetMetatable(t *testing.T) {
+	skipWithoutJIT(t)
+	exits := map[string]int{}
+	jitExitHook = func(p *prototype, ip int, reason uint64) {
+		if p.LineDefined >= 3 && p.LineDefined <= 5 {
+			exits[exitKind(p, ip, reason)]++
+		}
+	}
+	defer func() { jitExitHook = nil }()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBoth(t, `local setmetatable, getmetatable = setmetatable, getmetatable
+		local P = {} P.__index = P
+		function P.new(x) return setmetatable({x = x}, P) end -- line 3: a tail call
+		function P.new2(x) local p = setmetatable({x = x}, P) return p end
+		function P.new3(x) return setmetatable({x = x}, {__index = P}) end -- a fresh metatable
+		local G = setmetatable({}, {__gc = function() end})
+		function run()
+		  local s = 0
+		  for i = 1, 300 do s = s + P.new(i).x + P.new2(i).x + P.new3(i).x end
+		  local out = {s, getmetatable(P.new(1)) == P, getmetatable(P.new2(1)) == P}
+		  local prot = setmetatable({}, {__metatable = "locked"})
+		  out[#out + 1] = select(2, pcall(setmetatable, prot, P))
+		  local has = setmetatable({}, {})
+		  out[#out + 1] = getmetatable(setmetatable(has, P)) == P
+		  out[#out + 1] = getmetatable(setmetatable({}, nil)) == nil
+		  out[#out + 1] = select(2, pcall(setmetatable, 1, P))
+		  out[#out + 1] = select(2, pcall(setmetatable, {}, 1))
+		  local ran = false
+		  local gc = {__gc = function() ran = true end}
+		  out[#out + 1] = getmetatable(setmetatable({}, gc)) == gc
+		  collectgarbage()
+		  out[#out + 1] = ran -- the collector heard of the finalizer
+		  for i = 1, #out do out[i] = tostring(out[i]) end
+		  return table.concat(out, " ")
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q\ninterpreter %q", jit, interp)
+	}
+	for kind, n := range exits { // a call's first, and constructors' tables learning their shapes
+		if kind != "NEWTABLE" && n > 10 {
+			t.Fatalf("%s exited %d times in 300 iterations: %v", kind, n, exits)
+		}
 	}
 }
 

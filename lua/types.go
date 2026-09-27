@@ -486,6 +486,7 @@ type prototype struct {
 	hot     int32                  // calls and loop iterations counted
 	jit     *jitCode               // compiled code, or nil
 	jitOrig []bytecode.Instruction // exec before JIT patches; see jit.go
+	jitRuns []*uint64              // kernels' short runs, which compiled code counts: see kernelRuns
 }
 
 func (p *prototype) upValueName(index int) string {

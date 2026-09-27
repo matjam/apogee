@@ -738,8 +738,14 @@ func TestJITKernels(t *testing.T) {
 		{"long loop spends budget", "int", `function run() local s = 0; for i = 1, 300000 do s = s + 1 end; return s end`},
 		{"loop variable after the loop", "int", `function run() local last = 0; for i = 1, 7 do last = i end; return last end`},
 		{"nested: inner only", "int", `function run() local s = 0; for i = 1, 10 do for j = 1, 10 do s = s + i * j end end; return s end`},
-		{"break is not a kernel", "", `function run() local s = 0; for i = 1, 10 do s = s + i; if s > 20 then break end end; return s end`},
+		{"break leaves the kernel", "int", `function run() local s = 0; for i = 1, 10 do s = s + i; if s > 20 then break end end; return s end`},
+		{"break from a float comparison", "int", `function run() local s = 0.5; for i = 1, 100 do s = s * 1.5; if s >= 1000 then break end end; return s end`},
 		{"calls are not kernels", "", `function run() local s = 0; for i = 1, 10 do s = s + math.floor(i / 2) end; return s end`},
+		{"a call on a rare path leaves the kernel", "int", `function run() local s, t = 0, {}; for i = 1, 1000 do s = s + i * 3; if i % 100 == 0 then t[#t + 1] = s end end; return s, #t, t[4] end`},
+		{"a return on a rare path", "int", `function run() local s = 0; for i = 1, 1000 do s = s + i; if s > 5000 then return s, i end end; return s end`},
+		{"an exit on every path is not a kernel", "", `function run() local s, t = 0, {}; for i = 1, 100 do s = s + i; t[i] = s end; return s, t[50] end`},
+		{"locals written after an exit", "int", `function run() local a, b, t = 0, 0, {}; for i = 1, 300 do a = a + i; if i % 7 == 0 then t[#t + 1] = a end; b = b + a end; return a, b, #t end`},
+		{"temporaries live across an exit", "int", `function run() local s, t = 0, {}; for i = 1, 200 do local x = i * 2; local y = i * 3; if i % 50 == 0 then t[#t + 1] = x end; s = s + y end; return s, t[1], t[4] end`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1039,6 +1045,54 @@ func TestJITKernelRegisters(t *testing.T) {
 				  for i = 10, 99 do `+body+` end
 				  return s, iout[0], iout[10], iout[50], iout[99], ok, e
 				end`, setup)
+			if jit != interp {
+				t.Fatalf("JIT %q, interpreter %q", jit, interp)
+			}
+			if lj.jitCtx.kernels[1] == 0 {
+				t.Fatal("no kernel ran")
+			}
+		})
+	}
+}
+
+// Kernels needing more registers than the machine has spill the rest to
+// their stack slots, and agree with the interpreter.
+func TestJITKernelSpills(t *testing.T) {
+	skipWithoutJIT(t)
+	var names, init, body, sum []string
+	for j := range 30 {
+		n := fmt.Sprintf("f%d", j)
+		names, init = append(names, n), append(init, fmt.Sprintf("%d.5", j))
+		prev := "i * 0.25"
+		if j > 0 {
+			prev = names[j-1]
+		}
+		body = append(body, fmt.Sprintf("%s = %s * 0.5 + %s", n, n, prev))
+		sum = append(sum, n)
+	}
+	for j := range 16 {
+		n := fmt.Sprintf("n%d", j)
+		names, init = append(names, n), append(init, fmt.Sprint(j))
+		body = append(body, fmt.Sprintf("%s = (%s + i * %d) %% 1000", n, n, j+1))
+		sum = append(sum, n)
+	}
+	for _, tt := range []struct{ name, extra string }{
+		{"accumulators", ""},
+		{"with a buffer and an exit", "; buf[i % 8] = f29; if i == 150 then t[1] = n15 end"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime.GC()
+			defer debug.SetGCPercent(debug.SetGCPercent(-1))
+			src := fmt.Sprintf(`local buf, t = buf, {}
+				function run()
+				  local %s = %s
+				  for i = 1, 200 do %s%s end
+				  return %s, t[1], buf[3]
+				end`, strings.Join(names, ", "), strings.Join(init, ", "), strings.Join(body, "; "), tt.extra, strings.Join(sum, ", "))
+			jit, interp, lj := runBothWith(t, src, func(l *State) {
+				l.PushBuffer(make([]float64, 8))
+				l.SetGlobal("buf")
+			})
 			if jit != interp {
 				t.Fatalf("JIT %q, interpreter %q", jit, interp)
 			}

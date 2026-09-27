@@ -531,6 +531,24 @@ nothing compiles.
     enclosing function the body writes are live-in when a kernel can side
     exit, so they hold the last iteration's values there: an error may
     close upvalues over them.
+  - **Local exits.** An instruction the kernel cannot run (a call, a
+    table, a RETURN), or one `planKernel` stops at and retries without
+    (`planKernelWith`, at most `maxExits`), leaves the kernel where it
+    runs, for the ordinary code to run it and the rest of the iteration;
+    the next iteration re-enters. One on every path through the body
+    (`skipped` is false) is a loop that is not a kernel. A test whose jump
+    leaves the body (`break`) leaves at the test, for the ordinary code to
+    test again. Code after a local exit, until a jump lands, is left out
+    (`unreached`). An exit keeps every register it writes back live, as
+    the ordinary code may read any. A kernel that can leave counts runs
+    that leave within `kernelShortRun` iterations of starting, in its
+    prototype's `jitRuns`, and its entry check fails after
+    `kernelRunsOff` in a row: then its exits are not rare.
+  - **Spills.** When the registers run out, the last `spillRegs` of the
+    class hold spilled values for the operation using them, and the
+    virtual registers that do not fit live in their Lua registers' stack
+    slots, both words stored on each write; the loop's registers and the
+    scratch key never spill.
   - **Integer to float on amd64** goes through `toFloat`, which zeroes the
     destination first: CVTSI2SD keeps the rest of the register, so waits
     for its last writer, and in plasma that chained each sin to the one
@@ -828,12 +846,9 @@ In order of expected payoff for real-time scripts such as visualisers:
    of results (#143).
    Allocation itself stays in Go, so NEWTABLE and CLOSURE exits can only
    get cheaper, and in CD most of their cost is the allocation.
-2. **More in kernels.** Kernels call intrinsics and index buffers; a Go
-   or number function could be called by writing the kernel's registers
-   back, exiting, and re-entering after the call, and table arrays read
-   with a type check per element (array-fill-sum takes about twice C
-   Lua's time, though most of it is growing the array, in Go) and an
-   adaptive switch-off when that check keeps failing.
+2. **More in kernels.** Kernels call intrinsics, index buffers and
+   leave at anything else on a rare path (docs/jit-ir.md, phases 1 and 2);
+   phases 3 and 4 there put tables and calls on the common path in them.
 3. **Registers across ordinary code.** Keep numbers in FP registers
    across straight-line code between exits, not only in kernels, with
    type checks at the first use. This is the lever for fib, records and

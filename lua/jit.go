@@ -64,6 +64,7 @@ type jitContext struct {
 	kernels   [2]uint64      // float and integer kernels entered, for tests
 	spill     [4]uint64      // kernel registers an intrinsic's code needs, saved around it
 	hoist     [8]uint64      // a kernel's upvalues: numbers' bits, and buffers' *buffer
+	entry     int64          // the budget when a kernel that can leave last started
 }
 
 // A jitExitCallGo exit leaves only the callee's object in the context, and

@@ -64,6 +64,13 @@ type kernelPlan struct {
 	virtual      map[int]bool // GETUPVAL pcs that emit nothing
 	buffers      map[int]bool // registers holding buffers, true for those read
 
+	// Instructions the kernel leaves at, for the ordinary code to run them
+	// and the rest of the iteration (exits), and those it cannot reach,
+	// after one, which it leaves out (unreached). badPC is the pc checkTypes
+	// stopped at, or -1.
+	exits, unreached map[int]bool
+	badPC            int
+
 	// Upvalues the body reads, checked and loaded on entry into
 	// jitContext.hoist, by slot; nothing in a kernel can change them.
 	hoisted []hoistedUpValue
@@ -164,15 +171,33 @@ func kernelDivisor(v value) bool {
 // it holds one; floor reports whether the machine rounds a float down in
 // one instruction, for // of floats.
 func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool) *kernelPlan {
+	exits := map[int]bool{}
+	for range maxExits + 1 {
+		k, bad := planKernelWith(p, latch, intLoop, constOK, intrinsic, upValue, floor, exits)
+		if k != nil || bad < 0 || exits[bad] || len(exits) == maxExits {
+			return k
+		}
+		exits[bad] = true
+	}
+	return nil
+}
+
+// maxExits is how many instructions planKernel lets a kernel leave at.
+const maxExits = 8
+
+// planKernelWith is planKernel with the instructions at exits left to the
+// ordinary code. When the loop does not qualify it returns the pc of an
+// instruction that stops it, or -1.
+func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool, exits map[int]bool) (*kernelPlan, int) {
 	code := p.Code
 	fl := code[latch]
 	start := latch + 1 + fl.SBx()
 	if start > latch {
-		return nil
+		return nil, -1
 	}
 	k := &kernelPlan{start: start, latch: latch, base: fl.A(), intLoop: intLoop, types: map[int]numKind{},
 		calls: map[int]kernelCall{}, virtual: map[int]bool{}, buffers: map[int]bool{},
-		upLoads: map[int]int{}, bufFrom: map[int]int{}, floor: floor}
+		upLoads: map[int]int{}, bufFrom: map[int]int{}, floor: floor, exits: map[int]bool{}, unreached: map[int]bool{}}
 	wrote := map[int]bool{} // registers the body writes, which cannot hold buffers
 	used := map[int]bool{}  // registers holding numbers
 	base := fl.A()
@@ -205,11 +230,19 @@ func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool,
 		return false
 	}
 	number := func(kk int) bool { return constOK(kk) && constKind(p.Constants[kk]) != kindAny }
+	// A body temporary first written where a jump may skip the write is
+	// live in only if the body reads it: one only an exit reads is dead
+	// where the write is skipped.
+	maybe := map[int]bool{}
 	read := func(field int) bool {
 		if bytecode.IsConstant(field) {
 			return number(bytecode.ConstantIndex(field))
 		}
 		use(field)
+		if maybe[field] {
+			delete(maybe, field)
+			k.liveIn = append(k.liveIn, field) // may keep its old value
+		}
 		if !seen[field] {
 			seen[field] = true
 			if !defined[field] {
@@ -223,75 +256,100 @@ func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool,
 		use(r)
 		if !seen[r] {
 			seen[r] = true
-			if skipped(ip) {
-				k.liveIn = append(k.liveIn, r) // may keep its old value
-			} else {
+			switch {
+			case !skipped(ip):
 				defined[r] = true
+			case r > base+3:
+				maybe[r] = true
+			default:
+				k.liveIn = append(k.liveIn, r) // may keep its old value
 			}
 		}
 		k.written = append(k.written, r)
 		return true
 	}
+	live, targets := true, map[int]bool{} // whether ip is reachable, and where jumps go
 	for ip := start; ip < latch; ip++ {
 		i := code[ip]
+		if targets[ip] {
+			live = true
+		}
+		if !live || isExtraArg(code, ip) {
+			k.exits[ip], k.unreached[ip] = true, true
+			continue
+		}
+		if exits[ip] || !kernelOp(i.OpCode()) {
+			// The ordinary code runs it and the rest of the iteration, but
+			// not at every iteration.
+			if !skipped(ip) {
+				return nil, -1
+			}
+			k.exits[ip] = true
+			live = false
+			continue
+		}
 		switch i.OpCode() {
 		case bytecode.OpMove:
 			if !read(i.B()) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 		case bytecode.OpLoadConstant:
 			if !number(i.Bx()) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv:
 			if !read(i.B()) || !read(i.C()) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 		case bytecode.OpMod:
 			// By a constant: an integer by a kernelDivisor, never zero and of
 			// fixed sign, or a float by a floatModDivisor. checkTypes tells.
 			if !bytecode.IsConstant(i.C()) || !read(i.C()) {
-				return nil
+				return nil, ip
 			}
 			d := p.Constants[bytecode.ConstantIndex(i.C())]
 			if _, ok := floatModDivisor(d); !ok && !kernelDivisor(d) {
-				return nil
+				return nil, ip
 			}
 			if !read(i.B()) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 		case bytecode.OpIDiv:
 			// Of integers by such a constant, or of floats by anything: the
 			// floor of the quotient. checkTypes tells which.
 			if !read(i.B()) || !read(i.C()) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 		case bytecode.OpBitwise: // on integers; a shift by a constant
 			op := bytecode.ArithOp(code[ip+1].Ax())
 			shift := op == bytecode.ArithShl || op == bytecode.ArithShr
 			if shift && (!bytecode.IsConstant(i.C()) || !p.Constants[bytecode.ConstantIndex(i.C())].isInteger()) {
-				return nil
+				return nil, ip
 			}
 			if !read(i.B()) || op != bytecode.ArithBNot && !read(i.C()) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 			ip++ // the operator's word
 		case bytecode.OpUnaryMinus:
 			if !read(i.B()) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
 			if !read(i.B()) || !read(i.C()) {
-				return nil
+				return nil, ip
 			}
-			if _, ok := kernelJump(code, ip, latch); !ok {
-				return nil
+			if t, ok := kernelJump(code, ip, latch); ok {
+				targets[t] = true
+			} else if !leavingJump(code, ip, start, latch) {
+				return nil, ip
 			}
 			ip++ // the JMP
 		case bytecode.OpJump:
-			if _, ok := kernelJump(code, ip, latch); !ok {
-				return nil
+			t, ok := kernelJump(code, ip, latch)
+			if !ok {
+				return nil, ip
 			}
+			targets[t] = true
 		case bytecode.OpGetUpValue:
 			// An intrinsic for the CALL it feeds, or a number or buffer the
 			// kernel loads on entry.
@@ -305,25 +363,25 @@ func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool,
 			}
 			kind, ok := upValue(i.B())
 			if !ok || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 			s := k.hoist(i.B(), kind)
 			if s < 0 {
-				return nil
+				return nil, ip
 			}
 			k.upLoads[ip] = s
 		case bytecode.OpCall:
 			if kc, ok := k.calls[ip]; !ok || !read(i.A()+1) || kc.args == 2 && !read(i.A()+2) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 		case bytecode.OpGetTable: // a buffer's element, at a key checked below
 			if !read(i.C()) || !write(i.A(), ip) {
-				return nil
+				return nil, ip
 			}
 			k.bufUses = append(k.bufUses, bufUse{ip, i.B(), true})
 		case bytecode.OpSetTable:
 			if !read(i.B()) || !read(i.C()) {
-				return nil
+				return nil, ip
 			}
 			k.bufUses = append(k.bufUses, bufUse{ip, i.A(), false})
 		case bytecode.OpGetTableUp, bytecode.OpSetTableUp: // an upvalue buffer's element
@@ -332,22 +390,20 @@ func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool,
 				up, key = i.A(), i.B()
 			}
 			if kind, ok := upValue(up); !ok || kind != kindBuffer || !read(key) {
-				return nil
+				return nil, ip
 			}
 			if get && !write(i.A(), ip) || !get && !read(i.C()) {
-				return nil
+				return nil, ip
 			}
 			s := k.hoist(up, kindBuffer)
 			if s < 0 {
-				return nil
+				return nil, ip
 			}
 			k.bufFrom[ip] = s
 			k.hoisted[s].read = k.hoisted[s].read || i.OpCode() == bytecode.OpGetTableUp
-		default:
-			return nil
 		}
 	}
-	if len(k.calls) > 0 || len(k.bufUses) > 0 {
+	if len(k.calls) > 0 || len(k.bufUses) > 0 || len(k.exits) > 0 {
 		// A side exit leaves mid-iteration, where the enclosing function's
 		// locals, below the loop's registers, that the body has yet to write
 		// must hold the last iteration's values: an error from there may
@@ -370,7 +426,7 @@ func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool,
 		// `if v > 1 then v = 1 end` on a float v.
 		k.types = entry
 		if !k.promoteConstants(p, base) || !k.inferTypes(p) || !k.promotionsHold(p) {
-			return nil
+			return nil, k.badPC
 		}
 	}
 	// Each buffer access reads an upvalue's buffer, which its register
@@ -384,22 +440,25 @@ func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool,
 		k.bufFrom[u.ip] = -1
 		k.buffers[u.reg] = k.buffers[u.reg] || u.read
 	}
-	for r := range k.buffers {
-		// A buffer register the loop never writes, and not a number.
-		if used[r] || wrote[r] {
-			return nil
-		}
-		// Nor one the function makes a table in: that register is surely
-		// a table, and a kernel whose entry check fails costs the ordinary
+	for _, r := range k.bufferRegs() {
+		// A buffer register the loop never writes, and not a number, nor
+		// one the function makes a table in: that register is surely a
+		// table, and a kernel whose entry check fails costs the ordinary
 		// loop the check each iteration.
+		table := used[r] || wrote[r]
 		for _, i := range code {
-			if i.OpCode() == bytecode.OpNewTable && i.A() == r {
-				return nil
+			table = table || i.OpCode() == bytecode.OpNewTable && i.A() == r
+		}
+		if table {
+			for _, u := range k.bufUses {
+				if u.reg == r {
+					return nil, u.ip
+				}
 			}
 		}
 	}
 	k.shareVar = !wrote[base+3]
-	return k
+	return k, -1
 }
 
 // promoteConstants marks the body's LOADKs of integer constants that
@@ -444,6 +503,9 @@ func (k *kernelPlan) floatUses(p *prototype, ip, r int) ([][2]int, bool) {
 		}
 		seen[j] = true
 		i := code[j]
+		if k.exits[j] { // the ordinary code could tell
+			return nil, false
+		}
 		reads := func(f int) bool { return !bytecode.IsConstant(f) && f == r }
 		switch op := i.OpCode(); op {
 		case bytecode.OpSetTable, bytecode.OpSetTableUp:
@@ -483,8 +545,10 @@ func (k *kernelPlan) floatUses(p *prototype, ip, r int) ([][2]int, bool) {
 			}
 			continue
 		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
-			t, _ := kernelJump(code, j, k.latch)
-			work = append(work, j+2, t)
+			work = append(work, j+2)
+			if t, ok := kernelJump(code, j, k.latch); ok { // or the loop's left, and r dead
+				work = append(work, t)
+			}
 			continue
 		case bytecode.OpJump:
 			t, _ := kernelJump(code, j, k.latch)
@@ -806,6 +870,9 @@ func (k *kernelPlan) guess(p *prototype, at []map[int]numKind, r int) numKind {
 	floats, ints := 0, 0
 	for ip := k.start; ip < k.latch; ip++ {
 		i := p.Code[ip]
+		if k.exits[ip] {
+			continue
+		}
 		switch i.OpCode() {
 		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv,
 			bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
@@ -863,10 +930,15 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 		}
 		cur = maps.Clone(merged)
 		i := code[ip]
+		if k.exits[ip] { // the path leaves here
+			cur = nil
+			continue
+		}
 		switch i.OpCode() {
 		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
-			t, _ := kernelJump(code, ip, k.latch)
-			incoming[t-k.start] = append(incoming[t-k.start], cur)
+			if t, ok := kernelJump(code, ip, k.latch); ok { // or it leaves
+				incoming[t-k.start] = append(incoming[t-k.start], cur)
+			}
 			at[ip+1-k.start] = cur // the JMP, which the test consumes
 			ip++
 		case bytecode.OpJump:
@@ -943,7 +1015,7 @@ func mergeTypes(states []map[int]numKind) (map[int]numKind, bool) {
 // body writes that ends each iteration with the type it starts with.
 func (k *kernelPlan) checkTypes(p *prototype) bool {
 	code := p.Code
-	k.floatKeys = false
+	k.floatKeys, k.badPC = false, -1
 	end := k.at[k.latch-k.start]
 	for _, r := range k.writtenOnce() {
 		if t, ok := k.types[r]; ok && end[r] != t {
@@ -956,11 +1028,14 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 		}
 	}
 	for ip := k.start; ip < k.latch; ip++ {
+		if k.exits[ip] {
+			continue
+		}
 		i := code[ip]
 		known := func(fields ...int) bool { // numbers, not aliases
 			for _, f := range fields {
 				if !isNumKind(k.kind(p, ip, f)) {
-					return false
+					return k.fail(ip)
 				}
 			}
 			return true
@@ -969,7 +1044,7 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
 			b, c := k.kind(p, ip, i.B()), k.kind(p, ip, i.C())
 			if !known(i.B(), i.C()) || b != c && !k.exactConstant(p, i.B()) && !k.exactConstant(p, i.C()) {
-				return false
+				return k.fail(ip)
 			}
 			ip++
 			continue
@@ -977,38 +1052,38 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 			continue
 		case bytecode.OpSetTable, bytecode.OpSetTableUp:
 			if !k.bufferKey(p, ip, i.B()) || !known(i.C()) {
-				return false
+				return k.fail(ip)
 			}
 			continue
 		case bytecode.OpGetTable, bytecode.OpGetTableUp:
 			if !k.bufferKey(p, ip, i.C()) {
-				return false
+				return k.fail(ip)
 			}
 		case bytecode.OpCall:
 			if !known(i.A()+1) || k.calls[ip].args == 2 && !known(i.A()+2) {
-				return false
+				return k.fail(ip)
 			}
 			m := k.calls[ip].math
 			if (m == mathFloor || m == mathCeil) && k.typeAt(ip, i.A()+1) == kindFloat && !k.floor {
-				return false
+				return k.fail(ip)
 			}
 		case bytecode.OpMove: // of a number or an alias
 			if k.kind(p, ip, i.B()) == kindAny {
-				return false
+				return k.fail(ip)
 			}
 		case bytecode.OpUnaryMinus:
 			if !known(i.B()) {
-				return false
+				return k.fail(ip)
 			}
 		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv:
 			if !known(i.B(), i.C()) {
-				return false
+				return k.fail(ip)
 			}
 		case bytecode.OpMod, bytecode.OpIDiv:
 			// Integers by a kernelDivisor; floats by anything for //, and by
 			// a floatModDivisor for %, rounding in one instruction.
 			if !known(i.B(), i.C()) {
-				return false
+				return k.fail(ip)
 			}
 			var d value
 			if bytecode.IsConstant(i.C()) {
@@ -1017,26 +1092,32 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 			switch k.results[ip] {
 			case kindInt:
 				if !kernelDivisor(d) {
-					return false
+					return k.fail(ip)
 				}
 			case kindFloat:
 				_, modOK := floatModDivisor(d)
 				if !k.floor || i.OpCode() == bytecode.OpMod && !modOK {
-					return false
+					return k.fail(ip)
 				}
 			}
 		case bytecode.OpBitwise: // bitwiseResult checked the operands
 			if k.results[ip] != kindInt {
-				return false
+				return k.fail(ip)
 			}
 			ip++
 			continue
 		}
 		if k.results[ip] == kindAny {
-			return false
+			return k.fail(ip)
 		}
 	}
 	return true
+}
+
+// fail records ip as the pc checkTypes stopped at, and reports false.
+func (k *kernelPlan) fail(ip int) bool {
+	k.badPC = ip
+	return false
 }
 
 // bufferKey reports whether field can key a buffer access at ip: an
@@ -1089,6 +1170,32 @@ func kernelJump(code []bytecode.Instruction, ip, latch int) (int, bool) {
 	}
 	t := ip + 1 + i.SBx()
 	return t, t > ip && t <= latch
+}
+
+// kernelOp reports whether a kernel may run op; it leaves at any other.
+func kernelOp(op bytecode.OpCode) bool {
+	switch op {
+	case bytecode.OpMove, bytecode.OpLoadConstant, bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul,
+		bytecode.OpDiv, bytecode.OpMod, bytecode.OpIDiv, bytecode.OpBitwise, bytecode.OpUnaryMinus,
+		bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual, bytecode.OpJump,
+		bytecode.OpGetUpValue, bytecode.OpCall, bytecode.OpGetTable, bytecode.OpSetTable,
+		bytecode.OpGetTableUp, bytecode.OpSetTableUp:
+		return true
+	}
+	return false
+}
+
+// leavingJump reports whether the JMP after the test at ip leaves the
+// loop body, from start to latch, closing no upvalues: as a break does.
+// The kernel leaves at the test when it would jump, for the ordinary code
+// to test again and jump.
+func leavingJump(code []bytecode.Instruction, ip, start, latch int) bool {
+	j := code[ip+1]
+	if j.OpCode() != bytecode.OpJump || j.A() != 0 {
+		return false
+	}
+	t := ip + 2 + j.SBx()
+	return t > latch || t < start
 }
 
 // writtenOnce returns k's written registers without repeats.

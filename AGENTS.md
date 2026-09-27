@@ -416,11 +416,15 @@ nothing compiles.
     that fits 32 bits divide without a divide instruction, in kernels
     too (jit_divide.go): a shift and mask for a power of two, otherwise
     a multiply by Hacker's Delight's magic number. `divRef` mirrors the
-    emitted code for `TestDivideByConstant`. A zero divisor, float `%` (fmod), a
-    bitwise float operand, and `<` between a float and an integer beyond
-    2^53 exit to Go. Integer for loops count down in the limit's register,
+    emitted code for `TestDivideByConstant`. Float `%` runs `math.Mod`'s
+    own steps on the floats' bits (`floatModAny`), or a few instructions
+    for a power-of-two constant, and gives Go's NaN where `math.Mod` does.
+    A zero divisor, a subnormal float divisor, a bitwise float operand,
+    and `<` between a float and an integer beyond 2^53 exit to Go.
+    Integer for loops count down in the limit's register,
     as `forPrep` sets them up; a float limit with an integer start exits
-    at FORPREP. `<` and `<=` compare numbers; `==` compares any values, and
+    at FORPREP. `<` and `<=` compare numbers; `==` compares any values, a
+    float and an integer exactly (`floatEqualsInt`), and
     exits only for two userdata, two tables whose first metatable is not
     known to lack `__eq`, or equal-length strings longer than
     `maxInlineCompare`.
@@ -430,7 +434,8 @@ nothing compiles.
     metatable (whose cache `jitStep` fills), and array elements,
     including appends within capacity, of tables in registers or
     upvalues.
-  - `#` of strings.
+  - `#` of strings, buffers and tables without `__len` or a hash part:
+    the array's length, or a border by binary search (`tableLength`).
   - Native calls, tail calls and returns between compiled Lua functions,
     with arguments up to l.top (B 0) too. A vararg callee's frame starts
     above its arguments, where `adjustVarArgs` moves its fixed parameters,

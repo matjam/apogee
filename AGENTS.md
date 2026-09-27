@@ -545,6 +545,24 @@ nothing compiles.
     to observe types from, `findKernels` also plans with `floats` set,
     guessing floats where nothing decides, and keeps that plan when its
     types differ.
+  - **While loops.** A loop closed by a JMP back to its start, as while
+    loops are (the compile loop finds the JMPs; `isConsumed` ones are a
+    test's), is a kernel too: `kernelPlan.while`, entered at its start
+    before the ordinary code there, with no loop registers; its base, the
+    registers that outlive it, is the locals active at its start
+    (`activeLocals`, from the debug information). It leaves by its tests,
+    which do not count as short runs, nor do breaks (`breaks`), and a
+    test's jump back to the start goes to the latch (`kernelPlan.jump`).
+    Exits at a pc where kernels start go past them (`ordinaryAt`), not
+    into them again. A test that leaves, or a table access, makes the
+    locals below the loop the body writes live-in, like the other exits:
+    a value from the iteration before must be written back.
+  - **Booleans.** `kindBool` holds true or false as 1 or 0 in a
+    general-purpose register: LOADBOOL (without its skip), NOT, TEST
+    (`irBranch` with `cmp` TEST; on a number or a table, which is true,
+    it jumps or not at compile time), boolean constants, and booleans in
+    tables. `guess` makes a live-in only tested and never met by
+    arithmetic a boolean.
   - **Buffers.** `GETTABLE`/`SETTABLE` on a register the body never
     writes, with an integer key, reads or writes a buffer's element; the
     entry check confirms a buffer (of floats, if read). A register the

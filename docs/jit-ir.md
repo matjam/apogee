@@ -139,6 +139,10 @@ geometric mean; a phase that loses somewhere says where and why.
    what the kernel relies on and loading the live registers. Plasma, a
    Go call per pixel, is 23% faster; a loop that does little but call
    is not a kernel, as it was slower.
+5. **Phase 5,** while loops first: a loop a JMP closes, entered at its
+   start and left by its tests, with booleans in registers for the flags
+   such loops test. mandelbrot, whose innermost loop is one, is 76%
+   faster, and sieve, whose flags are booleans, 23%.
 
 ## What this does not change
 

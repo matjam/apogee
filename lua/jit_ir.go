@@ -51,7 +51,7 @@ const (
 	irNot                   // dst = ~a
 	irShift                 // dst = a << imm, >> -imm when negative; 0 when flag
 	irNeg                   // dst = -a, of dst's type
-	irBranch                // to target when a cmp b is flag
+	irBranch                // to target when a cmp b is flag, or for TEST, when a is flag
 	irJump                  // to target
 	irIntrinsic             // dst = the number function imm (a)
 	irMath                  // dst = math function imm (a, b), of a's type
@@ -64,11 +64,12 @@ const (
 	irFieldSet              // that field = c, over a value
 	irCopyUp                // register obj = upvalue imm, on the stack
 	irCopy                  // register obj = register imm, on the stack
+	irBoolNot               // dst = not a, of a boolean
 )
 
 var irOpNames = [...]string{"label", "move", "const", "hoist", "add", "sub", "mul", "div", "floordiv",
 	"fmod", "idiv", "imod", "and", "or", "xor", "not", "shift", "neg", "branch", "jump", "intrinsic",
-	"math", "bufget", "bufset", "exit", "aget", "aset", "fget", "fset", "copyup", "copy"}
+	"math", "bufget", "bufset", "exit", "aget", "aset", "fget", "fset", "copyup", "copy", "not"}
 
 func (o irOp) String() string { return irOpNames[o] }
 
@@ -195,7 +196,7 @@ func (f *irFunc) typeOf(v vreg) numKind { return f.vregs[v].t }
 // which outlive it, and the scratch key.
 func (f *irFunc) pinned(v vreg) bool {
 	r := f.vregs[v].r
-	return r > inlineReg && (r < f.base+4 || slices.Contains(f.liveIn, r))
+	return r > inlineReg && (r < f.pinBelow() || slices.Contains(f.liveIn, r))
 }
 
 // arg returns RK field before ip as an argument.
@@ -247,7 +248,8 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 	base := k.base
 	// Virtual registers in the order allocate colours them: the loop's,
 	// the live-in ones, then as the body writes them.
-	for r := base; r <= base+3; r++ {
+	f.loop = [4]vreg{noVreg, noVreg, noVreg, noVreg}
+	for r := base; r <= base+3 && !k.while; r++ {
 		f.loop[r-base] = f.value(r, k.types[base])
 	}
 	for _, r := range k.liveIn {
@@ -276,9 +278,9 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			continue
 		}
 		emit(irInst{op: irLabel, pc: ip, target: ip, dst: noVreg, a: noArg, b: noArg, c: noArg, snap: -1, buf: -1, tmp: noVreg})
-		if k.exits[ip] {
+		if k.exits[ip] { // a break ends the loop, which is no short run
 			f.leaves = true
-			emit(irInst{op: irExit, pc: ip, dst: noVreg, a: noArg, b: noArg, c: noArg, snap: f.snapshot(p, ip), buf: -1, tmp: noVreg})
+			emit(irInst{op: irExit, pc: ip, dst: noVreg, a: noArg, b: noArg, c: noArg, snap: f.snapshot(p, ip), buf: -1, tmp: noVreg, flag: k.breaks[ip]})
 			continue
 		}
 		in := irInst{pc: ip, dst: noVreg, a: noArg, b: noArg, c: noArg, snap: -1, buf: -1, tmp: noVreg}
@@ -334,8 +336,37 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			}
 		case bytecode.OpUnaryMinus:
 			in.op, in.dst, in.a = irNeg, dst(), f.arg(p, ip, i.B())
+		case bytecode.OpLoadBool:
+			in.op, in.dst, in.a = irConst, dst(), irArg{v: noVreg, k: litK, t: kindInt, lit: integerValue(int64(min(i.B(), 1)))}
+		case bytecode.OpNot:
+			if in.a = f.arg(p, ip, i.B()); in.a.t == kindBool {
+				in.op, in.dst = irBoolNot, dst()
+				break
+			}
+			// A number or a table: true, so not it is false.
+			in.op, in.dst, in.a = irConst, dst(), irArg{v: noVreg, k: litK, t: kindInt, lit: integerValue(0)}
+		case bytecode.OpTest:
+			t, ok := k.jump(code, ip)
+			in.op, in.cmp, in.flag, in.target, in.a = irBranch, bytecode.OpTest, i.C() != 0, t, f.arg(p, ip, i.A())
+			if !ok { // it leaves the loop: the ordinary code tests again
+				in.target, in.snap, f.leaves = -1, f.snapshot(p, ip), true
+			}
+			if in.a.t != kindBool { // a number or a table, which is true
+				switch {
+				case !in.flag: // never jumps
+					ip++
+					continue
+				case in.target >= 0:
+					in.op = irJump
+				default:
+					in.op, in.flag = irExit, true
+				}
+			}
+			emit(in)
+			ip++ // the JMP
+			continue
 		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
-			t, ok := kernelJump(code, ip, k.latch)
+			t, ok := k.jump(code, ip)
 			in.op, in.cmp, in.flag, in.target = irBranch, op, i.A() != 0, t
 			in.a, in.b = f.arg(p, ip, i.B()), f.arg(p, ip, i.C())
 			if !ok { // it leaves the loop: the ordinary code tests again
@@ -345,7 +376,7 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			ip++ // the JMP
 			continue
 		case bytecode.OpJump:
-			t, _ := kernelJump(code, ip, k.latch)
+			t, _ := k.jump(code, ip)
 			in.op, in.target = irJump, t
 		case bytecode.OpGetUpValue:
 			// The function an intrinsic call checked on entry, or a buffer the
@@ -778,7 +809,7 @@ func (f *irFunc) String() string {
 	var b strings.Builder
 	name := func(v vreg) string {
 		s := f.vregs[v]
-		t := map[numKind]string{kindFloat: "f", kindInt: "i", kindTable: "t"}[s.t]
+		t := map[numKind]string{kindFloat: "f", kindInt: "i", kindTable: "t", kindBool: "b"}[s.t]
 		return fmt.Sprintf("%s%d.r%d", t, v, s.r)
 	}
 	arg := func(a irArg) string {
@@ -787,6 +818,9 @@ func (f *irFunc) String() string {
 		}
 		if a.isConst() {
 			return fmt.Sprintf("k%d", a.k)
+		}
+		if a.v == noVreg {
+			return "-"
 		}
 		return name(a.v)
 	}
@@ -825,4 +859,12 @@ func (f *irFunc) String() string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// b2i is 1 for true and 0 for false.
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

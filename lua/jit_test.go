@@ -1200,6 +1200,56 @@ func TestJITKernelCalls(t *testing.T) {
 	}
 }
 
+// While loops are kernels too, entered at their start and left by their
+// tests, and kernels hold booleans.
+func TestJITKernelWhile(t *testing.T) {
+	skipWithoutJIT(t)
+	tests := []struct{ name, src string }{
+		{"counting", `function run() local i, s = 0, 0 while i < 1000 do s = s + i * 2; i = i + 1 end return i, s end`},
+		{"floats", `function run() local x, n = 1.0, 0 while x < 1e6 do x = x * 1.5 + 0.25; n = n + 1 end return x, n end`},
+		{"a boolean condition", `function run() local go, i = true, 0 while go do i = i + 3; if i > 500 then go = false end end return i, go end`},
+		{"mandelbrot's escape", `
+			function run()
+			  local sum = 0
+			  for y = 0, 19 do
+			    for x = 0, 19 do
+			      local cr, ci = 2.0 * x / 20 - 1.5, 2.0 * y / 20 - 1.0
+			      local zr, zi, zrzr, zizi = 0.0, 0.0, 0.0, 0.0
+			      local z, not_done, escape = 0, true, 0
+			      while not_done and z < 50 do
+			        zr = zrzr - zizi + cr
+			        zi = 2.0 * zr * zi + ci
+			        zrzr, zizi = zr * zr, zi * zi
+			        if zrzr + zizi > 4.0 then not_done = false; escape = 1 end
+			        z = z + 1
+			      end
+			      sum = sum + escape * z
+			    end
+			  end
+			  return sum
+			end`},
+		{"break", `function run() local i = 0 while true do i = i + 7; if i > 300 then break end end return i end`},
+		{"not", `function run() local a, n = false, 0 for i = 1, 100 do a = not a; if a then n = n + i end end return a, n end`},
+		{"boolean arrays", `function run() local flags, n = {}, 0 for i = 1, 200 do flags[i] = true end
+			for i = 2, 200 do if flags[i] then n = n + 1; flags[i] = false end end return n, flags[5] end`},
+		{"a number is true", `function run() local x, n = 5, 0 for i = 1, 10 do if x then n = n + x end end return n end`},
+		{"repeat is not a while loop", `function run() local i = 0 repeat i = i + 1 until i >= 100 return i end`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime.GC()
+			defer debug.SetGCPercent(debug.SetGCPercent(-1)) // kernels run while the barrier is off
+			jit, interp, lj := runBoth(t, tt.src)
+			if jit != interp {
+				t.Fatalf("JIT %q, interpreter %q", jit, interp)
+			}
+			if ran := lj.jitCtx.kernels[0]+lj.jitCtx.kernels[1] > 0; ran != !strings.HasPrefix(tt.name, "repeat") {
+				t.Errorf("kernels ran: %v", ran)
+			}
+		})
+	}
+}
+
 // Kernels needing more registers than the machine has spill the rest to
 // their stack slots, and agree with the interpreter.
 func TestJITKernelSpills(t *testing.T) {

@@ -861,11 +861,10 @@ Measured and not worth it for now: loop-invariant global loads (plasma
 runs the same with `set` global or local), putting `sin` and `cos`
 first in the intrinsic dispatch (0.9% on plasma, at a cost to every other
 intrinsic), and running TAILCALL in `runJIT` rather than the interpreter
-(no change: the exit is the cost).
+(no change: the exit is the cost). Closing JMPs in compiled code once
+measured closures +20%; as compiled since #149 (`closeJump`) they measure
+no change (4.84 against 4.92 ms, p=0.44).
 
-- **Closing JMPs in compiled code**, when nothing at or above the level
-  is open: +2% on the geometric mean, closures +20%, even with the jump
-  still marked `always` for `worthEntering`.
 - **Inline integer-times-float-constant branches in `executeSwitch`'s
   RK opcodes:** plasma −7% interpreted, but others +1–2.5% from layout;
   −0.1% net.

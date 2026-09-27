@@ -76,6 +76,11 @@ type Asm struct {
 // its label, which LongTests allows.
 var ErrTestRange = errors.New("arm64: test branch out of range")
 
+// ErrRange is Code's error for another branch farther than it reaches:
+// ±1 MB for a conditional branch, ±128 MB for another, in code too long
+// to compile.
+var ErrRange = errors.New("arm64: branch out of range")
+
 // Len returns the number of instructions emitted so far.
 func (a *Asm) Len() int { return len(a.words) }
 
@@ -102,12 +107,12 @@ func (a *Asm) Code() ([]byte, error) {
 		switch f.kind {
 		case fixB26:
 			if delta < -(1<<25) || delta >= 1<<25 {
-				return nil, fmt.Errorf("arm64: branch out of range")
+				return nil, ErrRange
 			}
 			a.words[f.at] |= uint32(delta) & (1<<26 - 1)
 		case fixCond19:
 			if delta < -(1<<18) || delta >= 1<<18 {
-				return nil, fmt.Errorf("arm64: conditional branch out of range")
+				return nil, ErrRange
 			}
 			a.words[f.at] |= (uint32(delta) & (1<<19 - 1)) << 5
 		case fixTest14:

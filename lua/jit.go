@@ -33,6 +33,11 @@ var jitDefault = true
 // the interpreter before it is compiled. Tests set it to zero.
 var jitThreshold int32 = 1000
 
+// jitStrict, which tests set, makes a function whose code fails to
+// assemble panic, as the compiler's bug it is, rather than run
+// interpreted.
+var jitStrict bool
+
 // jitExitHook, when tests set it, sees every exit from compiled code: the
 // prototype, the pc and the reason. It finds instructions that leave
 // compiled code in hot paths.

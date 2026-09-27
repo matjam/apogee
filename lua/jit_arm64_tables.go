@@ -547,11 +547,22 @@ func (c *arm64Compiler) setIndex(ip int, i bytecode.Instruction, up bool) {
 // other Go function exits with jitExitCallGo, and runJIT makes it; other
 // calls exit to the interpreter.
 func (c *arm64Compiler) call(ip int, i bytecode.Instruction) {
-	notGoFunction := c.a.NewLabel()
+	a := &c.a
+	notGoFunction := a.NewLabel()
 	if (i.B() == 2 || i.B() == 0) && (i.C() == 2 || i.C() == 0) { // one argument, one result
-		c.intrinsic(ip, i, notGoFunction)
+		// Out of line: the intrinsics' code would stand between a Lua
+		// call's few instructions here and the rest in callLua.
+		goFunction, fn := a.NewLabel(), reg(i.A())
+		a.Ldr(rTmp, fn.base, fn.off+offN)
+		a.MovImm(rTmp2, tagOf(vkGoFunction))
+		a.Cmp(rTmp, rTmp2)
+		a.BCond(EQ, goFunction)
+		c.outOfLine = append(c.outOfLine, func() {
+			a.Bind(goFunction)
+			c.intrinsic(ip, i, notGoFunction)
+		})
 	}
-	c.a.Bind(notGoFunction)
+	a.Bind(notGoFunction)
 	c.notLua[ip] = c.a.NewLabel()
 	c.callLua(ip, i, c.notLua[ip])
 }

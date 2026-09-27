@@ -516,6 +516,15 @@ nothing compiles.
     then `CALL … B 0`: an intrinsic has one result, so `kernelCall.args`
     fixes the count, and a side exit at a `B 0` call sets `l.top`. The kernel saves the integer registers trig uses around it
     (`intrinsicSaved`, spilled to `jitContext.spill`).
+  - **Inlining.** `GETUPVAL f; …; CALL f B 2` where the closure being
+    compiled holds in that upvalue a Lua function that only moves, loads
+    number constants and does arithmetic before returning one value
+    (`inlinable`, at most `maxInline` instructions) runs inline: the entry
+    check confirms the upvalue holds that closure (`jitKeep` keeps it
+    alive, as the code compares its address), and `irFunc.inline` renames
+    its registers to virtual ones of their own (`temp`, which never
+    spill), reading the arguments' sources through their MOVEs
+    (`copied`). spectral-norm's `A(i, j)` is the case.
   - **Buffers.** `GETTABLE`/`SETTABLE` on a register the body never
     writes, with an integer key, reads or writes a buffer's element; the
     entry check confirms a buffer (of floats, if read). A register the

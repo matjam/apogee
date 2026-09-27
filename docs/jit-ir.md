@@ -130,6 +130,10 @@ geometric mean; a phase that loses somewhere says where and why.
    field cache. array-fill-sum stays: its first loop appends, which Go
    does, and its second was cheap already. The rest of the standard
    benchmarks' hot loops call methods or functions: phase 4.
+4. **Phase 4,** inlining first: a call through an upvalue of a small
+   numeric leaf function, checked on entry to be that function, runs
+   inline in the kernel, its registers virtual. spectral-norm is 43%
+   faster; nothing else changes.
 
 ## What this does not change
 

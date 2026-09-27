@@ -25,9 +25,7 @@ func irOf(t *testing.T, src string, maxFloats, maxInts int) (*irFunc, bool) {
 		if i.OpCode() != bytecode.OpForLoop {
 			continue
 		}
-		plan := planKernel(p, ip, true, func(int) bool { return true },
-			func(int) (uint64, mathFn, bool) { return 0, mathNone, false },
-			func(int) (numKind, bool) { return kindAny, false }, true, func(int) numKind { return kindAny })
+		plan := planKernel(p, ip, true, newKernelEnv(nil, nil, func(int) bool { return true }, nil, true))
 		if plan == nil {
 			t.Fatal("the loop is not a kernel")
 		}

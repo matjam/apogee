@@ -1111,6 +1111,45 @@ func TestJITKernelTables(t *testing.T) {
 	}
 }
 
+// Kernels inline small numeric Lua functions they call through
+// upvalues, checking on entry that the upvalue still holds the function.
+func TestJITKernelInline(t *testing.T) {
+	skipWithoutJIT(t)
+	tests := []struct{ name, src string }{
+		{"spectral-norm's A", `
+			local function A(i, j) local ij = i + j - 1 return 1.0 / (ij * (ij - 1) * 0.5 + i) end
+			function run() local x = {} for i = 1, 100 do x[i] = i * 0.25 end
+			  local a = 0 for j = 1, 100 do a = a + x[j] * A(3, j) end return a end`},
+		{"integers", `local function sq(n) return n * n + 1 end
+			function run() local s = 0 for i = 1, 1000 do s = s + sq(i) end return s end`},
+		{"mixed", `local function lerp(a, b, t) return a + (b - a) * t end
+			function run() local s = 0 for i = 1, 100 do s = s + lerp(i, 2 * i, 0.25) end return s end`},
+		{"moves and constants", `local function f(a, b) local c = b local d = 3 return -(a - c) * d end
+			function run() local s = 0 for i = 1, 100 do s = s + f(i, 7) + f(1.5, i) end return s end`},
+		{"returns a parameter", `local function id(a) return a end
+			function run() local s = 0 for i = 1, 100 do s = s + id(i) end return s end`},
+		{"returns a constant", `local function k() return 2.5 end
+			function run() local s = 0 for i = 1, 100 do s = s + k() end return s end`},
+		{"the upvalue changes", `local function f(a) return a * 2 end
+			function run() local s = 0 for i = 1, 100 do s = s + f(i) end
+			  f = function(a) return a * 3 end
+			  for i = 1, 100 do s = s + f(i) end return s end`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime.GC()
+			defer debug.SetGCPercent(debug.SetGCPercent(-1)) // kernels run while the barrier is off
+			jit, interp, lj := runBoth(t, tt.src)
+			if jit != interp {
+				t.Fatalf("JIT %q, interpreter %q", jit, interp)
+			}
+			if lj.jitCtx.kernels[0]+lj.jitCtx.kernels[1] == 0 {
+				t.Error("no kernel ran")
+			}
+		})
+	}
+}
+
 // Kernels needing more registers than the machine has spill the rest to
 // their stack slots, and agree with the interpreter.
 func TestJITKernelSpills(t *testing.T) {

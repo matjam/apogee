@@ -487,6 +487,7 @@ type prototype struct {
 	jit     *jitCode               // compiled code, or nil
 	jitOrig []bytecode.Instruction // exec before JIT patches; see jit.go
 	jitRuns []*uint64              // kernels' short runs, which compiled code counts: see kernelRuns
+	jitKeep []*luaClosure          // functions kernels inline, whose addresses their code compares
 }
 
 func (p *prototype) upValueName(index int) string {

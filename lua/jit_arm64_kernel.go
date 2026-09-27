@@ -43,33 +43,10 @@ func (c *arm64Compiler) findKernels(latch int) []*kernel {
 		fns = append(fns, in.fn)
 	}
 	constOK := func(k int) bool { _, ok := c.constant(k); return ok }
-	intrinsic := func(n int) (uint64, mathFn, bool) {
-		if fn, ok := upValueIntrinsic(c.cl, n, fns); ok {
-			return fn, mathNone, true
-		}
-		m, fn := mathFnOf(c.cl, n)
-		return fn, m, m != mathNone
-	}
-	upValue := func(n int) (numKind, bool) { return upValueKind(c.cl, n) }
-	observed := func(r int) numKind {
-		if r >= len(c.frame) {
-			return kindAny
-		}
-		switch v := c.frame[r]; {
-		case v.isFloat():
-			return kindFloat
-		case v.isInteger():
-			return kindInt
-		case v.table() != nil:
-			return kindTable
-		case v.userData() != nil && v.userData().buf != nil:
-			return kindBuffer
-		}
-		return kindAny
-	}
+	env := newKernelEnv(c.cl, c.frame, constOK, fns, true)
 	var ks []*kernel
 	for _, intLoop := range []bool{true, false} {
-		plan := planKernel(c.p, latch, intLoop, constOK, intrinsic, upValue, true, observed)
+		plan := planKernel(c.p, latch, intLoop, env)
 		if plan == nil {
 			continue
 		}
@@ -84,6 +61,11 @@ func (c *arm64Compiler) findKernels(latch int) []*kernel {
 		if f.leaves {
 			k.runs = new(uint64)
 			c.p.jitRuns = append(c.p.jitRuns, k.runs)
+		}
+		for _, kc := range f.calls {
+			if kc.closure != nil {
+				c.p.jitKeep = append(c.p.jitKeep, kc.closure)
+			}
 		}
 		ks = append(ks, k)
 	}
@@ -216,13 +198,24 @@ func (c *arm64Compiler) kernelGuards(k *kernel, normal Label) {
 	a := &c.a
 	for _, n := range k.guardedUpValues() {
 		c.upValueAddr(n)
+		fn, math, closure := k.upValueFn(n)
+		if closure != nil { // a Lua function to inline: that one
+			a.Ldr(rTmp, rAddr, offN)
+			a.MovImm(rTmp2, tagOf(vkLuaClosure))
+			a.Cmp(rTmp, rTmp2)
+			a.BCond(NE, normal)
+			a.Ldr(rTmp, rAddr, offP)
+			a.MovImm(rTmp2, uint64(uintptr(unsafe.Pointer(closure))))
+			a.Cmp(rTmp, rTmp2)
+			a.BCond(NE, normal)
+			continue
+		}
 		a.Ldr(rTmp, rAddr, offN)
 		a.MovImm(rTmp2, tagOf(vkGoFunction))
 		a.Cmp(rTmp, rTmp2)
 		a.BCond(NE, normal)
 		a.Ldr(rTmp, rAddr, offP)
 		c.branchNumber(rTmp, normal) // a number whose bits match the tag
-		fn, math := k.upValueFn(n)
 		if math {
 			a.Ldr(rTmp, rTmp, 0) // the Function's code
 		} else {
@@ -659,8 +652,8 @@ func (c *arm64Compiler) floatArg(k *kernel, x irArg, tmp FReg) FReg {
 		}
 		return k.reg(x.v)
 	}
-	if v := c.p.Constants[x.k]; v.isInteger() {
-		a.MovImm(rTmp, math.Float64bits(float64(v.i())))
+	if v := x.constant(c.p); v.isInteger() || x.k == litK {
+		a.MovImm(rTmp, math.Float64bits(v.toFloat()))
 		a.FmovToF(tmp, rTmp)
 		return tmp
 	}
@@ -674,6 +667,10 @@ func (c *arm64Compiler) floatArg(k *kernel, x irArg, tmp FReg) FReg {
 func (c *arm64Compiler) intArg(k *kernel, x irArg, tmp Reg) Reg {
 	if !x.isConst() {
 		return k.ireg(x.v)
+	}
+	if x.k == litK {
+		c.a.MovImm(tmp, uint64(x.lit.i()))
+		return tmp
 	}
 	o, _ := c.constant(x.k)
 	c.a.Ldr(tmp, o.base, o.off+offN)
@@ -694,6 +691,14 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 			a.Fmov(k.reg(in.dst), k.reg(in.a.v))
 		}
 	case irConst:
+		if v := in.a.constant(p); in.a.k == litK && isInt {
+			a.MovImm(k.ireg(in.dst), uint64(v.i()))
+			break
+		} else if in.a.k == litK {
+			a.MovImm(rTmp, math.Float64bits(v.toFloat()))
+			a.FmovToF(k.reg(in.dst), rTmp)
+			break
+		}
 		o, _ := c.constant(in.a.k)
 		switch v := p.Constants[in.a.k]; {
 		case isInt:

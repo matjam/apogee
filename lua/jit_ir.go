@@ -70,18 +70,31 @@ var irOpNames = [...]string{"label", "move", "const", "hoist", "add", "sub", "mu
 
 func (o irOp) String() string { return irOpNames[o] }
 
-// irArg is an operation's argument: a virtual register, or constant k.
+// irArg is an operation's argument: a virtual register, or constant k, or
+// when k is litK, the number lit, a constant of a function inlined.
 type irArg struct {
-	v vreg
-	k int
-	t numKind // its type
+	v   vreg
+	k   int
+	t   numKind // its type
+	lit value
 }
 
 // noArg is an operation's unused argument.
 var noArg = irArg{v: noVreg, k: -1}
 
+// litK is an irArg's k when it holds its constant in lit.
+const litK = -2
+
 // isConst reports whether the argument is a constant.
-func (a irArg) isConst() bool { return a.v == noVreg && a.k >= 0 }
+func (a irArg) isConst() bool { return a.v == noVreg && (a.k >= 0 || a.k == litK) }
+
+// constant returns the constant a holds, from p's constants or lit.
+func (a irArg) constant(p *prototype) value {
+	if a.k == litK {
+		return a.lit
+	}
+	return p.Constants[a.k]
+}
 
 // irInst is one operation, from the instruction at pc.
 type irInst struct {
@@ -132,6 +145,7 @@ type irFunc struct {
 	end    int          // the latch's snapshot, for leaving at the end of an iteration
 	leaves bool         // whether an instruction or a branch leaves: see irExit
 	share  bool         // the variable shares the index's vreg
+	temps  int          // inlined functions' temporaries: see temp
 	loc    []int        // each vreg's machine register, in its class, or -1: see allocate
 	reload [2]int       // the first of the float and integer registers holding spilled values, or -1
 	cur    map[vreg]int // spilled vregs the operation being lowered uses, and their reload registers
@@ -177,7 +191,7 @@ func (f *irFunc) typeOf(v vreg) numKind { return f.vregs[v].t }
 // which outlive it, and the scratch key.
 func (f *irFunc) pinned(v vreg) bool {
 	r := f.vregs[v].r
-	return r < f.base+4 || slices.Contains(f.liveIn, r)
+	return r > inlineReg && (r < f.base+4 || slices.Contains(f.liveIn, r))
 }
 
 // arg returns RK field before ip as an argument.
@@ -332,6 +346,10 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			in.op, in.dst, in.imm = irHoist, dst(), int64(s)
 		case bytecode.OpCall:
 			kc := k.calls[ip]
+			if kc.closure != nil {
+				f.inline(p, ip, kc, dst(), emit)
+				continue
+			}
 			in.dst, in.a = dst(), f.arg(p, ip, i.A()+1)
 			if kc.math == mathNone {
 				in.op, in.imm, in.snap = irIntrinsic, int64(kc.fn), f.snapshot(p, ip)
@@ -379,6 +397,93 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 	}
 	f.end = f.snapshot(p, k.latch)
 	return f
+}
+
+// inline emits the call at ip of kc's Lua function, into dst: its
+// registers are virtual registers of their own, or the arguments' and
+// constants it moves, and its RETURN moves the result. inlinable made sure
+// nothing in it leaves.
+func (f *irFunc) inline(p *prototype, ip int, kc kernelCall, dst vreg, emit func(irInst)) {
+	q, a := kc.closure.prototype, p.Code[ip].A()
+	regs := map[int]irArg{}
+	for j := range kc.args {
+		regs[j] = f.arg(p, ip, copied(p.Code, kc.get, ip, a+1+j))
+	}
+	rk := func(field int) irArg {
+		if bytecode.IsConstant(field) {
+			v := q.Constants[bytecode.ConstantIndex(field)]
+			return irArg{v: noVreg, k: litK, t: constKind(v), lit: v}
+		}
+		return regs[field]
+	}
+	state := func() map[int]numKind {
+		m := map[int]numKind{}
+		for r, x := range regs {
+			m[r] = x.t
+		}
+		return m
+	}
+	for _, i := range q.Code {
+		in := irInst{pc: ip, dst: noVreg, a: noArg, b: noArg, c: noArg, snap: -1, buf: -1, tmp: noVreg, target: -1}
+		switch op := i.OpCode(); op {
+		case bytecode.OpReturn:
+			if x := regs[i.A()]; x.isConst() {
+				in.op, in.dst, in.a = irConst, dst, x
+			} else {
+				in.op, in.dst, in.a = irMove, dst, x
+			}
+			emit(in)
+			return
+		case bytecode.OpMove:
+			regs[i.A()] = regs[i.B()]
+		case bytecode.OpLoadConstant:
+			v := q.Constants[i.Bx()]
+			regs[i.A()] = irArg{v: noVreg, k: litK, t: constKind(v), lit: v}
+		default:
+			t, _ := result(q, i, state())
+			in.op = map[bytecode.OpCode]irOp{bytecode.OpAdd: irAdd, bytecode.OpSub: irSub,
+				bytecode.OpMul: irMul, bytecode.OpDiv: irDiv, bytecode.OpUnaryMinus: irNeg}[op]
+			in.dst, in.a = f.temp(t), rk(i.B())
+			if op != bytecode.OpUnaryMinus {
+				in.b = rk(i.C())
+			}
+			emit(in)
+			regs[i.A()] = irArg{v: in.dst, t: t}
+		}
+	}
+}
+
+// copied returns the register the argument register r of the call at ip
+// copies, when the last write to it after from, the call's GETUPVAL, is a
+// MOVE whose source nothing writes after it: the argument's value, which
+// the inlined function reads instead, so that the copy dies at once and
+// takes no register through the call. Otherwise it returns r.
+func copied(code []bytecode.Instruction, from, ip, r int) int {
+	src := r
+	for j := from + 1; j < ip; j++ {
+		i := code[j]
+		if i.A() == src && src != r { // the source written: stay with r
+			src = r
+		}
+		if i.A() == r {
+			src = r
+			if i.OpCode() == bytecode.OpMove {
+				src = i.B()
+			}
+		}
+	}
+	return src
+}
+
+// inlineReg is the Lua register of the first virtual register an inlined
+// function's temporary takes; the next take the ones below.
+const inlineReg = -1000
+
+// temp returns a new virtual register of type t for a temporary of an
+// inlined function, which never spills.
+func (f *irFunc) temp(t numKind) vreg {
+	f.temps++
+	return f.value(inlineReg-f.temps, t)
 }
 
 // uses returns the virtual registers in reads. An exit reads what it
@@ -602,6 +707,9 @@ func (f *irFunc) String() string {
 		return fmt.Sprintf("%s%d.r%d", t, v, s.r)
 	}
 	arg := func(a irArg) string {
+		if a.k == litK {
+			return fmt.Sprint(a.lit.toFloat())
+		}
 		if a.isConst() {
 			return fmt.Sprintf("k%d", a.k)
 		}

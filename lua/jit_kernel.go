@@ -104,13 +104,15 @@ type kernelPlan struct {
 }
 
 // kernelCall is an intrinsic call in a kernel, by the CALL's pc: of fn,
-// the intrinsic's Go function, which upvalue upValue must hold.
+// the intrinsic's Go function, which upvalue upValue must hold, or of a
+// Lua function the kernel inlines.
 type kernelCall struct {
 	upValue int
 	fn      uint64
-	get, a  int    // the GETUPVAL's pc, and the register it and the CALL name
-	args    int    // one or two, whether B gives them or, when 0, l.top
-	math    mathFn // a math function, or mathNone for a number function
+	get, a  int         // the GETUPVAL's pc, and the register it and the CALL name
+	args    int         // how many, whether B gives them or, when 0, l.top
+	math    mathFn      // a math function, or mathNone for a number function
+	closure *luaClosure // for a Lua function inlined, which upvalue must hold: see inlinable
 }
 
 // calleesAt returns the intrinsic calls whose callee register the
@@ -172,19 +174,70 @@ func kernelDivisor(v value) bool {
 	return ok && v.isInteger() && i != 0 && -(1<<31) <= i && i < 1<<31
 }
 
+// kernelEnv is what planKernel knows of the closure it plans for and the
+// machine. constOK reports whether generated code can reach constant k;
+// intrinsic returns the intrinsic upvalue n holds, if it holds one compiled
+// code computes: a number function's code, or a math function (mathFn) and
+// its code; upValue returns the kind of number, kindBuffer or kindTable
+// upvalue n holds, if it holds one; closure returns the Lua function
+// upvalue n holds, or nil; floor reports whether the machine rounds a
+// float down in one instruction, for // of floats; observed returns the
+// type register r held when the function compiled, a hint, or kindAny.
+type kernelEnv struct {
+	constOK   func(k int) bool
+	intrinsic func(n int) (uint64, mathFn, bool)
+	upValue   func(n int) (numKind, bool)
+	closure   func(n int) *luaClosure
+	floor     bool
+	observed  func(r int) numKind
+}
+
+// newKernelEnv returns the kernelEnv for compiling cl, whose registers
+// held frame when it compiled, or nil, on a machine whose intrinsics are
+// fns.
+func newKernelEnv(cl *luaClosure, frame []value, constOK func(k int) bool, fns []uint64, floor bool) *kernelEnv {
+	return &kernelEnv{
+		constOK: constOK,
+		intrinsic: func(n int) (uint64, mathFn, bool) {
+			if fn, ok := upValueIntrinsic(cl, n, fns); ok {
+				return fn, mathNone, true
+			}
+			m, fn := mathFnOf(cl, n)
+			return fn, m, m != mathNone
+		},
+		upValue: func(n int) (numKind, bool) { return upValueKind(cl, n) },
+		closure: func(n int) *luaClosure {
+			if cl == nil || n >= len(cl.upValues) || cl.upValues[n] == nil {
+				return nil
+			}
+			return cl.upValues[n].value().luaClosure()
+		},
+		floor: floor,
+		observed: func(r int) numKind {
+			if r >= len(frame) {
+				return kindAny
+			}
+			switch v := frame[r]; {
+			case v.isFloat():
+				return kindFloat
+			case v.isInteger():
+				return kindInt
+			case v.table() != nil:
+				return kindTable
+			case v.userData() != nil && v.userData().buf != nil:
+				return kindBuffer
+			}
+			return kindAny
+		},
+	}
+}
+
 // planKernel returns the kernel for the FORLOOP at latch in p, as an
-// integer or a float loop, or nil when its loop does not qualify. constOK
-// reports whether generated code can reach constant k; intrinsic returns
-// the intrinsic upvalue n holds, if it holds one compiled code computes: a
-// number function's code, or a math function (mathFn) and its code;
-// upValue returns the kind of number, or kindBuffer, upvalue n holds, if
-// it holds one; floor reports whether the machine rounds a float down in
-// one instruction, for // of floats; observed returns the type register r
-// held when the function compiled, a hint, or kindAny.
-func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool, observed func(r int) numKind) *kernelPlan {
+// integer or a float loop, or nil when its loop does not qualify.
+func planKernel(p *prototype, latch int, intLoop bool, env *kernelEnv) *kernelPlan {
 	exits := map[int]bool{}
 	for range maxExits + 1 {
-		k, bad := planKernelWith(p, latch, intLoop, constOK, intrinsic, upValue, floor, observed, exits)
+		k, bad := planKernelWith(p, latch, intLoop, env, exits)
 		if k != nil || bad < 0 || exits[bad] || len(exits) == maxExits {
 			return k
 		}
@@ -199,7 +252,8 @@ const maxExits = 8
 // planKernelWith is planKernel with the instructions at exits left to the
 // ordinary code. When the loop does not qualify it returns the pc of an
 // instruction that stops it, or -1.
-func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool, observed func(r int) numKind, exits map[int]bool) (*kernelPlan, int) {
+func planKernelWith(p *prototype, latch int, intLoop bool, env *kernelEnv, exits map[int]bool) (*kernelPlan, int) {
+	constOK, intrinsic, upValue, floor, observed := env.constOK, env.intrinsic, env.upValue, env.floor, env.observed
 	code := p.Code
 	fl := code[latch]
 	start := latch + 1 + fl.SBx()
@@ -375,6 +429,13 @@ func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) b
 					break
 				}
 			}
+			if call, args, ok := feedsCall(code, ip, start, latch); ok && code[call].B() != 0 && code[call].C() == 2 {
+				if cl := env.closure(i.B()); cl != nil && inlinable(cl.prototype, args) {
+					k.calls[call] = kernelCall{upValue: i.B(), get: ip, a: i.A(), args: args, closure: cl}
+					k.virtual[ip] = true
+					break
+				}
+			}
 			kind, ok := upValue(i.B())
 			if !ok || !write(i.A(), ip) {
 				return nil, ip
@@ -386,7 +447,16 @@ func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) b
 			}
 			k.upLoads[ip] = s
 		case bytecode.OpCall:
-			if kc, ok := k.calls[ip]; !ok || !read(i.A()+1) || kc.args == 2 && !read(i.A()+2) || !write(i.A(), ip) {
+			kc, ok := k.calls[ip]
+			if !ok {
+				return nil, ip
+			}
+			for r := i.A() + 1; r <= i.A()+kc.args; r++ {
+				if !read(r) {
+					return nil, ip
+				}
+			}
+			if !write(i.A(), ip) {
 				return nil, ip
 			}
 		case bytecode.OpGetTable, bytecode.OpSetTable:
@@ -668,6 +738,16 @@ func upValueKind(cl *luaClosure, n int) (numKind, bool) {
 // GETUPVAL would have. An intrinsic has one result, so a call of one
 // that ends another's arguments, C 0 then B 0, passes a fixed count.
 func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, int, bool) {
+	j, args, ok := feedsCall(code, ip, start, latch)
+	i := code[j]
+	return j, args, ok && (args == 1 || args == 2) && (i.C() == 2 || i.C() == 0 && j+1 < latch &&
+		code[j+1].OpCode() == bytecode.OpCall && code[j+1].B() == 0)
+}
+
+// feedsCall returns the pc of the CALL A that the GETUPVAL A at ip feeds,
+// and its argument count, as intrinsicCall does, without the limits on
+// them.
+func feedsCall(code []bytecode.Instruction, ip, start, latch int) (int, int, bool) {
 	a := code[ip].A()
 	for j := ip + 1; j < latch; j++ {
 		i := code[j]
@@ -687,9 +767,7 @@ func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, int,
 			if i.B() == 0 { // up to the call before's result
 				args = code[j-1].A() - a
 			}
-			ok := i.A() == a && (args == 1 || args == 2) && (i.C() == 2 || i.C() == 0 && j+1 < latch &&
-				code[j+1].OpCode() == bytecode.OpCall && code[j+1].B() == 0)
-			return j, args, ok
+			return j, args, i.A() == a
 		case bytecode.OpMove, bytecode.OpUnaryMinus:
 			clobbers = i.A() == a || i.B() == a
 		case bytecode.OpLoadConstant, bytecode.OpGetUpValue:
@@ -708,6 +786,68 @@ func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, int,
 	return 0, 0, false
 }
 
+// maxInline is the most instructions a function the kernel inlines has.
+const maxInline = 24
+
+// inlinable reports whether a kernel may inline a call of q with args
+// arguments: q takes that many, and is a leaf that only moves, loads
+// number constants and does arithmetic before returning one value, so
+// that a kernel runs it without leaving, and nothing but its result can
+// tell it ran inline.
+func inlinable(q *prototype, args int) bool {
+	if q.IsVarArg || q.ParameterCount != args || len(q.Code) > maxInline {
+		return false
+	}
+	for _, i := range q.Code {
+		switch i.OpCode() {
+		case bytecode.OpReturn:
+			return i.B() == 2
+		case bytecode.OpLoadConstant:
+			if constKind(q.Constants[i.Bx()]) == kindAny {
+				return false
+			}
+		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv:
+			for _, f := range []int{i.B(), i.C()} {
+				if bytecode.IsConstant(f) && constKind(q.Constants[bytecode.ConstantIndex(f)]) == kindAny {
+					return false
+				}
+			}
+		case bytecode.OpMove, bytecode.OpUnaryMinus:
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// inlineResult returns the type an inlined call of q returns given
+// arguments of types args, kindAny while one is undecided, and false for
+// arguments it cannot run on.
+func inlineResult(q *prototype, args []numKind) (numKind, bool) {
+	state := map[int]numKind{}
+	for j, t := range args {
+		if t == kindAny {
+			return kindAny, true
+		}
+		if !isNumKind(t) {
+			return kindAny, false
+		}
+		state[j] = t
+	}
+	for _, i := range q.Code {
+		if i.OpCode() == bytecode.OpReturn {
+			t := state[i.A()]
+			return t, isNumKind(t)
+		}
+		t, ok := result(q, i, state)
+		if !ok || !isNumKind(t) {
+			return kindAny, false
+		}
+		state[i.A()] = t
+	}
+	return kindAny, false
+}
+
 // guardedUpValues returns the upvalues k's intrinsic calls come from, each
 // once, in order.
 func (k *kernelPlan) guardedUpValues() []int {
@@ -722,14 +862,15 @@ func (k *kernelPlan) guardedUpValues() []int {
 }
 
 // upValueFn returns the intrinsic upvalue n must hold: a number
-// function's code, or a math function's, when math is set.
-func (k *kernelPlan) upValueFn(n int) (fn uint64, math bool) {
+// function's code, or a math function's, when math is set; or the Lua
+// function, closure, the kernel inlines.
+func (k *kernelPlan) upValueFn(n int) (fn uint64, math bool, closure *luaClosure) {
 	for _, kc := range k.calls {
 		if kc.upValue == n {
-			return kc.fn, kc.math != mathNone
+			return kc.fn, kc.math != mathNone, kc.closure
 		}
 	}
-	return 0, false
+	return 0, false, nil
 }
 
 // callResult returns the type the intrinsic call kc at i gives A with
@@ -739,6 +880,13 @@ func (k *kernelPlan) upValueFn(n int) (fn uint64, math bool) {
 // same for both. kindAny while an argument's is unknown; false for mixed
 // ones.
 func callResult(kc kernelCall, i bytecode.Instruction, state map[int]numKind) (numKind, bool) {
+	if kc.closure != nil {
+		args := make([]numKind, kc.args)
+		for j := range args {
+			args[j] = state[i.A()+1+j]
+		}
+		return inlineResult(kc.closure.prototype, args)
+	}
 	arg := state[i.A()+1]
 	switch kc.math {
 	case mathNone:
@@ -1234,8 +1382,10 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 				return k.fail(ip)
 			}
 		case bytecode.OpCall:
-			if !known(i.A()+1) || k.calls[ip].args == 2 && !known(i.A()+2) {
-				return k.fail(ip)
+			for r := i.A() + 1; r <= i.A()+k.calls[ip].args; r++ {
+				if !known(r) {
+					return k.fail(ip)
+				}
 			}
 			m := k.calls[ip].math
 			if (m == mathFloor || m == mathCeil) && k.typeAt(ip, i.A()+1) == kindFloat && !k.floor {

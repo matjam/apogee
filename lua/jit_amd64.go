@@ -40,9 +40,10 @@ const maxOffset = 1 << 30
 type amd64Compiler struct {
 	a       Asm
 	p       *prototype
-	g       *globalState // the state p runs in, whose string metatable SELF reads
-	cl      *luaClosure  // the closure being compiled, whose upvalues kernels speculate on
-	frame   []value      // its registers when it compiled at a loop latch, which hint kernels' types, or nil
+	g       *globalState  // the state p runs in, whose string metatable SELF reads
+	cl      *luaClosure   // the closure being compiled, whose upvalues kernels speculate on
+	frame   []value       // its registers when it compiled at a loop latch, which hint kernels' types, or nil
+	resume  map[int]Label // where compiled code enters at a pc to go on in a kernel, when not the pc's code
 	code    []bytecode.Instruction
 	pcs     []Label
 	exits   []Label
@@ -75,7 +76,7 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (co
 	if len(p.Code) > 1<<16 {
 		return nil, nil, nil, 0
 	}
-	c := &amd64Compiler{p: p, g: g, cl: cl, frame: frame, code: p.jitOrig, sse41: HasSSE41(), kernelExit: -1}
+	c := &amd64Compiler{p: p, g: g, cl: cl, frame: frame, code: p.jitOrig, sse41: HasSSE41(), kernelExit: -1, resume: map[int]Label{}}
 	c.pcs = make([]Label, len(c.code))
 	c.exits = make([]Label, len(c.code))
 	c.budget = make([]Label, len(c.code))
@@ -122,6 +123,9 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (co
 		if isExtraArg(c.p.Code, i) {
 			offsets[i] = -1
 		}
+	}
+	for pc, l := range c.resume { // kernels go on after calls they leave at
+		offsets[pc] = int32(c.a.Offset(l))
 	}
 	exits := make([]bool, len(c.exits))
 	for i, l := range c.exits {

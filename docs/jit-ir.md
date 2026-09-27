@@ -133,7 +133,12 @@ geometric mean; a phase that loses somewhere says where and why.
 4. **Phase 4,** inlining first: a call through an upvalue of a small
    numeric leaf function, checked on entry to be that function, runs
    inline in the kernel, its registers virtual. spectral-norm is 43%
-   faster; nothing else changes.
+   faster; nothing else changes. Then other calls leave the kernel and
+   it resumes after them: the return, or runJIT after a Go call, enters
+   at the next pc, which a kernel's resume point takes, checking again
+   what the kernel relies on and loading the live registers. Plasma, a
+   Go call per pixel, is 23% faster; a loop that does little but call
+   is not a kernel, as it was slower.
 
 ## What this does not change
 

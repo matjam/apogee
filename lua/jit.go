@@ -227,6 +227,10 @@ const maxSetList = 1024
 // it exits for longer ones, which Go compares faster.
 const maxInlineCompare = 32
 
+// minCallWork is the operations a kernel does in registers for each call
+// it resumes after: see worksBetweenCalls. Tests lower it.
+var minCallWork = 4
+
 // jitMinRun is how many instructions compiled code must run from an entry
 // before its first unconditional exit for entering it to pay: a round trip
 // between the interpreter and compiled code costs about as much as

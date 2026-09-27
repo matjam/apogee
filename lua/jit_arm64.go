@@ -47,9 +47,10 @@ const maxOffset = 32768
 type arm64Compiler struct {
 	a       Asm
 	p       *prototype
-	g       *globalState // the state p runs in, whose string metatable SELF reads
-	cl      *luaClosure  // the closure being compiled, whose upvalues kernels speculate on
-	frame   []value      // its registers when it compiled at a loop latch, which hint kernels' types, or nil
+	g       *globalState  // the state p runs in, whose string metatable SELF reads
+	cl      *luaClosure   // the closure being compiled, whose upvalues kernels speculate on
+	frame   []value       // its registers when it compiled at a loop latch, which hint kernels' types, or nil
+	resume  map[int]Label // where compiled code enters at a pc to go on in a kernel, when not the pc's code
 	code    []bytecode.Instruction
 	pcs     []Label // start of each pc's code
 	exits   []Label // exit to the interpreter at each pc, created on demand
@@ -96,7 +97,7 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (co
 }
 
 func compileARM64(p *prototype, g *globalState, cl *luaClosure, frame []value, longTests bool) (code []byte, offsets []int32, entries []int, kernels int, err error) {
-	c := &arm64Compiler{p: p, g: g, cl: cl, frame: frame, code: p.jitOrig, kernelExit: -1}
+	c := &arm64Compiler{p: p, g: g, cl: cl, frame: frame, code: p.jitOrig, kernelExit: -1, resume: map[int]Label{}}
 	c.a.LongTests = longTests
 	c.pcs = make([]Label, len(c.code))
 	c.exits = make([]Label, len(c.code))
@@ -141,6 +142,9 @@ func compileARM64(p *prototype, g *globalState, cl *luaClosure, frame []value, l
 		if isExtraArg(c.p.Code, i) {
 			offsets[i] = -1
 		}
+	}
+	for pc, l := range c.resume { // kernels go on after calls they leave at
+		offsets[pc] = int32(c.a.Offset(l))
 	}
 	exits := make([]bool, len(c.exits))
 	for i, l := range c.exits {

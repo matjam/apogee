@@ -740,10 +740,10 @@ func TestJITKernels(t *testing.T) {
 		{"nested: inner only", "int", `function run() local s = 0; for i = 1, 10 do for j = 1, 10 do s = s + i * j end end; return s end`},
 		{"break leaves the kernel", "int", `function run() local s = 0; for i = 1, 10 do s = s + i; if s > 20 then break end end; return s end`},
 		{"break from a float comparison", "int", `function run() local s = 0.5; for i = 1, 100 do s = s * 1.5; if s >= 1000 then break end end; return s end`},
-		{"calls are not kernels", "", `function run() local s = 0; for i = 1, 10 do s = s + math.floor(i / 2) end; return s end`},
+		{"calls leave the kernel and resume", "int", `function run() local s = 0; for i = 1, 10 do s = s + math.floor(i / 2) end; return s end`},
 		{"a call on a rare path leaves the kernel", "int", `function run() local s, t = 0, {}; for i = 1, 1000 do s = s + i * 3; if i % 100 == 0 then t[#t + 1] = s end end; return s, #t, t[4] end`},
 		{"a return on a rare path", "int", `function run() local s = 0; for i = 1, 1000 do s = s + i; if s > 5000 then return s, i end end; return s end`},
-		{"an exit on every path is not a kernel", "", `function run() local s = 0; for i = 1, 100 do s = s + i; local _ = tostring(s) end; return s end`},
+		{"an exit on every path is not a kernel", "", `function run() local s = 0; for i = 1, 100 do s = s + i; local _ = s .. "" end; return s end`},
 		{"locals written after an exit", "int", `function run() local a, b, t = 0, 0, {}; for i = 1, 300 do a = a + i; if i % 7 == 0 then t[#t + 1] = a end; b = b + a end; return a, b, #t end`},
 		{"temporaries live across an exit", "int", `function run() local s, t = 0, {}; for i = 1, 200 do local x = i * 2; local y = i * 3; if i % 50 == 0 then t[#t + 1] = x end; s = s + y end; return s, t[1], t[4] end`},
 	}
@@ -996,9 +996,12 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 				t.Fatalf("JIT %q, interpreter %q", jit, interp)
 			}
 			floats, ints := lj.jitCtx.kernels[0] > 0, lj.jitCtx.kernels[1] > 0
+			// Where Go computes sin and cos, calls of them leave the kernel,
+			// and whether one runs depends on how much else the loop does
+			// (minCallWork): only the results count.
 			want := tt.runs
 			if !trigInline && (strings.Contains(tt.src, "sin") || strings.Contains(tt.src, "cos")) {
-				want = "none" // Go computes them, so they are not intrinsics
+				return
 			}
 			if floats != (want == "float" || want == "both") || ints != (want == "int" || want == "both") {
 				t.Fatalf("float kernels ran: %v, integer kernels ran: %v; want %q", floats, ints, want)
@@ -1140,6 +1143,53 @@ func TestJITKernelInline(t *testing.T) {
 			runtime.GC()
 			defer debug.SetGCPercent(debug.SetGCPercent(-1)) // kernels run while the barrier is off
 			jit, interp, lj := runBoth(t, tt.src)
+			if jit != interp {
+				t.Fatalf("JIT %q, interpreter %q", jit, interp)
+			}
+			if lj.jitCtx.kernels[0]+lj.jitCtx.kernels[1] == 0 {
+				t.Error("no kernel ran")
+			}
+		})
+	}
+}
+
+// Calls a kernel cannot inline leave it, for the ordinary code to make,
+// and the kernel goes on after them, checking again what it relies on.
+func TestJITKernelCalls(t *testing.T) {
+	skipWithoutJIT(t)
+	tests := []struct{ name, src string }{
+		{"Lua function", `local function f(x) if x > 50 then return x * 2 end return x end
+			function run() local s = 0.5 for i = 1, 100 do s = s + f(i) * 0.5 end return s end`},
+		{"Go function", `function run() local s = 0 for i = 1, 100 do s = s + math.abs(i - 50) end return s end`},
+		{"global Go function", `function run() local s = 0 for i = 1, 100 do s = s + gofn(i) end return s end`},
+		{"no result", `local n = 0 local function bump(x) n = n + x end
+			function run() local s = 0 for i = 1, 100 do s = s + i; bump(i) end return s, n end`},
+		{"the callee writes a local the loop holds", `function run() local s = 0 local function f() s = s + 1000 end
+			  for i = 1, 10 do s = s + i; f() end return s end`},
+		{"the result changes type", `local function f(i) if i > 50 then return i + 0.5 end return i end
+			function run() local s = 0 for i = 1, 100 do s = s + f(i) end return s end`},
+		{"the result is not a number", `local function f(i) if i == 60 then return "x" end return i end
+			function run() local s, n = 0, 0 for i = 1, 100 do local v = f(i) if i == 60 then n = n + 1 else s = s + v end end return s, n end`},
+		{"an error in the callee", `local function f(i) if i == 70 then error("stop") end return i end
+			local function g() local s = 0 for i = 1, 100 do s = s + f(i) end return s end
+			function run() return pcall(g) end`},
+		{"with tables", `local function norm(x, y) return math.sqrt(x * x + y * y) end
+			function run() local ps = {} for i = 1, 50 do ps[i] = {x = i * 0.5, y = 2.0} end
+			  local s = 0.0 for i = 1, #ps do local p = ps[i]; s = s + norm(p.x, p.y) end return s end`},
+		{"the function changes", `local g = function(x) return x end
+			function run() local s = 0 for i = 1, 100 do s = s + g(i); if i == 40 then g = function(x) return -x end end end return s end`},
+	}
+	saved := minCallWork
+	minCallWork = 0 // kernels of calls, however little else they do
+	defer func() { minCallWork = saved }()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime.GC()
+			defer debug.SetGCPercent(debug.SetGCPercent(-1)) // kernels run while the barrier is off
+			setup := func(l *State) {
+				l.Register("gofn", func(l *State) int { v, _ := l.ToNumber(1); l.PushNumber(v * 2); return 1 })
+			}
+			jit, interp, lj := runBothWith(t, tt.src, setup)
 			if jit != interp {
 				t.Fatalf("JIT %q, interpreter %q", jit, interp)
 			}

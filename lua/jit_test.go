@@ -942,6 +942,25 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			  for i = 0, 99 do v = min(a[i], 1) end
 			  return v, math.type(v)
 			end`},
+		{"a math call's argument from another", "int", `
+			local floor, min, a, out = math.floor, math.min, f64, f64
+			function run()
+			  for i = 0, 99 do a[i] = (i - 50) * 7.3 end
+			  a[7], a[8], a[9] = 1e300, -1/0, 0/0 -- floor leaves the kernel for these, and min gets floats
+			  local s = 0
+			  for i = 10, 99 do s = s + min(255, floor(a[i])) end
+			  local ok, v = pcall(function() local t = 0; for i = 0, 99 do t = t + min(255, floor(a[i])) end; return t end)
+			  return s, ok, v
+			end`},
+		{"an intrinsic's argument from a math call", "int", `
+			local floor, sin = math.floor, math.sin
+			function run()
+			  local s = 0.0
+			  for i = 0, 99 do -- sin(2^40 + 366) leaves the kernel, its argument at l.top
+			    s = s + sin(floor(i * 3.7 + i // 99 * 2^40))
+			  end
+			  return s
+			end`},
 		{"float into an integer buffer", "int", `
 			function run()
 			  local i32 = i32
@@ -977,6 +996,52 @@ func TestJITKernelCallsAndBuffers(t *testing.T) {
 			}
 			if floats != (want == "float" || want == "both") || ints != (want == "int" || want == "both") {
 				t.Fatalf("float kernels ran: %v, integer kernels ran: %v; want %q", floats, ints, want)
+			}
+		})
+	}
+}
+
+// A kernel's temporaries share machine registers where their lives do not
+// overlap, so clamps and nested calls fit in the few integer registers:
+// each loop here, alone in its function, runs as a kernel. Their inputs
+// make floor leave the kernel mid-iteration, with shared registers
+// holding other temporaries' values.
+func TestJITKernelRegisters(t *testing.T) {
+	skipWithoutJIT(t)
+	xs := make([]float64, 100)
+	for i := range xs {
+		xs[i] = float64(i%60)*9.3 - 200.5
+	}
+	xs[7], xs[8], xs[9] = 1e300, math.Inf(-1), math.NaN()
+	setup := func(l *State) {
+		l.PushBuffer(xs)
+		l.SetGlobal("a")
+		l.PushBuffer(make([]int32, 100))
+		l.SetGlobal("iout")
+	}
+	for _, body := range []string{
+		"iout[i] = max(0, min(255, floor(a[i])))",
+		"local k = floor(a[i]); iout[i] = min(255, k)",
+		"local k = floor(a[i]); if k < 0 then k = 0 elseif k > 255 then k = 255 end; iout[i] = k",
+		"local x = floor(a[i]) // 7; s = s + min(x, 100)",
+	} {
+		t.Run(body, func(t *testing.T) {
+			runtime.GC()
+			defer debug.SetGCPercent(debug.SetGCPercent(-1)) // kernels run while the barrier is off
+			jit, interp, lj := runBothWith(t, `
+				local floor, min, max, a, iout = math.floor, math.min, math.max, a, iout
+				function run()
+				  local s = 0
+				  local ok, e = pcall(function() for i = 0, 99 do `+body+` end end)
+				  s = 0 -- perhaps a float now
+				  for i = 10, 99 do `+body+` end
+				  return s, iout[0], iout[10], iout[50], iout[99], ok, e
+				end`, setup)
+			if jit != interp {
+				t.Fatalf("JIT %q, interpreter %q", jit, interp)
+			}
+			if lj.jitCtx.kernels[1] == 0 {
+				t.Fatal("no kernel ran")
 			}
 		})
 	}

@@ -217,6 +217,9 @@ func (c *arm64Compiler) kernelSideExit(k *kernel, ip int) Label {
 			c.load(operand{rAddr, 0})
 			c.store(reg(kc.a))
 		}
+		if kc, ok := k.calls[ip]; ok && c.p.Code[ip].B() == 0 { // its arguments run to l.top
+			c.setTop(kc.a + 1 + kc.args)
+		}
 		a.B(c.pcs[ip])
 	})
 	return l
@@ -260,16 +263,11 @@ func (c *arm64Compiler) kernelCall(k *kernel, ip int, i bytecode.Instruction) {
 		a.Fmov(0, k.reg(arg))
 	}
 	save()
-	side := a.NewLabel()
+	side, exit := a.NewLabel(), c.kernelSideExit(k, ip)
 	c.outOfLine = append(c.outOfLine, func() {
 		a.Bind(side)
 		restore()
-		c.flush(k, k.at[ip-k.start])
-		// The ordinary CALL finds the function in register A again.
-		c.upValueAddr(kc.upValue)
-		c.load(operand{rAddr, 0})
-		c.store(reg(i.A()))
-		a.B(c.pcs[ip])
+		a.B(exit)
 	})
 	c.kernelExit = side
 	for _, in := range intrinsics {

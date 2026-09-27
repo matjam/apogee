@@ -456,8 +456,8 @@ nothing compiles.
   number constants, arithmetic (`%` and `//` by a nonzero integer
   constant), number comparisons, and the intrinsic calls and buffer
   accesses below keeps every Lua register it uses in a machine register
-  for the whole loop (`emitKernel`): integers in
-  general-purpose registers, floats in FP registers. A loop gets an
+  (`emitKernel`): integers in general-purpose registers, floats in FP
+  registers. A loop gets an
   integer and a float kernel where both type; each checks its live-in
   types on entry and falls through to the next, then to ordinary code,
   which comes back to the check every iteration, so a kernel whose check
@@ -466,15 +466,23 @@ nothing compiles.
   - **Types per pc.** `planKernel` types each register before each body
     pc (`at`), because Lua reuses a temporary for an integer and then a
     float; a register gets a machine register for each type it takes
-    (`slots`). A live-in register the body writes starts with the type it
+    (`slots`, `allocate`). The loop's registers, live-in ones and locals
+    below the loop keep theirs throughout; the body's temporaries share by
+    liveness, so a result may take the register of an operand it reads
+    last, which every kernel emitter must allow by reading its operands
+    before writing its result. amd64 has 7 integer registers, and the
+    loop takes 4 of them. A live-in register the body writes starts with the type it
     ends with; one nothing decides takes `guess`'s type, a float only
     when it meets floats more than integers (a time parameter), since a
     wrong guess costs the kernel.
-  - **Intrinsic calls.** `GETUPVAL f; …arithmetic and buffer reads…;
-    CALL f 2 2` (a side exit in between stores `f` first, `calleesAt`), where
-    the closure being compiled holds `math.sqrt`, `sin` or `cos` in that
-    upvalue, compiles inline; the entry check confirms the upvalue still
-    holds it. The kernel saves the integer registers trig uses around it
+  - **Intrinsic calls.** `GETUPVAL f; …arithmetic, buffer reads and
+    other intrinsic calls…; CALL f B C` (a side exit in between stores `f`
+    first, `calleesAt`), where the closure being compiled holds
+    `math.sqrt`, `sin`, `cos`, `floor`, `ceil`, `abs`, `min` or `max` in
+    that upvalue, compiles inline; the entry check confirms the upvalue
+    still holds it. A nested call, `min(255, floor(x))`, is `CALL … C 0`
+    then `CALL … B 0`: an intrinsic has one result, so `kernelCall.args`
+    fixes the count, and a side exit at a `B 0` call sets `l.top`. The kernel saves the integer registers trig uses around it
     (`intrinsicSaved`, spilled to `jitContext.spill`).
   - **Buffers.** `GETTABLE`/`SETTABLE` on a register the body never
     writes, with an integer key, reads or writes a buffer's element; the

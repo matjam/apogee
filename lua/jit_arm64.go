@@ -862,14 +862,19 @@ func (c *arm64Compiler) instruction(ip int) int {
 		a.Str(rBool, dst.base, dst.off+offP)
 	case bytecode.OpJump:
 		if orig.A() != 0 {
-			c.exitAlways(ip)
+			c.closeJump(ip, orig)
 			break
 		}
-		if target := ip + 1 + orig.SBx(); target <= ip {
-			c.backEdge(target)
-		} else {
-			a.B(c.pcs[target])
-		}
+		c.jumpTo(ip, ip+1+orig.SBx())
+	case bytecode.OpTForCall:
+		c.tforCall(ip, orig)
+	case bytecode.OpTForLoop: // after TFORCALL: on while the control variable is not nil
+		r := reg(orig.A() + 3)
+		done := a.NewLabel()
+		a.Ldr(rTmp, r.base, r.off+offP)
+		a.Cbz(rTmp, done)
+		c.backEdge(ip + 1 + orig.SBx())
+		a.Bind(done)
 	case bytecode.OpEqual:
 		c.equal(ip, orig)
 	case bytecode.OpLessThan, bytecode.OpLessOrEqual:

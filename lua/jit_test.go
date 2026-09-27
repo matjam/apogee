@@ -1138,6 +1138,63 @@ func TestJITMixedMinMax(t *testing.T) {
 	}
 }
 
+// Generic for loops with ipairs, pairs and next over array parts run in
+// compiled code, calls of ipairs and pairs included; tables with other
+// keys, __index or __pairs, and loops whose variables a closure captures,
+// exit where they must, and agree.
+func TestJITGenericFor(t *testing.T) {
+	skipWithoutJIT(t)
+	exits := map[string]int{}
+	jitExitHook = func(p *prototype, ip int, reason uint64) {
+		if p.LineDefined == 2 {
+			exits[exitKind(p, ip, reason)]++
+		}
+	}
+	defer func() { jitExitHook = nil }()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBoth(t, `local ipairs, pairs, next = ipairs, pairs, next
+		local function arrays(t, u) -- line 2: no exits
+		  local s = 0
+		  for r = 1, 50 do
+		    for i, v in ipairs(t) do s = s + i * v end
+		    for k, v in pairs(t) do s = s + k - v end
+		    for k in pairs(u) do s = s + k end -- holes
+		    for k, v in next, t do s = s + v end
+		    for i, v, extra in ipairs(t) do s = s + (extra or 1) end
+		    for i in ipairs(u) do s = s + i end -- stops at the first hole
+		    local f, st, c = ipairs(t)
+		    local g, st2, c2, cl = pairs(t)
+		    s = s + c + (c2 or 7) + (cl or 9) + (f == ipairs(u) and 1 or 0) + (g == next and 1 or 0)
+		  end
+		  return s
+		end
+		local function others(mixed, meta, custom, fs)
+		  local out = {}
+		  for k, v in pairs(mixed) do out[#out + 1] = tostring(k) .. "=" .. tostring(v) end
+		  for i, v in ipairs(meta) do out[#out + 1] = i .. ":" .. v end
+		  for k, v in pairs(custom) do out[#out + 1] = k .. "~" .. v end
+		  for i, v in ipairs(fs) do fs[i] = function() return i + v end end -- captures: Go closes
+		  for i = 1, #fs do out[#out + 1] = fs[i]() end
+		  for k, v in pairs({1, 2, 3}) do if k == 2 then break end out[#out + 1] = v end
+		  out[#out + 1] = select("#", ipairs(meta)) .. select("#", pairs(mixed))
+		  return table.concat(out, " ")
+		end
+		function run()
+		  local t, u = {1, 2.5, 3, 4}, {1, 2, nil, 4, nil, nil, 7}
+		  local mixed = {10, 20, 30, x = 1, [100] = 5}
+		  local meta = setmetatable({1, 2}, {__index = function(_, k) if k < 5 then return k * 10 end end})
+		  local custom = setmetatable({}, {__pairs = function(t) return function(_, k) if not k then return "a", 1 end end, t, nil end})
+		  return arrays(t, u), others(mixed, meta, custom, {5, 6, 7})
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q\ninterpreter %q", jit, interp)
+	}
+	if len(exits) != 0 {
+		t.Fatalf("exits: %v", exits)
+	}
+}
+
 // % of floats by any divisor runs in compiled code, bit for bit as
 // math.Mod and Lua's correction give it, NaN included; random normal
 // floats never exit, and edge cases, subnormal divisors left to Go,

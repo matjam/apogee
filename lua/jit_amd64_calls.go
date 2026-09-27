@@ -202,6 +202,34 @@ func (c *amd64Compiler) exitIfUpValuesOpen(ip int) {
 	a.Bind(none)
 }
 
+// closeJump compiles JMP A sBx with A > 0, which closes upvalues and
+// to-be-closed variables from register A-1 up, as a generic for's exit
+// does: it jumps when nothing there is open, and exits for Go to close
+// what is.
+func (c *amd64Compiler) closeJump(ip int, i bytecode.Instruction) {
+	a := &c.a
+	exit := c.exit(ip)
+	level := reg(i.A() - 1)
+	a.Mov(rTmp2, level.base)
+	a.AddImm(rTmp2, int32(level.off)) // its address
+	a.Load(rTmp, rCtx, offCtxTBC)
+	a.Cmp(rTmp, rTmp2)
+	a.J(AE, exit) // a to-be-closed variable at or above it
+	none := a.NewLabel()
+	a.Load(rTmp, rCtx, offCtxS)
+	a.Load(rAddr, rTmp, offLUpValues)
+	a.Test(rAddr, rAddr)
+	a.J(E, none)
+	a.Load(rAddr, rAddr, offUVIndex) // the highest open upvalue's index
+	a.Load(rTmp, rTmp, offStack)
+	a.Sub(rTmp2, rTmp)
+	a.Shr(rTmp2, 4) // its index
+	a.Cmp(rAddr, rTmp2)
+	a.J(GE, exit)
+	a.Bind(none)
+	c.jumpTo(ip, ip+1+i.SBx())
+}
+
 // tailCallLua compiles the TAILCALL i at ip for a compiled, fixed-parameter
 // Lua closure as the interpreter's TAILCALL replaces the frame: the callee
 // and its arguments move down to the frame's function slot, and the frame,

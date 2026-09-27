@@ -371,8 +371,8 @@ nothing compiles.
   - Other exits at CALL and at RETURN are run by the driver, as are
     CLOSURE, NEWTABLE, LEN of a table with a hash part or `__len`,
     generic table access, SETLIST into a short
-    array and upvalue-closing JMPs (`jitStep`). Compiled code then carries
-    on after the instruction.
+    array and upvalue-closing JMPs with something to close (`jitStep`).
+    Compiled code then carries on after the instruction.
   - `runJIT` reloads the closure and prototype only when `l.callInfo`
     changes. The chain of loads from a callInfo to its prototype is most
     of a crossing's cost otherwise.
@@ -453,6 +453,13 @@ nothing compiles.
     the rest, math_functions.go), stdlib registers them, and compiled
     code tells them by their code pointer (jit_math.go) in `goCallee`'s
     path for Go functions, where Lua-to-Lua calls never go.
+  - **Generic for** the same way: `pairs`, `ipairs`, `next` and ipairs'
+    iterator are `BasePairs` and the rest (base_functions.go). A call of
+    `pairs` or `ipairs` stores its results inline (`pairsCall`), and
+    TFORCALL steps through an array part itself (`tforCall`), exiting
+    where string keys or a hash part follow, or for `__index`. The JMP
+    that closes the loop jumps when nothing at or above it is open
+    (`closeJump`).
 - **Kernels:** an innermost numeric for loop whose body is only moves,
   number constants, arithmetic (`%` and `//` by a nonzero integer
   constant), number comparisons, and the intrinsic calls and buffer
@@ -634,7 +641,8 @@ The gap is architectural:
   - CONCAT, and LEN of a table with a hash part or `__len`;
   - GETTABLE and SETTABLE with keys other than constant strings and
     array indices;
-  - the generic for's TFORCALL.
+  - the generic for's TFORCALL, except `ipairs` and `pairs` over an
+    array part.
 
 Closing most of the speed gap means a tracing or register-allocating
 JIT: a project, not tuning. The cheaper steps are in Next below (exits,
@@ -815,10 +823,9 @@ In order of expected payoff for real-time scripts such as visualisers:
    `call`, `preCall`, `pushLuaFrame` and `enterJIT`.
 5. **Closures and GC.** Shrink `luaClosure`, or create closures in
    compiled code from a pre-allocated pool.
-6. **More native instructions:** TFORCALL/TFORLOOP with fast paths for
-   `ipairs` and `pairs` over array parts; CONCAT into a reusable buffer;
-   vararg; GETTABLE and SETTABLE with string keys in
-   registers.
+6. **More native instructions:** `pairs` over string keys (slots);
+   CONCAT into a reusable buffer; vararg; GETTABLE and SETTABLE with
+   string keys in registers.
 
 7. **The barrier and budget in registers on amd64**, where they live in
    the context: unmeasured.

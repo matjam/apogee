@@ -581,8 +581,180 @@ func (c *arm64Compiler) goCallee(ip int, i bytecode.Instruction) {
 	a.Bind(closure)
 	a.Ldr(rT, fn.base, fn.off+offP)
 	c.branchNumber(rT, notGo) // a number whose bits match the tag
+	c.pairsCall(ip, i)
 	a.B(c.goCallExit(ip))
 	a.Bind(notGo)
+}
+
+// pairsCall computes the CALL i at ip inline when its callee, the Go
+// closure in rT, is ipairs or pairs of one argument: the closure's
+// iterator, the argument, and 0 or nil, which a generic for takes. pairs
+// takes only a table without a metatable, which could hold __pairs; it
+// calls Go for anything else. Other closures fall through.
+func (c *arm64Compiler) pairsCall(ip int, i bytecode.Instruction) {
+	if i.B() != 2 {
+		return
+	}
+	a := &c.a
+	goCall := c.goCallExit(ip)
+	other, ipairs := a.NewLabel(), a.NewLabel()
+	a.Ldr(rTmp, rT, 0) // the Function's code
+	a.MovImm(rTmp2, callIPairs)
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(EQ, ipairs)
+	a.MovImm(rTmp2, callPairs)
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(NE, other)
+	arg := reg(i.A() + 1)
+	a.Ldr(rTmp, arg.base, arg.off+offN)
+	a.Lsr(rTmp, rTmp, kindShift)
+	a.CmpImm(rTmp, uint32(vkTable))
+	a.BCond(NE, goCall)
+	a.Ldr(rTmp, arg.base, arg.off+offP)
+	c.branchNumber(rTmp, goCall)
+	a.Ldr(rTmp, rTmp, offTMeta)
+	a.Cbnz(rTmp, goCall)
+	c.pairsResults(ip, i, false)
+	a.Bind(ipairs)
+	c.pairsResults(ip, i, true)
+	a.Bind(other)
+}
+
+// pairsResults stores ipairs' results, or pairs', for the CALL i at ip of
+// the closure in rT: its iterator over the callee, the argument where it
+// is, and then 0 for ipairs, and nil, as many as the call wants; then it
+// goes on at ip+1.
+func (c *arm64Compiler) pairsResults(ip int, i bytecode.Instruction, ipairs bool) {
+	a := &c.a
+	a.Cbnz(rBarrier, c.goCallExit(ip)) // it stores the iterator over the closure
+	a.Ldr(rTmp, rT, offGCUpVals)
+	c.load(operand{rTmp, 0})
+	c.store(reg(i.A()))
+	n := 4 // results
+	if ipairs {
+		n = 3
+	}
+	last := i.A() + i.C() - 1 // the register after those wanted
+	if i.C() == 0 {
+		last = i.A() + n
+	}
+	from := i.A() + 2 // nil from here
+	if ipairs && last > from {
+		c.storeInteger(reg(from), ZR)
+		from++
+	}
+	for r := from; r < last; r++ {
+		a.Str(ZR, rFrame, reg(r).off+offP)
+		a.Str(ZR, rFrame, reg(r).off+offN)
+	}
+	if i.C() == 0 {
+		c.setTop(last)
+	}
+	a.B(c.pcs[ip+1])
+}
+
+// tforCall compiles TFORCALL A C, a generic for's call of its iterator.
+// For next, and for ipairs' iterator on a table whose metatable lacks
+// __index, it steps through the table's array part itself: the index
+// after the control variable and its value, or nil at the end when no
+// other keys follow. Anything else exits, for Go to call the iterator.
+func (c *arm64Compiler) tforCall(ip int, i bytecode.Instruction) {
+	a := &c.a
+	exit := c.exit(ip)
+	fn, state, ctl := reg(i.A()), reg(i.A()+1), reg(i.A()+3)
+	a.Cbnz(rBarrier, exit) // it stores values
+	a.Ldr(rTmp, fn.base, fn.off+offN)
+	a.MovImm(rTmp2, tagOf(vkGoFunction))
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(NE, exit)
+	a.Ldr(rTmp, fn.base, fn.off+offP)
+	c.branchNumber(rTmp, exit) // a number whose bits match the tag
+	a.Ldr(rIdx, rTmp, 0)       // the Function's code
+	// The state: a table, in rT, with its array's length in rN.
+	a.Ldr(rTmp, state.base, state.off+offN)
+	a.Lsr(rTmp, rTmp, kindShift)
+	a.CmpImm(rTmp, uint32(vkTable))
+	a.BCond(NE, exit)
+	a.Ldr(rT, state.base, state.off+offP)
+	c.branchNumber(rT, exit)
+	a.Ldr(rN, rT, offTArray+offSliceLen)
+	a.Ldr(rTmp, ctl.base, ctl.off+offP) // the control variable's first word
+	ipairs, found, end, done := a.NewLabel(), a.NewLabel(), a.NewLabel(), a.NewLabel()
+	a.MovImm(rTmp2, iterIPairs)
+	a.Cmp(rIdx, rTmp2)
+	a.BCond(EQ, ipairs)
+	a.MovImm(rTmp2, iterNext)
+	a.Cmp(rIdx, rTmp2)
+	a.BCond(NE, exit)
+	// next: the first non-nil element from the start, for a nil key, or
+	// after an index in the array part.
+	from, loop, rest := a.NewLabel(), a.NewLabel(), a.NewLabel()
+	a.MovImm(rIdx, 0)
+	a.Cbz(rTmp, from)
+	a.Cmp(rTmp, rInteger)
+	a.BCond(NE, exit)
+	a.Ldr(rIdx, ctl.base, ctl.off+offN)
+	a.SubImm(rTmp2, rIdx, 1)
+	a.Cmp(rTmp2, rN)
+	a.BCond(HS, exit) // not in the array part
+	a.Bind(from)      // rIdx: where to look from, 0-based
+	a.Ldr(rP, rT, offTArray)
+	a.Bind(loop)
+	a.Cmp(rIdx, rN)
+	a.BCond(HS, rest)
+	a.AddShifted(rAddr, rP, rIdx, 4)
+	a.Ldr(rTmp, rAddr, offP)
+	a.Cbnz(rTmp, found)
+	a.AddImm(rIdx, rIdx, 1)
+	a.B(loop)
+	a.Bind(rest) // string keys or a hash part may follow, which Go finds
+	a.Ldr(rTmp, rT, offTShape)
+	a.Cbnz(rTmp, exit)
+	a.Ldr(rTmp, rT, offTHash)
+	a.Cbnz(rTmp, exit)
+	a.B(end)
+	// ipairs' iterator: the element after the integer control variable,
+	// until one is nil.
+	a.Bind(ipairs)
+	noMeta, inArray := a.NewLabel(), a.NewLabel()
+	a.Ldr(rTmp2, rT, offTMeta)
+	a.Cbz(rTmp2, noMeta)
+	a.Ldrb(rAddr, rTmp2, offTFlags)
+	a.Tbz(rAddr, uint32(tmIndex), exit) // the metatable may have __index
+	a.Bind(noMeta)
+	a.Cmp(rTmp, rInteger)
+	a.BCond(NE, exit)
+	a.Ldr(rIdx, ctl.base, ctl.off+offN) // the next index, 0-based
+	a.Cmp(rIdx, rN)
+	a.BCond(LO, inArray)
+	a.Tbnz(rIdx, 63, exit) // an index below 1, which Go looks for in the hash part
+	a.Ldr(rTmp, rT, offTHash)
+	a.Cbnz(rTmp, exit)
+	a.B(end)
+	a.Bind(inArray)
+	a.Ldr(rAddr, rT, offTArray)
+	a.AddShifted(rAddr, rAddr, rIdx, 4)
+	a.Ldr(rTmp, rAddr, offP)
+	a.Cbz(rTmp, end)
+	// The element at rAddr, index rIdx, 0-based: its key and value.
+	a.Bind(found)
+	c.load(operand{rAddr, 0})
+	a.AddImm(rIdx, rIdx, 1)
+	c.storeInteger(ctl, rIdx)
+	if i.C() >= 2 {
+		c.store(reg(i.A() + 4))
+	}
+	for r := i.A() + 5; r < i.A()+3+i.C(); r++ {
+		a.Str(ZR, rFrame, reg(r).off+offP)
+		a.Str(ZR, rFrame, reg(r).off+offN)
+	}
+	a.B(done)
+	a.Bind(end)
+	for r := i.A() + 3; r < i.A()+3+i.C(); r++ {
+		a.Str(ZR, rFrame, reg(r).off+offP)
+		a.Str(ZR, rFrame, reg(r).off+offN)
+	}
+	a.Bind(done)
 }
 
 // plainGoCall returns the label in goCallee's code for the CALL at ip

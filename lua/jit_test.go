@@ -1138,6 +1138,59 @@ func TestJITMixedMinMax(t *testing.T) {
 	}
 }
 
+// % of floats by any divisor runs in compiled code, bit for bit as
+// math.Mod and Lua's correction give it, NaN included; random normal
+// floats never exit, and edge cases, subnormal divisors left to Go,
+// agree.
+func TestJITFloatMod(t *testing.T) {
+	skipWithoutJIT(t)
+	exits := 0
+	jitExitHook = func(p *prototype, ip int, reason uint64) {
+		if p.LineDefined == 2 && exitKind(p, ip, reason) == "MOD" {
+			exits++
+		}
+	}
+	defer func() { jitExitHook = nil }()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBoth(t, `
+		local function normals(xs, out) -- line 2: no exits
+		  for i = 1, #xs do
+		    local x = xs[i]
+		    for j = 1, #xs do out[#out + 1] = x % xs[j] end
+		  end
+		end
+		local function all(xs, out)
+		  for i = 1, #xs do
+		    local x = xs[i]
+		    for j = 1, #xs do out[#out + 1] = x % xs[j] end
+		  end
+		end
+		local edge = {0.0, -0.0, 1.0, -1.0, 2.5, -2.5, 0.1, 3, -7, 1e308, -1e308, 2^-1074, -2^-1074, 2^-1022,
+		  1.7976931348623157e308, 5e-324 * 3, 1/0, -1/0, 0/0, 2^53, 2^53 + 2, 1/3, math.pi, 2^-1060}
+		math.randomseed(7)
+		local normal = {}
+		for k = 1, 150 do
+		  local v = string.unpack("<d", string.pack("<i8", math.random(math.mininteger, math.maxinteger)))
+		  if v == v and v - v == 0 and (v > 2^-1022 or v < -2^-1022) then normal[#normal + 1] = v end
+		end
+		function run()
+		  local out, edges = {}, {}
+		  normals(normal, out)
+		  all(edge, edges)
+		  local s = {} -- bits: Go's NaN is math.NaN()'s
+		  for i = 1, #out do s[#s + 1] = string.format("%x", string.unpack("<i8", string.pack("<d", out[i]))) end
+		  for i = 1, #edges do s[#s + 1] = string.format("%x", string.unpack("<i8", string.pack("<d", edges[i]))) end
+		  return #out, table.concat(s, " ")
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q\ninterpreter %q", jit, interp)
+	}
+	if exits != 0 {
+		t.Fatalf("MOD of normal floats exited %d times", exits)
+	}
+}
+
 // # of strings, buffers and tables without __len runs in compiled code:
 // a table's array length, or a border by binary search when its last
 // element is nil. A hash part, __len or other userdata exit, and agree.

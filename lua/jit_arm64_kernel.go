@@ -662,7 +662,7 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 				a.Fmov(0, b)
 			}
 			d, _ := floatModDivisor(p.Constants[bytecode.ConstantIndex(i.C())])
-			c.floatMod(d, c.kernelSideExit(k, ip))
+			c.floatMod(d)
 			a.Fmov(k.reg(i.A()), 3)
 			break
 		}

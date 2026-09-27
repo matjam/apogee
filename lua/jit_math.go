@@ -62,3 +62,15 @@ func mathFnOf(cl *luaClosure, n int) (mathFn, uint64) {
 	}
 	return mathNone, 0
 }
+
+// iterNext and iterIPairs are BaseNext's and BaseIPairsIterator's first
+// words: the generic for iterators whose steps through a table's array
+// part compiled code takes itself (tforCall). callPairs and callIPairs are
+// BasePairs's and BaseIPairs's, which compiled code runs (pairsCall).
+// init sets them, as mathFns.
+var iterNext, iterIPairs, callPairs, callIPairs uint64
+
+func init() {
+	iterNext, iterIPairs = functionValue(BaseNext), functionValue(BaseIPairsIterator)
+	callPairs, callIPairs = functionValue(BasePairs), functionValue(BaseIPairs)
+}

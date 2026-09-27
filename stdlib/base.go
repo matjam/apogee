@@ -8,44 +8,6 @@ import (
 	"github.com/matjam/apogee/lua"
 )
 
-func baseNext(l *lua.State) int {
-	l.CheckType(1, lua.TypeTable)
-	l.SetTop(2)
-	if l.Next(1) {
-		return 2
-	}
-	l.PushNil()
-	return 1
-}
-
-// pairs is a Go closure whose upvalue is next, which it returns, so it
-// returns the same function each time, unless __pairs says otherwise.
-func pairs(l *lua.State) int {
-	l.CheckAny(1)
-	if l.MetaField(1, "__pairs") != lua.TypeNil {
-		l.PushValue(1) // argument 'self' to metamethod
-		// 4 values, the last a closing value, as Lua 5.5; the metamethod
-		// may yield.
-		l.CallWithContinuation(1, 4, 0, func(*lua.State) int { return 4 })
-		return 4
-	}
-	l.PushValue(lua.UpValueIndex(1))
-	l.PushValue(1)
-	l.PushNil()
-	l.PushNil() // no closing value
-	return 4
-}
-
-// ipairs returns its iterator, an upvalue so that it is the same function
-// each time, which indexes the value with metamethods, as Lua 5.4's does.
-func ipairs(l *lua.State) int {
-	l.CheckAny(1)
-	l.PushValue(lua.UpValueIndex(1))
-	l.PushValue(1)
-	l.PushInteger(0)
-	return 3
-}
-
 var gcOptions = []string{"stop", "restart", "collect", "count", "step", "isrunning", "generational", "incremental", "param"}
 
 // gcOptionValues are the GC options for gcOptions, in order.
@@ -101,19 +63,6 @@ func baseError(l *lua.State) int {
 	}
 	l.Error()
 	panic("unreachable")
-}
-
-// intPairs is ipairs' iterator: the next index, and the value there,
-// through __index, until that is nil.
-func intPairs(l *lua.State) int {
-	i := l.CheckInteger(2) + 1
-	l.PushInteger(i)
-	l.PushInteger(i)
-	l.Table(1)
-	if l.IsNil(-1) {
-		return 1
-	}
-	return 2
 }
 
 func finishProtectedCall(l *lua.State, status bool) int {
@@ -253,7 +202,7 @@ var baseLibrary = []lua.RegistryFunction{
 		}
 		return loadHelper(l, err, e)
 	}},
-	{Name: "next", Function: baseNext},
+	{Name: "next", Function: lua.BaseNext}, // which compiled code recognises, as ipairs' iterator
 	{Name: "pcall", Function: func(l *lua.State) int {
 		l.CheckAny(1)
 		l.PushNil()
@@ -388,10 +337,10 @@ func OpenBase(l *lua.State) int {
 	l.SetFunctions(baseLibrary, 0)
 	// pairs returns next, and ipairs one iterator, as C Lua's do.
 	l.Field(-1, "next")
-	l.PushGoClosure(pairs, 1)
+	l.PushGoClosure(lua.BasePairs, 1)
 	l.SetField(-2, "pairs")
-	l.PushGoFunction(intPairs)
-	l.PushGoClosure(ipairs, 1)
+	l.PushGoFunction(lua.BaseIPairsIterator)
+	l.PushGoClosure(lua.BaseIPairs, 1)
 	l.SetField(-2, "ipairs")
 	l.PushString(lua.VersionString)
 	l.SetField(-2, "_VERSION")

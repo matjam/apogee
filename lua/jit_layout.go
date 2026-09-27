@@ -48,6 +48,7 @@ const (
 	offLvMtSlot  = uint32(unsafe.Offsetof(chainLevel{}.mtSlot))
 	offLvIndex   = uint32(unsafe.Offsetof(chainLevel{}.index))
 	offGFNumber  = uint32(unsafe.Offsetof(goFunction{}.number))
+	offGCUpVals  = uint32(unsafe.Offsetof(goClosure{}.upValues))
 	offNFUnary   = uint32(unsafe.Offsetof(numberFunction{}.unary))
 	offSliceLen  = 8
 	offCtxS      = uint32(unsafe.Offsetof(jitContext{}.state))

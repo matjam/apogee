@@ -921,10 +921,20 @@ func (c *amd64Compiler) instruction(ip int) int {
 		a.Bind(done)
 	case bytecode.OpJump:
 		if orig.A() != 0 {
-			c.exitAlways(ip)
+			c.closeJump(ip, orig)
 			break
 		}
 		c.jumpTo(ip, ip+1+orig.SBx())
+	case bytecode.OpTForCall:
+		c.tforCall(ip, orig)
+	case bytecode.OpTForLoop: // after TFORCALL: on while the control variable is not nil
+		r := reg(orig.A() + 3)
+		done := a.NewLabel()
+		a.Load(rTmp, r.base, r.off+offP)
+		a.Test(rTmp, rTmp)
+		a.J(E, done)
+		c.backEdge(ip + 1 + orig.SBx())
+		a.Bind(done)
 	case bytecode.OpEqual:
 		c.equal(ip, orig)
 	case bytecode.OpLessThan, bytecode.OpLessOrEqual:

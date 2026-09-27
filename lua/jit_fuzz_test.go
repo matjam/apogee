@@ -64,9 +64,10 @@ func TestJITFuzz(t *testing.T) {
 
 // jitMustNotExit lists the exits, by the start of exitKind's description,
 // no fuzz program may take on every iteration: Lua calls and returns of
-// any number of values, # of a table, == and % of numbers, and the math
-// functions compiled code runs, which are the only Go functions called.
-var jitMustNotExit = []string{"CALL B=", "RETURN B=", "LEN", "EQ", "MOD", "CALL (Go function)"}
+// any number of values, # of a table, == and % of numbers, the math
+// functions, ipairs and pairs, which are the only Go functions called, and
+// generic for loops over their arrays, including the JMP that closes one.
+var jitMustNotExit = []string{"CALL B=", "RETURN B=", "LEN", "EQ", "MOD", "CALL (Go function)", "TFORCALL", "JMP"}
 
 // exitKind describes an exit for the report: the instruction's name and
 // what distinguishes its exits.
@@ -157,6 +158,9 @@ obj = {x = 1.5, y = 2}
 local f64, i32, tab, obj = f64, i32, tab, obj
 local function g(a) return a * 2 end
 local function h(a, b) return a + b, a - b end
+local small = {1, 2.5, 3}
+local function sum(t) local s = 0 for _, v in ipairs(t) do s = s + v end return s end
+local function psum(t) local s = 0 for _, v in pairs(t) do s = s + v end return s end
 local scale = 0.75
 function run(n)
   local i1, i2, f1, f2 = 3, -7, 0.25, -1.5
@@ -188,6 +192,13 @@ func (g *fuzzGen) stmt(depth int) string {
 		v := g.pick("f1", "f2")
 		return fmt.Sprintf("if %s %s %s then %s = %s else %s end", v, g.pick("<", ">", "<=", "=="), g.pick("1", "1.5", "0", "i"),
 			v, g.pick("1", "1.0", "0", "-2.5", "i"), g.stmt(depth+1))
+	case n == 9 && g.r.IntN(2) == 0:
+		return g.pick(
+			"f2 = f2 + sum(small)",
+			"f2 = f2 + psum(small)",
+			"small[i % 3 + 1] = nil; small[i % 3 + 1] = "+g.floatExpr(1),
+			"tab[i % 64 + 1] = nil; tab[i % 64 + 1] = "+g.floatExpr(1),
+		)
 	default:
 		return g.pick("tab[i % 64 + 1] = "+g.floatExpr(1), "obj.y = "+g.intExpr(1), "obj.x = "+g.floatExpr(1))
 	}

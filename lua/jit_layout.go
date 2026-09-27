@@ -63,6 +63,7 @@ const (
 	offPParams   = uint32(unsafe.Offsetof(prototype{}.ParameterCount))
 	offPMaxStack = uint32(unsafe.Offsetof(prototype{}.MaxStackSize))
 	offPVarArg   = uint32(unsafe.Offsetof(prototype{}.IsVarArg))
+	offPVarKind  = uint32(unsafe.Offsetof(prototype{}.VarArgKind))
 	offPJit      = uint32(unsafe.Offsetof(prototype{}.jit))
 	offJCEntry   = uint32(unsafe.Offsetof(jitCode{}.entry))
 	offJCBase    = uint32(unsafe.Offsetof(jitCode{}.base))

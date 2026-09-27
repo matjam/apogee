@@ -930,6 +930,8 @@ func (c *amd64Compiler) instruction(ip int) int {
 		c.jumpTo(ip, ip+1+orig.SBx())
 	case bytecode.OpTForCall:
 		c.tforCall(ip, orig)
+	case bytecode.OpVarArg:
+		c.varArg(ip, orig)
 	case bytecode.OpTForLoop: // after TFORCALL: on while the control variable is not nil
 		r := reg(orig.A() + 3)
 		done := a.NewLabel()

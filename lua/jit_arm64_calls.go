@@ -37,8 +37,9 @@ func (c *arm64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	c.branchNumber(rT, exit) // a number whose bits match the tag
 	a.Cbnz(rBarrier, exit)
 	a.Ldr(rT2, rT, offClProto)
-	a.Ldrb(rTmp, rT2, offPVarArg)
-	a.Cbnz(rTmp, exit)
+	a.Ldrb(rTmp, rT2, offPVarKind)
+	a.CmpImm(rTmp, uint32(bytecode.VarArgTable))
+	a.BCond(EQ, exit) // Go makes the table
 	a.Ldr(rCache, rT2, offPJit)
 	a.Cbz(rCache, exit)
 	a.Ldr(rState, rCtx, offCtxS)
@@ -52,11 +53,14 @@ func (c *arm64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	} else {
 		a.AddImm(rSlot, rIdx, uint32(b))
 	}
-	// checkStack(p.maxStackSize) would grow the stack.
+	// checkStack(p.maxStackSize) would grow the stack, as would a vararg
+	// function's, which adds the parameters: this checks both.
 	a.Ldr(rLen, rT2, offPMaxStack)
 	a.Ldr(rNext, rState, offLStackLast)
 	a.Sub(rNext, rNext, rSlot)
-	a.Cmp(rNext, rLen)
+	a.Ldr(rTmp, rT2, offPParams)
+	a.Add(rTmp, rTmp, rLen)
+	a.Cmp(rNext, rTmp)
 	a.BCond(LE, exit)
 	// pushLuaFrame reuses l.callInfo.next, which must have Lua storage.
 	a.Ldr(rCI, rState, offLCallInfo)
@@ -99,7 +103,16 @@ func (c *arm64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	}
 	a.Str(rT, rP, offLClosure)
 	a.Str(rIdx, rNext, offCIFunction)
-	a.AddImm(rSlot, rIdx, 1)           // base
+	varArgs, based := a.NewLabel(), a.NewLabel()
+	a.Ldrb(rTmp, rT2, offPVarArg)
+	a.Cbnz(rTmp, varArgs)
+	a.AddImm(rSlot, rIdx, 1) // base
+	a.Bind(based)
+	c.outOfLine = append(c.outOfLine, func() {
+		a.Bind(varArgs)
+		c.adjustVarArgs()
+		a.B(based)
+	})
 	a.AddShifted(rLen, rSlot, rLen, 0) // top = base + maxStackSize
 	a.Str(rLen, rNext, offCITop)
 	a.MovImm(rTmp2, uint64(int64(results)))
@@ -151,6 +164,119 @@ func (c *arm64Compiler) exitIfUpValuesOpen(ip int) {
 	a.Cmp(rTmp, rTmp2)
 	a.BCond(GT, c.exit(ip)) // index >= base, which is function + 1
 	a.Bind(none)
+}
+
+// adjustVarArgs moves a vararg callee's frame above its arguments, as
+// adjustVarArgs does. With the function's index in rIdx, the arguments'
+// end in rSlot, the prototype in rT2 and &stack[0] in rStack, it leaves the
+// base in rSlot, the fixed parameters moved there and nil where they were,
+// and the vararg marker after them: nil, or the view of a named vararg
+// table only indexed. It uses rTmp, rTmp2, rN and rCI.
+func (c *arm64Compiler) adjustVarArgs() {
+	a := &c.a
+	a.Ldr(rN, rT2, offPParams)
+	a.Add(rTmp, rIdx, rN)
+	a.AddImm(rTmp, rTmp, 1) // after the parameters, the missing ones cleared
+	a.Cmp(rSlot, rTmp)
+	a.Csel(rSlot, rSlot, rTmp, GE) // the base
+	a.AddImm(rTmp, rIdx, 1)
+	a.AddShifted(rTmp, rStack, rTmp, 4)   // the first parameter
+	a.AddShifted(rTmp2, rStack, rSlot, 4) // where it goes, past the last
+	loop, marker := a.NewLabel(), a.NewLabel()
+	a.Bind(loop)
+	a.Cbz(rN, marker)
+	a.Ldr(rCI, rTmp, offP)
+	a.Str(rCI, rTmp2, offP)
+	a.Ldr(rCI, rTmp, offN)
+	a.Str(rCI, rTmp2, offN)
+	a.Str(ZR, rTmp, offP)
+	a.Str(ZR, rTmp, offN)
+	a.AddImm(rTmp, rTmp, valueSize)
+	a.AddImm(rTmp2, rTmp2, valueSize)
+	a.SubImm(rN, rN, 1)
+	a.B(loop)
+	a.Bind(marker) // rTmp2: the register after the parameters
+	view, done := a.NewLabel(), a.NewLabel()
+	a.Str(ZR, rTmp2, offN)
+	a.Ldrb(rTmp, rT2, offPVarKind)
+	a.CmpImm(rTmp, uint32(bytecode.VarArgView))
+	a.BCond(EQ, view)
+	a.Str(ZR, rTmp2, offP)
+	a.B(done)
+	a.Bind(view)
+	a.MovImm(rTmp, uint64(uintptr(varArgView.p)))
+	a.Str(rTmp, rTmp2, offP)
+	a.Bind(done)
+}
+
+// varArg compiles VARARG A B of a function without a vararg table: B-1 of
+// its extra arguments, nil past the last, or for B 0 all of them, leaving
+// l.top after them. The extra arguments lie below the frame, after the
+// function and its fixed parameters' old places. It exits while the write
+// barrier is on, and when all of them would not fit the stack, for Go to
+// grow it.
+func (c *arm64Compiler) varArg(ip int, i bytecode.Instruction) {
+	a := &c.a
+	if c.p.VarArgKind == bytecode.VarArgTable {
+		c.exitAlways(ip)
+		return
+	}
+	exit := c.exit(ip)
+	a.Cbnz(rBarrier, exit)
+	a.Ldr(rT2, rCtx, offCtxS)    // the state
+	a.Ldr(rT, rT2, offLCallInfo) // the callInfo
+	a.Ldr(rTmp, rT2, offStack)
+	a.Sub(rIdx, rFrame, rTmp)
+	a.Lsr(rIdx, rIdx, 4) // the base
+	a.Ldr(rTmp, rT, offCIFunction)
+	a.Sub(rTmp2, rIdx, rTmp)
+	a.SubImm(rTmp2, rTmp2, uint32(c.p.ParameterCount+1)) // n, the extra arguments
+	a.AddShifted(rAddr, ZR, rTmp2, 4)
+	a.Sub(rAddr, rFrame, rAddr) // the first
+	ra, wanted := i.A(), i.B()-1
+	if wanted >= 0 {
+		for j := range wanted {
+			dst, none, next := reg(ra+j), a.NewLabel(), a.NewLabel()
+			a.CmpImm(rTmp2, uint32(j))
+			a.BCond(LE, none)
+			c.load(operand{rAddr, uint32(j) * valueSize})
+			c.store(dst)
+			a.B(next)
+			a.Bind(none)
+			a.Str(ZR, dst.base, dst.off+offP)
+			a.Str(ZR, dst.base, dst.off+offN)
+			a.Bind(next)
+		}
+		return
+	}
+	// All of them, the frame growing to hold them as varArgs grows it,
+	// within the stack; Go grows the stack.
+	fits := a.NewLabel()
+	a.AddImm(rP, rIdx, uint32(ra))
+	a.Add(rP, rP, rTmp2) // l.top after them
+	a.Ldr(rTmp, rT, offCITop)
+	a.Cmp(rP, rTmp)
+	a.BCond(LE, fits)
+	a.Ldr(rN, rT2, offLStackLast)
+	a.Cmp(rP, rN)
+	a.BCond(GE, exit)
+	a.Str(rP, rT, offCITop)
+	a.Ldr(rN, rT, offCILua)
+	a.Sub(rTmp, rP, rIdx)
+	a.Str(rTmp, rN, offLFrame+offSliceLen) // frame = l.stack[base:ci.top]
+	a.Bind(fits)
+	a.Str(rP, rT2, offLTop)
+	loop, done := a.NewLabel(), a.NewLabel()
+	a.AddImm(rT, rFrame, uint32(ra)*valueSize) // the destination
+	a.Bind(loop)
+	a.Cbz(rTmp2, done)
+	c.load(operand{rAddr, 0})
+	c.store(operand{rT, 0})
+	a.AddImm(rAddr, rAddr, valueSize)
+	a.AddImm(rT, rT, valueSize)
+	a.SubImm(rTmp2, rTmp2, 1)
+	a.B(loop)
+	a.Bind(done)
 }
 
 // closeJump compiles JMP A sBx with A > 0, which closes upvalues and

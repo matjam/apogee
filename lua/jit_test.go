@@ -1217,6 +1217,56 @@ func TestJITTailCallFromVarArgs(t *testing.T) {
 	}
 }
 
+// Calls of vararg functions, and VARARG in them, run in compiled code:
+// any number of extra arguments, missing fixed parameters, all of them
+// passed on or returned, and a named vararg table only indexed. One that
+// needs a real table exits, and all agree.
+func TestJITVarArgs(t *testing.T) {
+	skipWithoutJIT(t)
+	exits := map[string]int{}
+	jitExitHook = func(p *prototype, ip int, reason uint64) {
+		// view, at line 7, indexes a vararg view, which Go does.
+		if p.LineDefined >= 2 && p.LineDefined <= 8 && p.LineDefined != 7 {
+			if k := exitKind(p, ip, reason); !strings.HasPrefix(k, "CALL (Go") {
+				exits[k]++
+			}
+		}
+	}
+	defer func() { jitExitHook = nil }()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBoth(t, `local select = select
+		local function sum(...) local a, b, c = ... return (a or 0) + (b or 0) + (c or 0) end -- line 2
+		local function fixed(x, y, ...) local a = ... return x + (y or 100) + (a or 1000) end
+		local function pass(...) local s = sum(...) return s end -- not a tail call
+		local function all(...) return ... end
+		local function count(...) local n = select("#", ...) return n end
+		local function view(...t) return (t[1] or 0) + t.n end
+		local function loop(n) -- line 8: no exits
+		  local s = 0
+		  for i = 1, n do
+		    s = s + sum() + sum(i) + sum(i, 2) + sum(i, 2, 3) + sum(i, 2, 3, 4, 5)
+		    s = s + fixed(i) + fixed(i, 1) + fixed(i, 1, 2) + fixed(i, 1, 2, 3)
+		    s = s + pass(i, i) + select(2, all(i, i + 1)) + count(all(i, nil, nil)) + view(i, 2) + view()
+		  end
+		  return s
+		end
+		local function tbl(...t) return #t, t[2] end
+		local function nested(a, ...) if a == 0 then return ... end return nested(a - 1, a, ...) end
+		function run()
+		  local a, b, c = nested(3)
+		  return loop(200), a, b, c, tbl(1, 2, 3), count(), count(nil, nil)
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q\ninterpreter %q", jit, interp)
+	}
+	for kind, n := range exits { // a call's first, before its callee compiles
+		if n > 5 {
+			t.Fatalf("%s exited %d times in 200 iterations: %v", kind, n, exits)
+		}
+	}
+}
+
 // nil stored into an array element, through a register or an upvalue,
 // runs in compiled code; into an absent element of a table with
 // __newindex, or a buffer, it exits, and agrees.

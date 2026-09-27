@@ -431,8 +431,12 @@ nothing compiles.
     including appends within capacity, of tables in registers or
     upvalues.
   - `#` of strings.
-  - Native calls, tail calls and returns between compiled
-    fixed-parameter Lua functions. A tail call replaces the frame as the
+  - Native calls and returns between compiled Lua functions, and tail
+    calls between fixed-parameter ones. A vararg callee's frame starts
+    above its arguments, where `adjustVarArgs` moves its fixed parameters,
+    as preCall does; one whose named vararg table must be made exits.
+    VARARG copies the extra arguments from below the frame (`varArg`),
+    growing the frame for all of them within the stack. A tail call replaces the frame as the
     interpreter's does (`tailCallLua`), keeping its base. A function with
     nested functions returns and tail calls natively too, unless an
     upvalue over its frame is still open (`exitIfUpValuesOpen`); then it
@@ -730,8 +734,8 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
   which about 4.5 ns is compiled code around it, and the rest is the
   API's Go frame and the round trip. The other exits left on every
   iteration are allocations (`NEWTABLE`, `CLOSURE`), tail calls of Go
-  functions other than `setmetatable`, calls of
-  vararg functions, GETTABLE and SETTABLE with keys that are not constant
+  functions other than `setmetatable`, tail calls of vararg functions,
+  GETTABLE and SETTABLE with keys that are not constant
   strings or array indices, CONCAT, and the sort comparator's return to
   Go.
 - CD, the standard benchmark closest to C Lua 5.5 (0.85 times), spent
@@ -832,8 +836,9 @@ In order of expected payoff for real-time scripts such as visualisers:
 5. **Closures and GC.** Shrink `luaClosure`, or create closures in
    compiled code from a pre-allocated pool.
 6. **More native instructions:** `pairs` over string keys (slots);
-   CONCAT into a reusable buffer; vararg; GETTABLE and SETTABLE with
-   string keys in registers.
+   CONCAT into a reusable buffer; tail calls of vararg functions and
+   indexing a vararg view; GETTABLE and SETTABLE with string keys in
+   registers.
 
 7. **The barrier and budget in registers on amd64**, where they live in
    the context: unmeasured.

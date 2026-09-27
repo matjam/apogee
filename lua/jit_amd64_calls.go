@@ -59,10 +59,12 @@ func (c *amd64Compiler) setTop(r int) {
 	a.Store(rTmp, offLTop, rTmp2)
 }
 
-// callLua compiles the CALL i at ip for a compiled, fixed-parameter Lua
-// closure. It jumps to notLua when the callee is not a Lua closure, and
-// exits for any other Lua closure. Arguments may run up to l.top (B 0),
-// and the callee may return all its results (C 0).
+// callLua compiles the CALL i at ip for a compiled Lua closure. It jumps
+// to notLua when the callee is not a Lua closure, and exits for any other
+// Lua closure, or one whose named vararg table must be made. Arguments
+// may run up to l.top (B 0), and the callee may return all its results
+// (C 0). A vararg callee's frame starts above its arguments, where its
+// fixed parameters move, as adjustVarArgs does.
 func (c *amd64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	a := &c.a
 	ra, b, results := i.A(), i.B(), i.C()-1
@@ -77,9 +79,9 @@ func (c *amd64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	a.CmpMem(rCtx, offBarrier, 0)
 	a.J(NE, exit)
 	a.Load(R11, R10, offClProto) // prototype
-	a.Load8(AX, R11, offPVarArg)
-	a.Test(AX, AX)
-	a.J(NE, exit)
+	a.Load8(AX, R11, offPVarKind)
+	a.CmpImm(AX, int32(bytecode.VarArgTable))
+	a.J(E, exit) // Go makes the table
 	a.Load(AX, R11, offPJit)
 	a.Test(AX, AX)
 	a.J(E, exit)
@@ -96,10 +98,13 @@ func (c *amd64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 		a.Mov(DX, R13)
 		a.AddImm(DX, int32(b)) // l.top
 	}
-	// checkStack(p.maxStackSize) would grow the stack.
+	// checkStack(p.maxStackSize) would grow the stack, as would a vararg
+	// function's, which adds the parameters: this checks both.
 	a.Load(CX, R12, offLStackLast)
 	a.Sub(CX, DX)
 	a.Load(AX, R11, offPMaxStack)
+	a.Load(R8, R11, offPParams)
+	a.Add(AX, R8)
 	a.Cmp(CX, AX)
 	a.J(LE, exit)
 	// pushLuaFrame reuses l.callInfo.next, which must have Lua storage.
@@ -150,7 +155,17 @@ func (c *amd64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	}
 	a.Store(DX, offLClosure, R10)
 	a.Store(R9, offCIFunction, R13)
+	varArgs, based := a.NewLabel(), a.NewLabel()
+	a.Load8(AX, R11, offPVarArg)
+	a.Test(AX, AX)
+	a.J(NE, varArgs)
 	a.AddImm(R13, 1) // base
+	a.Bind(based)
+	c.outOfLine = append(c.outOfLine, func() {
+		a.Bind(varArgs)
+		c.adjustVarArgs(b)
+		a.Jmp(based)
+	})
 	a.Load(AX, R11, offPMaxStack)
 	a.Add(AX, R13) // top
 	a.Store(R9, offCITop, AX)
@@ -200,6 +215,146 @@ func (c *amd64Compiler) exitIfUpValuesOpen(ip int) {
 	a.Cmp(AX, CX)
 	a.J(G, c.exit(ip)) // index >= base, which is function + 1
 	a.Bind(none)
+}
+
+// adjustVarArgs moves a vararg callee's frame above its arguments, as
+// adjustVarArgs does, for a CALL whose argument field is b. With the
+// function's index in R13, the prototype in R11 and the state in R12, it
+// leaves the base in R13, the fixed parameters moved there and nil where
+// they were, and the vararg marker after them: nil, or the view of a
+// named vararg table only indexed. It uses AX, CX and R8, and DX, which
+// it reloads with the callee's luaCallInfo from R9.
+func (c *amd64Compiler) adjustVarArgs(b int) {
+	a := &c.a
+	if b == 0 {
+		a.Load(CX, R12, offLTop)
+	} else {
+		a.Mov(CX, R13)
+		a.AddImm(CX, int32(b))
+	}
+	a.Load(AX, R11, offPParams)
+	a.Add(AX, R13)
+	a.AddImm(AX, 1) // after the parameters, the missing ones cleared
+	above := a.NewLabel()
+	a.Cmp(CX, AX)
+	a.J(GE, above)
+	a.Mov(CX, AX)
+	a.Bind(above) // CX: the base
+	a.Load(DX, R12, offStack)
+	a.Mov(R8, R13)
+	a.AddImm(R8, 1)
+	a.Shl(R8, 4)
+	a.Add(R8, DX) // the first parameter
+	a.Mov(R13, CX)
+	a.Shl(CX, 4)
+	a.Add(CX, DX) // where it goes, past the last
+	a.Load(DX, R11, offPParams)
+	loop, marker := a.NewLabel(), a.NewLabel()
+	a.Bind(loop)
+	a.Test(DX, DX)
+	a.J(E, marker)
+	a.Load(AX, R8, offP)
+	a.Store(CX, offP, AX)
+	a.Load(AX, R8, offN)
+	a.Store(CX, offN, AX)
+	a.StoreZero(R8, offP)
+	a.StoreZero(R8, offN)
+	a.AddImm(R8, int32(valueSize))
+	a.AddImm(CX, int32(valueSize))
+	a.SubImm(DX, 1)
+	a.Jmp(loop)
+	a.Bind(marker) // CX: the register after the parameters
+	view, done := a.NewLabel(), a.NewLabel()
+	a.StoreZero(CX, offN)
+	a.Load8(AX, R11, offPVarKind)
+	a.CmpImm(AX, int32(bytecode.VarArgView))
+	a.J(E, view)
+	a.StoreZero(CX, offP)
+	a.Jmp(done)
+	a.Bind(view)
+	a.MovImm(AX, uint64(uintptr(varArgView.p)))
+	a.Store(CX, offP, AX)
+	a.Bind(done)
+	a.Load(DX, R9, offCILua)
+}
+
+// varArg compiles VARARG A B of a function without a vararg table: B-1 of
+// its extra arguments, nil past the last, or for B 0 all of them, leaving
+// l.top after them. The extra arguments lie below the frame, after the
+// function and its fixed parameters' old places. It exits while the write
+// barrier is on, and when all of them would not fit the stack, for Go to
+// grow it.
+func (c *amd64Compiler) varArg(ip int, i bytecode.Instruction) {
+	a := &c.a
+	if c.p.VarArgKind == bytecode.VarArgTable {
+		c.exitAlways(ip)
+		return
+	}
+	exit := c.exit(ip)
+	a.CmpMem(rCtx, offBarrier, 0)
+	a.J(NE, exit)
+	a.Load(rT2, rCtx, offCtxS)    // the state
+	a.Load(rT, rT2, offLCallInfo) // the callInfo
+	a.Load(rTmp, rT2, offStack)
+	a.Mov(rIdx, rFrame)
+	a.Sub(rIdx, rTmp)
+	a.Shr(rIdx, 4) // the base
+	a.Load(rTmp, rT, offCIFunction)
+	a.Mov(rTmp2, rIdx)
+	a.Sub(rTmp2, rTmp)
+	a.SubImm(rTmp2, int32(c.p.ParameterCount+1)) // n, the extra arguments
+	a.Mov(rAddr, rTmp2)
+	a.Shl(rAddr, 4)
+	a.Neg(rAddr)
+	a.Add(rAddr, rFrame) // the first
+	ra, wanted := i.A(), i.B()-1
+	if wanted >= 0 {
+		for j := range wanted {
+			dst, none, next := reg(ra+j), a.NewLabel(), a.NewLabel()
+			a.CmpImm(rTmp2, int32(j))
+			a.J(LE, none)
+			c.load(operand{rAddr, uint32(j) * valueSize})
+			c.store(dst)
+			a.Jmp(next)
+			a.Bind(none)
+			a.StoreZero(dst.base, dst.off+offP)
+			a.StoreZero(dst.base, dst.off+offN)
+			a.Bind(next)
+		}
+		return
+	}
+	// All of them, the frame growing to hold them as varArgs grows it,
+	// within the stack; Go grows the stack.
+	fits := a.NewLabel()
+	a.Mov(rP, rIdx)
+	a.AddImm(rP, int32(ra))
+	a.Add(rP, rTmp2) // l.top after them
+	a.Load(rTmp, rT, offCITop)
+	a.Cmp(rP, rTmp)
+	a.J(LE, fits)
+	a.Load(rN, rT2, offLStackLast)
+	a.Cmp(rP, rN)
+	a.J(GE, exit)
+	a.Store(rT, offCITop, rP)
+	a.Load(rN, rT, offCILua)
+	a.Mov(rTmp, rP)
+	a.Sub(rTmp, rIdx)
+	a.Store(rN, offLFrame+offSliceLen, rTmp) // frame = l.stack[base:ci.top]
+	a.Bind(fits)
+	a.Store(rT2, offLTop, rP)
+	loop, done := a.NewLabel(), a.NewLabel()
+	a.Mov(rT, rFrame)
+	a.AddImm(rT, int32(uint32(ra)*valueSize)) // the destination
+	a.Bind(loop)
+	a.Test(rTmp2, rTmp2)
+	a.J(E, done)
+	c.load(operand{rAddr, 0})
+	c.store(operand{rT, 0})
+	a.AddImm(rAddr, int32(valueSize))
+	a.AddImm(rT, int32(valueSize))
+	a.SubImm(rTmp2, 1)
+	a.Jmp(loop)
+	a.Bind(done)
 }
 
 // closeJump compiles JMP A sBx with A > 0, which closes upvalues and

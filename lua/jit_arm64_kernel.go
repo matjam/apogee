@@ -45,13 +45,23 @@ func (c *arm64Compiler) findKernels(latch int) []*kernel {
 	constOK := func(k int) bool { _, ok := c.constant(k); return ok }
 	env := newKernelEnv(c.cl, c.frame, constOK, fns, true)
 	var ks []*kernel
+	var plans []*kernelPlan
 	for _, intLoop := range []bool{true, false} {
-		plan := planKernel(c.p, latch, intLoop, env)
+		plans = append(plans, planKernel(c.p, latch, intLoop, env))
+		if c.frame == nil { // guesses with nothing to go on: floats too
+			env.floats = true
+			if alt := planKernel(c.p, latch, intLoop, env); alt != nil && !alt.sameTypes(plans[len(plans)-1]) {
+				plans = append(plans, alt)
+			}
+			env.floats = false
+		}
+	}
+	for _, plan := range plans {
 		if plan == nil {
 			continue
 		}
 		f := buildIR(c.p, plan)
-		if !f.allocate(kernelCount, len(kernelInts)) {
+		if !f.worksBetweenCalls() || !f.allocate(kernelCount, len(kernelInts)) {
 			continue
 		}
 		k := &kernel{irFunc: f, exits: make([]Label, len(f.snaps)), counted: make([]Label, len(f.snaps))}
@@ -89,43 +99,9 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 		a.BCond(HS, normal)
 	}
 	c.kernelGuards(k, normal)
-	for _, r := range k.liveIn {
-		if k.types[r] == kindTable {
-			a.Ldr(rTmp, rFrame, reg(r).off+offN)
-			a.MovImm(rExitPC, tagOf(vkTable))
-			a.Cmp(rTmp, rExitPC)
-			a.BCond(NE, normal)
-			a.Ldr(rTmp, rFrame, reg(r).off+offP)
-			c.branchNumber(rTmp, normal) // a number whose bits match the tag
-			continue
-		}
-		a.Ldr(rTmp, rFrame, reg(r).off+offP)
-		if k.types[r] == kindInt {
-			a.Cmp(rTmp, rInteger)
-		} else {
-			a.Cmp(rTmp, rNumber)
-		}
-		a.BCond(NE, normal)
-	}
-	for _, r := range k.liveIn {
-		if v := k.value(r, k.types[r]); k.spilled(v) {
-			continue // in its stack slot already
-		} else if k.types[r] == kindTable {
-			a.Ldr(k.ireg(v), rFrame, reg(r).off+offP)
-		} else if k.types[r] == kindInt {
-			a.Ldr(k.ireg(v), rFrame, reg(r).off+offN)
-		} else {
-			a.LdrD(k.reg(v), rFrame, reg(r).off+offN)
-		}
-	}
+	c.kernelLoad(k, k.entryRegs(), normal)
 	a.FmovToF(fZero, ZR)
-	counter := offKernels
-	if k.intLoop {
-		counter += 8
-	}
-	a.Ldr(rTmp, rCtx, counter)
-	a.AddImm(rTmp, rTmp, 1)
-	a.Str(rTmp, rCtx, counter)
+	c.countKernel(k)
 	if k.runs != nil {
 		a.Str(rBudget, rCtx, offEntry)
 	}
@@ -168,6 +144,9 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 				}
 			}
 		}
+	}
+	for _, pc := range k.resumes {
+		c.kernelResume(k, pc+1, label)
 	}
 	a.Bind(latch)
 	next := a.NewLabel()
@@ -828,8 +807,8 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		a.B(label(in.pc + 2))
 	case irJump:
 		a.B(label(in.target))
-	case irExit:
-		a.B(c.kernelSideExit(k, in.snap, true))
+	case irExit: // a call's is not a short run: the kernel resumes after it
+		a.B(c.kernelSideExit(k, in.snap, !in.flag))
 	case irHoist: // a number, from the context
 		if isInt {
 			a.Ldr(k.ireg(in.dst), rCtx, offHoist+uint32(in.imm)*8)
@@ -844,6 +823,12 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		c.kernelGetBuffer(k, in)
 	case irBufSet:
 		c.kernelSetBuffer(k, in)
+	case irCopyUp:
+		c.kernelUpValue(int(in.imm))
+		c.copyToReg(in.obj, rTmp, 0)
+	case irCopy:
+		src := reg(int(in.imm))
+		c.copyToReg(in.obj, src.base, src.off)
 	case irArrayGet, irFieldGet:
 		exit := c.kernelSideExit(k, in.snap, true)
 		c.tableSlot(k, in, exit)
@@ -881,7 +866,10 @@ func (c *arm64Compiler) storeTable(dst operand, r Reg) {
 // uses rTmp2 and rExitPC.
 func (c *arm64Compiler) tableSlot(k *kernel, in *irInst, exit Label) {
 	a := &c.a
-	t := k.ireg(in.a.v)
+	var t Reg
+	if in.buf < 0 {
+		t = k.ireg(in.a.v)
+	}
 	if in.op == irArrayGet || in.op == irArraySet {
 		if in.b.isConst() {
 			a.MovImm(rTmp, uint64(c.p.Constants[in.b.k].i()-1))
@@ -895,17 +883,26 @@ func (c *arm64Compiler) tableSlot(k *kernel, in *irInst, exit Label) {
 		a.AddShifted(rTmp, rTmp2, rTmp, 4)
 		return
 	}
-	a.Ldr(rTmp, t, offTShape)
+	// A hoisted table is loaded from the context at each use, as the
+	// field needs all three scratch registers.
+	table := func(dst Reg) Reg {
+		if in.buf < 0 {
+			return t
+		}
+		a.Ldr(dst, rCtx, offHoist+uint32(in.buf)*8)
+		return dst
+	}
+	a.Ldr(rTmp, table(rTmp), offTShape)
 	a.Cbz(rTmp, exit)
 	a.MovImm(rTmp2, uint64(uintptr(unsafe.Pointer(&c.p.fields[in.pc]))))
 	a.Ldr(rExitPC, rTmp2, offCShape)
 	a.Cmp(rTmp, rExitPC)
 	a.BCond(NE, exit)
 	a.Ldrsw(rExitPC, rTmp2, offCSlot)
-	a.Ldr(rTmp, t, offTSlots+offSliceLen)
+	a.Ldr(rTmp, table(rTmp), offTSlots+offSliceLen)
 	a.Cmp(rExitPC, rTmp)
 	a.BCond(HS, exit) // unsigned: a slot below 0, not the table's own, too
-	a.Ldr(rTmp2, t, offTSlots)
+	a.Ldr(rTmp2, table(rTmp2), offTSlots)
 	a.AddShifted(rTmp, rTmp2, rExitPC, 4)
 }
 
@@ -913,6 +910,12 @@ func (c *arm64Compiler) tableSlot(k *kernel, in *irInst, exit Label) {
 // unless it has the result's type. It uses rTmp2 and rExitPC.
 func (c *arm64Compiler) tableValue(k *kernel, in *irInst, exit Label) {
 	a := &c.a
+	if in.dst == noVreg { // any value but nil, to the stack
+		a.Ldr(rTmp2, rTmp, offP)
+		a.Cbz(rTmp2, exit)
+		c.copyToReg(in.obj, rTmp, 0)
+		return
+	}
 	switch k.typeOf(in.dst) {
 	case kindFloat:
 		a.Ldr(rTmp2, rTmp, offP)
@@ -964,4 +967,113 @@ func (c *arm64Compiler) tableStore(k *kernel, in *irInst) {
 	} else {
 		a.Str(rInteger, rTmp, offP)
 	}
+}
+
+// kernelLoad checks that the Lua register of each of vs holds a value of
+// its type, branching to fail if not, then loads those not spilled.
+func (c *arm64Compiler) kernelLoad(k *kernel, vs []vreg, fail Label) {
+	a := &c.a
+	for _, v := range vs {
+		r := reg(k.vregs[v].r)
+		if k.typeOf(v) == kindTable {
+			a.Ldr(rTmp, r.base, r.off+offN)
+			a.MovImm(rExitPC, tagOf(vkTable))
+			a.Cmp(rTmp, rExitPC)
+			a.BCond(NE, fail)
+			a.Ldr(rTmp, r.base, r.off+offP)
+			c.branchNumber(rTmp, fail) // a number whose bits match the tag
+			continue
+		}
+		a.Ldr(rTmp, r.base, r.off+offP)
+		if k.typeOf(v) == kindInt {
+			a.Cmp(rTmp, rInteger)
+		} else {
+			a.Cmp(rTmp, rNumber)
+		}
+		a.BCond(NE, fail)
+	}
+	for _, v := range vs {
+		if r := reg(k.vregs[v].r); k.spilled(v) {
+			continue // in its stack slot already
+		} else if k.typeOf(v) == kindTable {
+			a.Ldr(k.ireg(v), r.base, r.off+offP)
+		} else if k.typeOf(v) == kindInt {
+			a.Ldr(k.ireg(v), r.base, r.off+offN)
+		} else {
+			a.LdrD(k.reg(v), r.base, r.off+offN)
+		}
+	}
+}
+
+// kernelResume makes the code compiled code enters at pc, after a call k
+// leaves at, go on in k: it checks what k's entry does and that the
+// registers live at pc hold values of their types, and loads them. When a
+// check fails it counts a short run and goes on in the ordinary code.
+func (c *arm64Compiler) kernelResume(k *kernel, pc int, label func(int) Label) {
+	if _, ok := c.resume[pc]; ok { // another kernel resumes there
+		return
+	}
+	a := &c.a
+	l := a.NewLabel()
+	c.resume[pc] = l
+	c.outOfLine = append(c.outOfLine, func() {
+		fail, ordinary := a.NewLabel(), c.pcs[pc]
+		a.Bind(l)
+		a.Cbnz(rBarrier, ordinary)
+		a.MovImm(rTmp2, uint64(uintptr(unsafe.Pointer(k.runs))))
+		a.Ldr(rTmp, rTmp2, 0)
+		a.CmpImm(rTmp, kernelRunsOff)
+		a.BCond(HS, ordinary)
+		c.kernelGuards(k, fail)
+		c.kernelLoad(k, k.resumeRegs(pc), fail)
+		c.countKernel(k)
+		a.FmovToF(fZero, ZR)
+		a.Str(rBudget, rCtx, offEntry)
+		a.B(label(pc))
+		a.Bind(fail)
+		a.MovImm(rTmp2, uint64(uintptr(unsafe.Pointer(k.runs))))
+		a.Ldr(rTmp, rTmp2, 0)
+		a.AddImm(rTmp, rTmp, 1)
+		a.Str(rTmp, rTmp2, 0)
+		a.B(ordinary)
+	})
+}
+
+// kernelUpValue leaves in rTmp the address of upvalue n's value, using
+// rTmp2 but no kernel register, as upValueAddr does not.
+func (c *arm64Compiler) kernelUpValue(n int) {
+	a := &c.a
+	closed, done := a.NewLabel(), a.NewLabel()
+	a.Ldr(rTmp, rUpVals, uint32(n)*8) // *upValue
+	a.Ldr(rTmp2, rTmp, offUVState)
+	a.Cbz(rTmp2, closed)
+	a.Ldr(rTmp2, rTmp2, offStack) // &state.stack[0]
+	a.Ldr(rTmp, rTmp, offUVIndex) // index
+	a.AddShifted(rTmp, rTmp2, rTmp, 4)
+	a.B(done)
+	a.Bind(closed)
+	a.AddImm(rTmp, rTmp, offUVClosed)
+	a.Bind(done)
+}
+
+// copyToReg copies the value at src+off to register dst, using rTmp2.
+func (c *arm64Compiler) copyToReg(dst int, src Reg, off uint32) {
+	a := &c.a
+	o := reg(dst)
+	a.Ldr(rTmp2, src, off+offP)
+	a.Str(rTmp2, o.base, o.off+offP)
+	a.Ldr(rTmp2, src, off+offN)
+	a.Str(rTmp2, o.base, o.off+offN)
+}
+
+// countKernel counts an entry to k, for tests.
+func (c *arm64Compiler) countKernel(k *kernel) {
+	a := &c.a
+	counter := offKernels
+	if k.intLoop {
+		counter += 8
+	}
+	a.Ldr(rTmp, rCtx, counter)
+	a.AddImm(rTmp, rTmp, 1)
+	a.Str(rTmp, rCtx, counter)
 }

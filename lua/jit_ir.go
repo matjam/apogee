@@ -57,16 +57,18 @@ const (
 	irMath                  // dst = math function imm (a, b), of a's type
 	irBufGet                // dst = buffer[a]
 	irBufSet                // buffer[a] = b
-	irExit                  // leave, for the ordinary code to run the instruction at pc
-	irArrayGet              // dst = a[b], guarded to have dst's type
+	irExit                  // leave, for the ordinary code to run the instruction at pc; a call's, flag, resumes after
+	irArrayGet              // dst = a[b], guarded to have dst's type, or with no dst register obj on the stack
 	irArraySet              // a[b] = c, over a value or with no metatable
-	irFieldGet              // dst = a's own field that the fieldCache at pc names, guarded
+	irFieldGet              // dst = a's own field that the fieldCache at pc names, guarded; of hoisted slot buf's when not -1
 	irFieldSet              // that field = c, over a value
+	irCopyUp                // register obj = upvalue imm, on the stack
+	irCopy                  // register obj = register imm, on the stack
 )
 
 var irOpNames = [...]string{"label", "move", "const", "hoist", "add", "sub", "mul", "div", "floordiv",
 	"fmod", "idiv", "imod", "and", "or", "xor", "not", "shift", "neg", "branch", "jump", "intrinsic",
-	"math", "bufget", "bufset", "exit", "aget", "aset", "fget", "fset"}
+	"math", "bufget", "bufset", "exit", "aget", "aset", "fget", "fset", "copyup", "copy"}
 
 func (o irOp) String() string { return irOpNames[o] }
 
@@ -136,19 +138,21 @@ type irSnapReg struct {
 // irFunc is a kernel's IR.
 type irFunc struct {
 	*kernelPlan
-	insts  []irInst
-	vregs  []kslot // each one's Lua register and type
-	index  map[kslot]vreg
-	snaps  []irSnap
-	snapAt map[int]int  // snapshot indices by pc
-	loop   [4]vreg      // the FORLOOP's index, limit (or count), step and variable
-	end    int          // the latch's snapshot, for leaving at the end of an iteration
-	leaves bool         // whether an instruction or a branch leaves: see irExit
-	share  bool         // the variable shares the index's vreg
-	temps  int          // inlined functions' temporaries: see temp
-	loc    []int        // each vreg's machine register, in its class, or -1: see allocate
-	reload [2]int       // the first of the float and integer registers holding spilled values, or -1
-	cur    map[vreg]int // spilled vregs the operation being lowered uses, and their reload registers
+	insts   []irInst
+	vregs   []kslot // each one's Lua register and type
+	index   map[kslot]vreg
+	snaps   []irSnap
+	snapAt  map[int]int           // snapshot indices by pc
+	loop    [4]vreg               // the FORLOOP's index, limit (or count), step and variable
+	end     int                   // the latch's snapshot, for leaving at the end of an iteration
+	leaves  bool                  // whether an instruction or a branch leaves: see irExit
+	resumes []int                 // the pcs of calls the kernel resumes after
+	liveAt  map[int]map[vreg]bool // the virtual registers live at each body pc's label, but the pinned
+	share   bool                  // the variable shares the index's vreg
+	temps   int                   // inlined functions' temporaries: see temp
+	loc     []int                 // each vreg's machine register, in its class, or -1: see allocate
+	reload  [2]int                // the first of the float and integer registers holding spilled values, or -1
+	cur     map[vreg]int          // spilled vregs the operation being lowered uses, and their reload registers
 }
 
 // A kernel that can leave (irFunc.leaves) counts its short runs: those
@@ -238,7 +242,8 @@ func (f *irFunc) snapshot(p *prototype, ip int) int {
 // buildIR returns k's IR.
 func buildIR(p *prototype, k *kernelPlan) *irFunc {
 	code := p.Code
-	f := &irFunc{kernelPlan: k, index: map[kslot]vreg{}, snapAt: map[int]int{}, share: k.shareVar, cur: map[vreg]int{}}
+	f := &irFunc{kernelPlan: k, index: map[kslot]vreg{}, snapAt: map[int]int{}, share: k.shareVar, cur: map[vreg]int{},
+		liveAt: map[int]map[vreg]bool{}}
 	base := k.base
 	// Virtual registers in the order allocate colours them: the loop's,
 	// the live-in ones, then as the body writes them.
@@ -246,7 +251,9 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 		f.loop[r-base] = f.value(r, k.types[base])
 	}
 	for _, r := range k.liveIn {
-		f.value(r, k.types[r])
+		if isRegKind(k.types[r]) {
+			f.value(r, k.types[r])
+		}
 	}
 	for ip := k.start; ip < k.latch; ip++ {
 		if t := k.results[ip]; isRegKind(t) {
@@ -279,6 +286,10 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 		dst := func() vreg { return f.value(i.A(), res) }
 		switch op := i.OpCode(); op {
 		case bytecode.OpMove:
+			if res == kindBoxed {
+				in.op, in.obj, in.imm = irCopy, i.A(), int64(i.B())
+				break
+			}
 			if !isRegKind(res) {
 				continue // an alias of a hoisted buffer: nothing to move
 			}
@@ -339,12 +350,22 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 		case bytecode.OpGetUpValue:
 			// The function an intrinsic call checked on entry, or a buffer the
 			// context holds: nothing. A number, from the context.
+			if k.upCopies[ip] {
+				in.op, in.obj, in.imm = irCopyUp, i.A(), int64(i.B())
+				break
+			}
 			s, ok := k.upLoads[ip]
 			if !ok || !isRegKind(res) {
 				continue
 			}
 			in.op, in.dst, in.imm = irHoist, dst(), int64(s)
 		case bytecode.OpCall:
+			if k.resumes[ip] {
+				f.leaves = true
+				f.resumes = append(f.resumes, ip)
+				in.op, in.flag, in.snap = irExit, true, f.snapshot(p, ip)
+				break
+			}
 			kc := k.calls[ip]
 			if kc.closure != nil {
 				f.inline(p, ip, kc, dst(), emit)
@@ -364,8 +385,18 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			}
 		case bytecode.OpGetTable, bytecode.OpGetTableUp: // GETTABUP's B, the upvalue, is hoisted
 			in.snap = f.snapshot(p, ip)
+			if s, ok := k.upFields[ip]; ok { // the table in the context's hoisted slot s
+				in.op, in.buf = irFieldGet, s
+				if in.dst, in.obj = noVreg, i.A(); res != kindBoxed {
+					in.dst = dst()
+				}
+				break
+			}
 			if field, ok := k.tabUses[ip]; ok {
-				in.op, in.dst, in.a = irArrayGet, dst(), f.arg(p, ip, i.B())
+				in.op, in.a = irArrayGet, f.arg(p, ip, i.B())
+				if in.dst, in.obj = noVreg, i.A(); res != kindBoxed {
+					in.dst = dst()
+				}
 				if field {
 					in.op = irFieldGet
 				} else {
@@ -536,6 +567,7 @@ func (f *irFunc) allocate(maxFloats, maxInts int) bool {
 		switch in.op {
 		case irLabel:
 			live[x] = live[x+1]
+			f.liveAt[in.target] = live[x]
 			continue
 		case irJump:
 			succ = []int{labels[in.target]}
@@ -641,6 +673,49 @@ func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill bool) (floa
 		}
 	}
 	return floats, ints
+}
+
+// worksBetweenCalls reports whether f does enough in registers for the
+// calls it leaves at and resumes after to pay: each costs writing the
+// registers back and checking and loading them again, which a kernel of
+// little else spends more on than the ordinary code would.
+func (f *irFunc) worksBetweenCalls() bool {
+	work := 0
+	for _, in := range f.insts {
+		switch in.op {
+		case irLabel, irMove, irConst, irHoist, irJump, irExit, irCopyUp, irCopy:
+		default:
+			work++
+		}
+	}
+	return work >= minCallWork*len(f.resumes)
+}
+
+// entryRegs returns the virtual registers a kernel loads on entry: the
+// live-in ones, but those left on the stack.
+func (f *irFunc) entryRegs() []vreg {
+	var vs []vreg
+	for _, r := range f.liveIn {
+		if t := f.types[r]; isRegKind(t) {
+			vs = append(vs, f.value(r, t))
+		}
+	}
+	return vs
+}
+
+// resumeRegs returns the virtual registers a kernel resuming at pc, after
+// a call, loads: those live there, and the pinned ones whose registers
+// hold their types there.
+func (f *irFunc) resumeRegs(pc int) []vreg {
+	types := f.at[pc-f.start]
+	var vs []vreg
+	for x, s := range f.vregs {
+		v := vreg(x)
+		if s.r >= 0 && (f.liveAt[pc][v] || f.pinned(v)) && types[s.r] == s.t && !slices.Contains(vs, v) {
+			vs = append(vs, v)
+		}
+	}
+	return vs
 }
 
 // spilled reports whether v lives in its Lua register's stack slot.

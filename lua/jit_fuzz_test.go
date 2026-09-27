@@ -97,9 +97,9 @@ func exitKind(p *prototype, ip int, reason uint64) string {
 // everything at once, and returns what each returned, formatted exactly.
 func runFuzz(t *testing.T, src string, iterations int) (jit, interp string) {
 	t.Helper()
-	saved, savedRun := jitThreshold, jitMinRun
-	jitThreshold, jitMinRun = 0, 0
-	defer func() { jitThreshold, jitMinRun = saved, savedRun }()
+	saved, savedRun, savedWork := jitThreshold, jitMinRun, minCallWork
+	jitThreshold, jitMinRun, minCallWork = 0, 0, 0 // kernels resume after calls however little else they do
+	defer func() { jitThreshold, jitMinRun, minCallWork = saved, savedRun, savedWork }()
 	// Compiled calls and stores of pointers exit while Go's write barrier
 	// is on, as they must: finish any collection and hold off the next, so
 	// the exits counted are the program's.

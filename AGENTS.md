@@ -525,6 +525,26 @@ nothing compiles.
     its registers to virtual ones of their own (`temp`, which never
     spill), reading the arguments' sources through their MOVEs
     (`copied`). spectral-norm's `A(i, j)` is the case.
+  - **Calls it resumes after.** A CALL of B arguments and one result or
+    none that the kernel neither computes nor inlines leaves it: the
+    kernel writes back the registers and jumps to the CALL's ordinary
+    code (an `irExit` with `flag`, not counted as a short run). The
+    callee's RETURN, or runJIT after a Go call, enters compiled code at
+    `offsets[pc+1]`, which is the kernel's resume point
+    (`kernelResume`, recorded in `c.resume`): it checks the barrier, the
+    switch-off, what the entry checks (`kernelGuards`) and the types of
+    the registers live there (`resumeRegs`), loads them (`kernelLoad`)
+    and goes on in the kernel; when a check fails it counts a short run
+    and goes on in the ordinary code. Values the kernel only moves or
+    passes to calls, such as the function called, are `kindBoxed`: they
+    stay in their stack slots (`irCopyUp`, `irCopy`, and a table read
+    with no result register). A global is a field of the hoisted `_ENV`
+    table (`upFields`), read from the context at each use. A kernel whose
+    calls outnumber its other work (`worksBetweenCalls`, `minCallWork`
+    operations each) is not made: go-calls was 5% slower. With no frame
+    to observe types from, `findKernels` also plans with `floats` set,
+    guessing floats where nothing decides, and keeps that plan when its
+    types differ.
   - **Buffers.** `GETTABLE`/`SETTABLE` on a register the body never
     writes, with an integer key, reads or writes a buffer's element; the
     entry check confirms a buffer (of floats, if read). A register the

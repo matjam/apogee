@@ -431,9 +431,15 @@ nothing compiles.
     including appends within capacity, of tables in registers or
     upvalues.
   - `#` of strings.
-  - Native calls, tail calls and returns between compiled
-    fixed-parameter Lua functions. A tail call replaces the frame as the
-    interpreter's does (`tailCallLua`), keeping its base. A function with
+  - Native calls, tail calls and returns between compiled Lua functions,
+    with arguments up to l.top (B 0) too. A vararg callee's frame starts
+    above its arguments, where `adjustVarArgs` moves its fixed parameters,
+    as preCall does; one whose named vararg table must be made exits.
+    VARARG copies the extra arguments from below the frame (`varArg`),
+    growing the frame for all of them within the stack. A tail call
+    replaces the frame as the interpreter's does (`tailCallLua`): the
+    callee moves to the caller's function slot, below a vararg caller's
+    extra arguments, and its frame starts after it. A function with
     nested functions returns and tail calls natively too, unless an
     upvalue over its frame is still open (`exitIfUpValuesOpen`); then it
     exits, for Go to close it.
@@ -615,16 +621,16 @@ remains follows from running on Go.
     last bit.
 - **The JIT compiles only on linux and darwin, arm64 and amd64.**
   Elsewhere, Windows included, states interpret.
-- **Speed.** With the JIT, apogee takes 0.70 times C Lua 5.5's time on
+- **Speed.** With the JIT, apogee takes 0.69 times C Lua 5.5's time on
   the standard benchmarks on the 9900X3D; without it, 1.8 times. It is
-  faster on all 17, least on CD (0.85 times) and Json (0.90). The M1's results are
+  faster on all 17, least on CD (0.86 times) and Json (0.90). The M1's results are
   still against 5.4; re-measure there with `-tags clua55`
   (bench/README.md, "Reproducing").
 
 ### LuaJIT
 
 **Speed is the main gap.** On the standard benchmarks on the 9900X3D,
-LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.70: roughly
+LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.69: roughly
 four times faster.
 - Numeric loops: 5–16 times faster (spectral-norm, Permute, NBody,
   Towers).
@@ -680,7 +686,7 @@ Windows. apogee's JIT covers linux and darwin on arm64 and amd64.
 bench/README.md has the current tables and charts, generated from the raw
 results: AMD Ryzen 9 9900X3D (linux/amd64) and Apple M1 Pro (arm64). On
 the standard benchmarks (Are We Fast Yet and three from the Benchmarks
-Game) apogee with the JIT takes 0.70 times as long as C Lua 5.5 on amd64
+Game) apogee with the JIT takes 0.69 times as long as C Lua 5.5 on amd64
 (pinned to one CCD), and 1.8 times without it. The M1's results
 (0.75 and 1.5 times) are still against C Lua 5.4, from before the port to
 5.5, and before the arm64 fix that compiles functions past 32 KB of code.
@@ -730,11 +736,11 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
   which about 4.5 ns is compiled code around it, and the rest is the
   API's Go frame and the round trip. The other exits left on every
   iteration are allocations (`NEWTABLE`, `CLOSURE`), tail calls of Go
-  functions other than `setmetatable`, calls of
-  vararg functions, GETTABLE and SETTABLE with keys that are not constant
+  functions other than `setmetatable`,
+  GETTABLE and SETTABLE with keys that are not constant
   strings or array indices, CONCAT, and the sort comparator's return to
   Go.
-- CD, the standard benchmark closest to C Lua 5.5 (0.85 times), spent
+- CD, the standard benchmark closest to C Lua 5.5 (0.86 times), spent
   about a fifth of its time in `jitStep` before constructors' setmetatable
   compiled, most of that creating tables
   (`newTableAt`) and storing into their hash parts (`setTableAt`): the
@@ -832,8 +838,8 @@ In order of expected payoff for real-time scripts such as visualisers:
 5. **Closures and GC.** Shrink `luaClosure`, or create closures in
    compiled code from a pre-allocated pool.
 6. **More native instructions:** `pairs` over string keys (slots);
-   CONCAT into a reusable buffer; vararg; GETTABLE and SETTABLE with
-   string keys in registers.
+   CONCAT into a reusable buffer; indexing a vararg view; GETTABLE and
+   SETTABLE with string keys in registers.
 
 7. **The barrier and budget in registers on amd64**, where they live in
    the context: unmeasured.

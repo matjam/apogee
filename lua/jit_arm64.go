@@ -61,8 +61,9 @@ type arm64Compiler struct {
 	// outOfLine emit code instructions branch to rarely, after the
 	// function's: buffers in table instructions, and kernels' side exits.
 	outOfLine  []func()
-	always     []bool // instructions compiled as an unconditional exit
-	kernelExit Label  // in a kernel's intrinsic call, its side exit; otherwise -1
+	cold       []func() // out of line after outOfLine: code that seldom runs, kept from the rest
+	always     []bool   // instructions compiled as an unconditional exit
+	kernelExit Label    // in a kernel's intrinsic call, its side exit; otherwise -1
 }
 
 // intrinsicExit is where an intrinsic's code at ip exits: the
@@ -187,6 +188,13 @@ func (c *arm64Compiler) stubs() {
 	}
 	for k := 0; k < len(c.outOfLine); k++ { // an emit may add more
 		c.outOfLine[k]()
+	}
+	c.outOfLine = nil
+	for k := 0; k < len(c.cold); k++ {
+		c.cold[k]()
+		for ; len(c.outOfLine) > 0; c.outOfLine = c.outOfLine[1:] { // what it added
+			c.outOfLine[0]()
+		}
 	}
 	for ip, l := range c.exits {
 		if l >= 0 {
@@ -871,6 +879,8 @@ func (c *arm64Compiler) instruction(ip int) int {
 		c.jumpTo(ip, ip+1+orig.SBx())
 	case bytecode.OpTForCall:
 		c.tforCall(ip, orig)
+	case bytecode.OpVarArg:
+		c.varArg(ip, orig)
 	case bytecode.OpTForLoop: // after TFORCALL: on while the control variable is not nil
 		r := reg(orig.A() + 3)
 		done := a.NewLabel()

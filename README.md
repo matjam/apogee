@@ -96,9 +96,9 @@ results predate the port to Lua 5.5 and are against C Lua 5.4.
 <!-- suite-table summary -->
 | Geometric mean | Apogee (JIT) | Apogee (no JIT) | go-lua | Lua 5.5 | Lua 5.4 | LuaJIT |
 |---|---:|---:|---:|---:|---:|---:|
-| Standard benchmarks against C Lua 5.5, AMD Ryzen 9 9900X3D | **0.70×** | 1.8× | 6.0× | 1× | – | 0.18× |
+| Standard benchmarks against C Lua 5.5, AMD Ryzen 9 9900X3D | **0.69×** | 1.8× | 6.0× | 1× | – | 0.18× |
 | Standard benchmarks against C Lua 5.4, Apple M1 Pro | **0.75×** | 1.5× | 4.8× | – | 1× | 0.20× |
-| Embedding workloads against native Go, AMD Ryzen 9 9900X3D | **5.8×** | 13× | 52× | 7.8× | – | 2.3× |
+| Embedding workloads against native Go, AMD Ryzen 9 9900X3D | **5.7×** | 13× | 52× | 7.8× | – | 2.3× |
 | Embedding workloads against native Go, Apple M1 Pro | **6.9×** | 13× | 51× | – | 9.6× | 2.6× |
 <!-- /suite-table -->
 

@@ -26,7 +26,7 @@ const (
 // a Lua closure, and exits for any other Lua closure.
 func (c *arm64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	a := &c.a
-	ra, b, results := i.A(), i.B(), i.C()-1
+	ra := i.A()
 	fn := reg(ra)
 	exit := c.exit(ip)
 	a.Ldr(rTmp, fn.base, fn.off+offN)
@@ -37,9 +37,26 @@ func (c *arm64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	c.branchNumber(rT, exit) // a number whose bits match the tag
 	a.Cbnz(rBarrier, exit)
 	a.Ldr(rT2, rT, offClProto)
-	a.Ldrb(rTmp, rT2, offPVarKind)
-	a.CmpImm(rTmp, uint32(bytecode.VarArgTable))
-	a.BCond(EQ, exit) // Go makes the table
+	varArgs := a.NewLabel()
+	a.Ldrb(rTmp, rT2, offPVarArg)
+	a.Cbnz(rTmp, varArgs)
+	c.callLuaFrame(ip, i, false)
+	// A vararg callee's frame, out of line: most calls are not.
+	c.cold = append(c.cold, func() {
+		a.Bind(varArgs)
+		a.Ldrb(rTmp, rT2, offPVarKind)
+		a.CmpImm(rTmp, uint32(bytecode.VarArgTable))
+		a.BCond(EQ, exit) // Go makes the table
+		c.callLuaFrame(ip, i, true)
+	})
+}
+
+// callLuaFrame compiles the rest of callLua, for a vararg callee or not,
+// with the closure in rT and its prototype in rT2.
+func (c *arm64Compiler) callLuaFrame(ip int, i bytecode.Instruction, varArgs bool) {
+	a := &c.a
+	ra, b, results := i.A(), i.B(), i.C()-1
+	exit := c.exit(ip)
 	a.Ldr(rCache, rT2, offPJit)
 	a.Cbz(rCache, exit)
 	a.Ldr(rState, rCtx, offCtxS)
@@ -58,9 +75,13 @@ func (c *arm64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	a.Ldr(rLen, rT2, offPMaxStack)
 	a.Ldr(rNext, rState, offLStackLast)
 	a.Sub(rNext, rNext, rSlot)
-	a.Ldr(rTmp, rT2, offPParams)
-	a.Add(rTmp, rTmp, rLen)
-	a.Cmp(rNext, rTmp)
+	if varArgs {
+		a.Ldr(rTmp, rT2, offPParams)
+		a.Add(rTmp, rTmp, rLen)
+		a.Cmp(rNext, rTmp)
+	} else {
+		a.Cmp(rNext, rLen)
+	}
 	a.BCond(LE, exit)
 	// pushLuaFrame reuses l.callInfo.next, which must have Lua storage.
 	a.Ldr(rCI, rState, offLCallInfo)
@@ -103,16 +124,11 @@ func (c *arm64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	}
 	a.Str(rT, rP, offLClosure)
 	a.Str(rIdx, rNext, offCIFunction)
-	varArgs, based := a.NewLabel(), a.NewLabel()
-	a.Ldrb(rTmp, rT2, offPVarArg)
-	a.Cbnz(rTmp, varArgs)
-	a.AddImm(rSlot, rIdx, 1) // base
-	a.Bind(based)
-	c.outOfLine = append(c.outOfLine, func() {
-		a.Bind(varArgs)
+	if varArgs {
 		c.adjustVarArgs(rCI)
-		a.B(based)
-	})
+	} else {
+		a.AddImm(rSlot, rIdx, 1) // base
+	}
 	a.AddShifted(rLen, rSlot, rLen, 0) // top = base + maxStackSize
 	a.Str(rLen, rNext, offCITop)
 	a.MovImm(rTmp2, uint64(int64(results)))
@@ -354,6 +370,109 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	c.branchNumber(rT, exit) // a number whose bits match the tag
 	a.Cbnz(rBarrier, exit)
 	a.Ldr(rT2, rT, offClProto)
+	if b == 0 {
+		c.tailCallGeneral(ip, i)
+		return
+	}
+	general := a.NewLabel()
+	a.Ldrb(rTmp, rT2, offPVarArg)
+	a.Cbnz(rTmp, general)
+	c.tailCallFixed(ip, i)
+	// A vararg callee, out of line: most tail calls are not.
+	c.cold = append(c.cold, func() {
+		a.Bind(general)
+		c.tailCallGeneral(ip, i)
+	})
+}
+
+// tailCallFixed compiles the rest of tailCallLua for a fixed-parameter
+// callee and b-1 arguments, with the closure in rT and its prototype in
+// rT2.
+func (c *arm64Compiler) tailCallFixed(ip int, i bytecode.Instruction) {
+	a := &c.a
+	ra, b := i.A(), i.B()
+	exit := c.exit(ip)
+	a.Ldr(rCache, rT2, offPJit)
+	a.Cbz(rCache, exit)
+	a.Ldr(rState, rCtx, offCtxS)
+	a.Ldr(rCI, rState, offLCallInfo)
+	if len(c.p.Prototypes) > 0 {
+		c.exitIfUpValuesOpen(ip)
+	}
+	// checkStack(p.maxStackSize) with l.top at ci.function + b.
+	a.Ldr(rIdx, rCI, offCIFunction)
+	a.Ldr(rLen, rT2, offPMaxStack)
+	a.Ldr(rNext, rState, offLStackLast)
+	a.Sub(rNext, rNext, rIdx)
+	a.SubImm(rNext, rNext, uint32(b))
+	a.Cmp(rNext, rLen)
+	a.BCond(LE, exit)
+	c.spend(ip) // a loop of tail calls has no back-edge
+	// Move the callee and its arguments down to stack[ci.function:], one
+	// slot below the frame, or further in a vararg function, whose
+	// arguments lie between; the callee's frame starts after it.
+	a.Ldr(rTmp, rState, offStack)
+	a.AddShifted(rSlot, rTmp, rIdx, 4)
+	for k := range b {
+		src := reg(ra + k)
+		a.Ldr(rTmp, rFrame, src.off+offP)
+		a.Str(rTmp, rSlot, uint32(k)*valueSize+offP)
+		a.Ldr(rTmp, rFrame, src.off+offN)
+		a.Str(rTmp, rSlot, uint32(k)*valueSize+offN)
+	}
+	a.AddImm(rFrame, rSlot, valueSize)
+	// Clear the parameters the call does not pass.
+	loop, cleared := a.NewLabel(), a.NewLabel()
+	a.Ldr(rN, rT2, offPParams)
+	a.MovImm(rTmp, uint64(b-1))
+	a.Bind(loop)
+	a.Cmp(rTmp, rN)
+	a.BCond(GE, cleared)
+	a.AddShifted(rTmp2, rFrame, rTmp, 4)
+	a.Str(ZR, rTmp2, offP)
+	a.Str(ZR, rTmp2, offN)
+	a.AddImm(rTmp, rTmp, 1)
+	a.B(loop)
+	a.Bind(cleared)
+
+	// The frame now runs the callee: its code, closure, top, and frame
+	// slice, which keeps its base; it was tail called.
+	a.Ldr(rP, rCI, offCILua)
+	a.Str(ZR, rP, offLSavedPC)
+	for w := uint32(0); w < 24; w += 8 {
+		a.Ldr(rTmp2, rT2, offPCode+w)
+		a.Str(rTmp2, rP, offLCode+w)
+	}
+	a.Str(rT, rP, offLClosure)
+	a.AddImm(rSlot, rIdx, 1) // base
+	a.Str(rFrame, rP, offLFrame)
+	a.Str(rLen, rP, offLFrame+offSliceLen)
+	a.AddShifted(rLen, rSlot, rLen, 0) // top = base + maxStackSize
+	a.Str(rLen, rCI, offCITop)
+	a.Str(rLen, rState, offLTop)
+	a.Ldr(rTmp2, rState, offStack+offSliceCap)
+	a.Sub(rTmp2, rTmp2, rSlot)
+	a.Str(rTmp2, rP, offLFrame+offSliceCap)
+	a.Ldrb(rTmp, rCI, offCIStatus)
+	a.MovImm(rTmp2, uint64(callStatusTail))
+	a.Orr(rTmp, rTmp, rTmp2)
+	a.Strb(rTmp, rCI, offCIStatus)
+	a.Strb(ZR, rCI, offCIMeta) // no __call metamethods
+
+	// Enter the callee.
+	a.Ldr(rConst, rT2, offPConsts)
+	a.Ldr(rUpVals, rT, offClUpVals)
+	a.Ldr(rTmp, rCache, offJCEntry)
+	a.Br(rTmp)
+}
+
+// tailCallGeneral compiles the rest of tailCallLua for any callee and
+// arguments up to l.top (B 0) too, with the closure in rT and its
+// prototype in rT2.
+func (c *arm64Compiler) tailCallGeneral(ip int, i bytecode.Instruction) {
+	a := &c.a
+	ra, b := i.A(), i.B()
+	exit := c.exit(ip)
 	a.Ldrb(rTmp, rT2, offPVarKind)
 	a.CmpImm(rTmp, uint32(bytecode.VarArgTable))
 	a.BCond(EQ, exit) // Go makes the table
@@ -448,7 +567,7 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	a.Cbnz(rTmp, varArgs)
 	a.AddImm(rSlot, rIdx, 1) // base
 	a.Bind(based)
-	c.outOfLine = append(c.outOfLine, func() {
+	c.cold = append(c.cold, func() {
 		a.Bind(varArgs) // the frame starts above the arguments
 		a.Add(rSlot, rIdx, rN)
 		c.adjustVarArgs(rNext)

@@ -24,7 +24,7 @@ by [`chart`](chart) (see [Reproducing](#reproducing)).
 
 AMD Ryzen 9 9900X3D, linux, Go 1.27.1, `-count 6`,
 `-ldflags=-funcalign=64`, medians, pinned to the six cores of one CCD
-(`taskset -c 0-5`), 2026-09-27, at commit 8aa4256. Rows move by up to
+(`taskset -c 0-5`), 2026-09-27, at commit 45b42e8. Rows move by up to
 10% from one day's run to the next with nothing changed; compare
 commits back to back, not across these files. Lua 5.5.1 and LuaJIT
 2.1.1788460057 from Arch Linux's packages, measured on 2026-09-25 at commit

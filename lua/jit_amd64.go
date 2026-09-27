@@ -38,21 +38,22 @@ const maxOffset = 1 << 30
 // compiler, each instruction's code checks everything it needs before it
 // writes anything.
 type amd64Compiler struct {
-	a       Asm
-	p       *prototype
-	g       *globalState  // the state p runs in, whose string metatable SELF reads
-	cl      *luaClosure   // the closure being compiled, whose upvalues kernels speculate on
-	frame   []value       // its registers when it compiled at a loop latch, which hint kernels' types, or nil
-	resume  map[int]Label // where compiled code enters at a pc to go on in a kernel, when not the pc's code
-	code    []bytecode.Instruction
-	pcs     []Label
-	exits   []Label
-	budget  []Label
-	goCall  []Label // exits at a CALL of a Go function, created on demand
-	plainGo []Label // goCallee's code for a Go function no number function (plainGoCall)
-	numCall []Label // exits at a CALL of a number function, created on demand
-	notLua  []Label // a CALL's out-of-line code for callees other than Lua closures
-	strSelf []Label // a SELF's out-of-line code for receivers other than tables
+	a        Asm
+	p        *prototype
+	g        *globalState  // the state p runs in, whose string metatable SELF reads
+	cl       *luaClosure   // the closure being compiled, whose upvalues kernels speculate on
+	frame    []value       // its registers when it compiled at a loop latch, which hint kernels' types, or nil
+	resume   map[int]Label // where compiled code enters at a pc to go on in a kernel, when not the pc's code
+	ordinary map[int]Label // a pc's code past the kernels there, where kernels that leave at the pc go
+	code     []bytecode.Instruction
+	pcs      []Label
+	exits    []Label
+	budget   []Label
+	goCall   []Label // exits at a CALL of a Go function, created on demand
+	plainGo  []Label // goCallee's code for a Go function no number function (plainGoCall)
+	numCall  []Label // exits at a CALL of a number function, created on demand
+	notLua   []Label // a CALL's out-of-line code for callees other than Lua closures
+	strSelf  []Label // a SELF's out-of-line code for receivers other than tables
 	// outOfLine emit code instructions branch to rarely, after the
 	// function's: buffers in table instructions, and kernels' side exits.
 	outOfLine  []func()
@@ -76,7 +77,7 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (co
 	if len(p.Code) > 1<<16 {
 		return nil, nil, nil, 0
 	}
-	c := &amd64Compiler{p: p, g: g, cl: cl, frame: frame, code: p.jitOrig, sse41: HasSSE41(), kernelExit: -1, resume: map[int]Label{}}
+	c := &amd64Compiler{p: p, g: g, cl: cl, frame: frame, code: p.jitOrig, sse41: HasSSE41(), kernelExit: -1, resume: map[int]Label{}, ordinary: map[int]Label{}}
 	c.pcs = make([]Label, len(c.code))
 	c.exits = make([]Label, len(c.code))
 	c.budget = make([]Label, len(c.code))
@@ -94,10 +95,15 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (co
 	c.prologue()
 	loops := map[int][]*kernel{}
 	for ip, i := range c.p.Code {
-		if i.OpCode() == bytecode.OpForLoop && !isExtraArg(c.p.Code, ip) {
+		switch {
+		case i.OpCode() == bytecode.OpForLoop && !isExtraArg(c.p.Code, ip):
 			if ks := c.findKernels(ip); ks != nil {
 				loops[ip] = ks
 			}
+		case i.OpCode() == bytecode.OpJump && i.A() == 0 && i.SBx() < 0 && !isConsumed(c.p.Code, ip):
+			// A while loop's JMP back: its kernels start at its start.
+			start := ip + 1 + i.SBx()
+			loops[start] = append(loops[start], c.findKernels(ip)...)
 		}
 	}
 	for ip := 0; ip < len(c.code); ip++ {
@@ -106,6 +112,10 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (co
 			normal := c.a.NewLabel()
 			c.emitKernel(k, normal)
 			c.a.Bind(normal)
+		}
+		if loops[ip] != nil {
+			c.ordinary[ip] = c.a.NewLabel()
+			c.a.Bind(c.ordinary[ip])
 		}
 		ip += c.instruction(ip)
 	}

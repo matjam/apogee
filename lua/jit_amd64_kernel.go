@@ -46,6 +46,9 @@ func (c *amd64Compiler) findKernels(latch int) []*kernel {
 	var ks []*kernel
 	var plans []*kernelPlan
 	for _, intLoop := range []bool{true, false} {
+		if !intLoop && c.p.Code[latch].OpCode() == bytecode.OpJump {
+			break // a while loop has no loop registers to be floats
+		}
 		plans = append(plans, planKernel(c.p, latch, intLoop, env))
 		if c.frame == nil { // guesses with nothing to go on: floats too
 			env.floats = true
@@ -101,8 +104,9 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 		a.Store(rCtx, offEntry, rTmp)
 	}
 	body, latch, done := a.NewLabel(), a.NewLabel(), a.NewLabel()
-	// The first FORLOOP: nothing has changed if the loop does not run.
-	c.kernelStep(k, body, c.pcs[k.latch+1])
+	if !k.while { // the first FORLOOP: nothing has changed if the loop does not run
+		c.kernelStep(k, body, c.pcs[k.latch+1])
+	}
 
 	a.Bind(body)
 	labels := map[int]Label{k.latch: latch}
@@ -120,23 +124,11 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 		} else {
 			loads, store := k.spills(in)
 			for _, v := range loads {
-				if r := reg(k.vregs[v].r); k.typeOf(v) == kindTable {
-					a.Load(k.ireg(v), r.base, r.off+offP)
-				} else if k.typeOf(v) == kindInt {
-					a.Load(k.ireg(v), r.base, r.off+offN)
-				} else {
-					a.LoadSD(k.reg(v), r.base, r.off+offN)
-				}
+				c.loadVreg(k, v, reg(k.vregs[v].r))
 			}
 			c.kernelInstruction(k, in, label)
 			if store != noVreg {
-				if r := reg(k.vregs[store].r); k.typeOf(store) == kindTable {
-					c.storeTable(r, k.ireg(store))
-				} else if k.typeOf(store) == kindInt {
-					c.storeInteger(r, k.ireg(store))
-				} else {
-					c.storeNumber(r, k.reg(store))
-				}
+				c.storeVreg(k, store, reg(k.vregs[store].r))
 			}
 		}
 	}
@@ -145,7 +137,9 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 	}
 	a.Bind(latch)
 	next := a.NewLabel()
-	c.kernelStep(k, next, done)
+	if !k.while { // a while loop leaves by its tests: its JMP back only spends budget
+		c.kernelStep(k, next, done)
+	}
 	a.Bind(next)
 	out := a.NewLabel()
 	a.SubMem(rCtx, offBudget, 1)
@@ -158,9 +152,11 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 		c.budget[k.start] = a.NewLabel()
 	}
 	a.Jmp(c.budget[k.start])
-	a.Bind(done)
-	c.flush(k, end)
-	a.Jmp(c.pcs[k.latch+1])
+	if !k.while {
+		a.Bind(done)
+		c.flush(k, end)
+		a.Jmp(c.pcs[k.latch+1])
+	}
 }
 
 // kernelGuards jumps to normal unless each upvalue k calls holds its
@@ -287,7 +283,7 @@ func (c *amd64Compiler) kernelSideExit(k *kernel, n int, counted bool) Label {
 		if s.top >= 0 {
 			c.setTop(s.top)
 		}
-		a.Jmp(c.pcs[s.pc])
+		a.Jmp(c.ordinaryAt(s.pc))
 	})
 	return l
 }
@@ -607,13 +603,8 @@ func (c *amd64Compiler) flush(k *kernel, s *irSnap) {
 		if r.v != noVreg && k.spilled(r.v) {
 			continue // in its stack slot already
 		}
-		switch r.t {
-		case kindTable:
-			c.storeTable(reg(r.r), k.ireg(r.v))
-		case kindInt:
-			c.storeInteger(reg(r.r), k.ireg(r.v))
-		case kindFloat:
-			c.storeNumber(reg(r.r), k.reg(r.v))
+		if isRegKind(r.t) {
+			c.storeVreg(k, r.v, reg(r.r))
 		}
 	}
 	// A register aliasing a hoisted buffer gets the upvalue's value, as
@@ -811,11 +802,28 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		a.XorPD(4, 3)
 		a.MovSD(k.reg(in.dst), 4)
 	case irBranch:
+		if in.cmp == bytecode.OpTest { // of a boolean: to target when it is flag
+			var yes Label
+			if in.target >= 0 {
+				yes = label(in.target)
+			} else {
+				yes = c.kernelSideExit(k, in.snap, false)
+			}
+			r := k.ireg(in.a.v)
+			a.Test(r, r)
+			if in.flag {
+				a.J(NE, yes)
+			} else {
+				a.J(E, yes)
+			}
+			a.Jmp(label(in.pc + 2))
+			break
+		}
 		var yes Label
 		if in.target >= 0 {
 			yes = label(in.target)
 		} else {
-			yes = c.kernelSideExit(k, in.snap, true)
+			yes = c.kernelSideExit(k, in.snap, false) // it ends the loop: no short run
 		}
 		no := label(in.pc + 2)
 		if in.a.t == kindInt && in.b.t == kindInt {
@@ -848,6 +856,10 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		c.kernelGetBuffer(k, in)
 	case irBufSet:
 		c.kernelSetBuffer(k, in)
+	case irBoolNot:
+		a.MovImm(AX, 1)
+		a.Xor(AX, k.ireg(in.a.v))
+		a.Mov(k.ireg(in.dst), AX)
 	case irCopyUp:
 		c.kernelUpValue(int(in.imm))
 		c.copyToReg(in.obj, AX, 0)
@@ -962,6 +974,17 @@ func (c *amd64Compiler) tableValue(k *kernel, in *irInst, exit Label) {
 		a.CmpImm(DX, 1)
 		a.J(NE, exit)
 		a.Load(k.ireg(in.dst), AX, offN)
+	case kindBool:
+		a.Load(DX, AX, offN)
+		a.Shr(DX, kindShift)
+		a.CmpImm(DX, int32(vkBool))
+		a.J(NE, exit)
+		a.Load(DX, AX, offP)
+		a.Sub(DX, rNumber)
+		a.CmpImm(DX, 1)
+		a.J(BE, exit) // a number whose bits match the tag
+		a.Load(k.ireg(in.dst), AX, offN)
+		a.AndImm(k.ireg(in.dst), 1)
 	case kindTable:
 		a.Load(DX, AX, offN)
 		a.Shr(DX, kindShift)
@@ -981,6 +1004,19 @@ func (c *amd64Compiler) tableStore(k *kernel, in *irInst) {
 	a := &c.a
 	v := in.c
 	t := v.t
+	if t == kindBool {
+		if v.isConst() {
+			bit, _ := v.constant(c.p).boolean()
+			a.MovImm(DX, tagOf(vkBool)|uint64(b2i(bit)))
+		} else {
+			a.MovImm(DX, tagOf(vkBool))
+			a.Or(DX, k.ireg(v.v))
+		}
+		a.Store(AX, offN, DX)
+		a.MovImm(DX, uint64(uintptr(boolPtr())))
+		a.Store(AX, offP, DX)
+		return
+	}
 	switch {
 	case v.isConst():
 		n := c.p.Constants[v.k]
@@ -1012,36 +1048,12 @@ func (c *amd64Compiler) tableStore(k *kernel, in *irInst) {
 // kernelLoad checks that the Lua register of each of vs holds a value of
 // its type, branching to fail if not, then loads those not spilled.
 func (c *amd64Compiler) kernelLoad(k *kernel, vs []vreg, fail Label) {
-	a := &c.a
 	for _, v := range vs {
-		r := reg(k.vregs[v].r)
-		if k.typeOf(v) == kindTable {
-			a.Load(rTmp, r.base, r.off+offN)
-			a.MovImm(rTmp2, tagOf(vkTable))
-			a.Cmp(rTmp, rTmp2)
-			a.J(NE, fail)
-			a.Load(rTmp, r.base, r.off+offP)
-			c.branchNumber(rTmp, fail) // a number whose bits match the tag
-			continue
-		}
-		a.Load(rTmp, r.base, r.off+offP)
-		a.Sub(rTmp, rNumber) // 0 for a float, 1 for an integer
-		if k.typeOf(v) == kindInt {
-			a.CmpImm(rTmp, 1)
-		} else {
-			a.Test(rTmp, rTmp)
-		}
-		a.J(NE, fail)
+		c.checkVreg(k, v, reg(k.vregs[v].r), fail)
 	}
 	for _, v := range vs {
-		if r := reg(k.vregs[v].r); k.spilled(v) {
-			continue // in its stack slot already
-		} else if k.typeOf(v) == kindTable {
-			a.Load(k.ireg(v), r.base, r.off+offP)
-		} else if k.typeOf(v) == kindInt {
-			a.Load(k.ireg(v), r.base, r.off+offN)
-		} else {
-			a.LoadSD(k.reg(v), r.base, r.off+offN)
+		if !k.spilled(v) { // else in its stack slot already
+			c.loadVreg(k, v, reg(k.vregs[v].r))
 		}
 	}
 }
@@ -1058,7 +1070,7 @@ func (c *amd64Compiler) kernelResume(k *kernel, pc int, label func(int) Label) {
 	l := a.NewLabel()
 	c.resume[pc] = l
 	c.outOfLine = append(c.outOfLine, func() {
-		fail, ordinary := a.NewLabel(), c.pcs[pc]
+		fail, ordinary := a.NewLabel(), c.ordinaryAt(pc)
 		a.Bind(l)
 		a.CmpMem(rCtx, offBarrier, 0)
 		a.J(NE, ordinary)
@@ -1115,4 +1127,77 @@ func (c *amd64Compiler) countKernel(k *kernel) {
 		counter += 8
 	}
 	c.a.SubMem(rCtx, counter, -1)
+}
+
+// checkVreg branches to fail unless the value at o has v's type. It uses
+// rTmp and rTmp2, so runs before a kernel loads its registers.
+func (c *amd64Compiler) checkVreg(k *kernel, v vreg, o operand, fail Label) {
+	a := &c.a
+	switch t := k.typeOf(v); t {
+	case kindTable:
+		a.Load(rTmp, o.base, o.off+offN)
+		a.MovImm(rTmp2, tagOf(vkTable))
+		a.Cmp(rTmp, rTmp2)
+		a.J(NE, fail)
+		a.Load(rTmp, o.base, o.off+offP)
+		c.branchNumber(rTmp, fail) // a number whose bits match the tag
+	case kindBool:
+		a.Load(rTmp, o.base, o.off+offP)
+		a.MovImm(rTmp2, uint64(uintptr(boolPtr())))
+		a.Cmp(rTmp, rTmp2)
+		a.J(NE, fail)
+	default:
+		a.Load(rTmp, o.base, o.off+offP)
+		a.Sub(rTmp, rNumber) // 0 for a float, 1 for an integer
+		if t == kindInt {
+			a.CmpImm(rTmp, 1)
+		} else {
+			a.Test(rTmp, rTmp)
+		}
+		a.J(NE, fail)
+	}
+}
+
+// loadVreg loads v from the value at o, which has its type.
+func (c *amd64Compiler) loadVreg(k *kernel, v vreg, o operand) {
+	a := &c.a
+	switch k.typeOf(v) {
+	case kindTable:
+		a.Load(k.ireg(v), o.base, o.off+offP)
+	case kindInt:
+		a.Load(k.ireg(v), o.base, o.off+offN)
+	case kindBool:
+		a.Load(k.ireg(v), o.base, o.off+offN)
+		a.AndImm(k.ireg(v), 1)
+	default:
+		a.LoadSD(k.reg(v), o.base, o.off+offN)
+	}
+}
+
+// storeVreg stores v as a value at o.
+func (c *amd64Compiler) storeVreg(k *kernel, v vreg, o operand) {
+	a := &c.a
+	switch k.typeOf(v) {
+	case kindTable:
+		c.storeTable(o, k.ireg(v))
+	case kindInt:
+		c.storeInteger(o, k.ireg(v))
+	case kindBool:
+		a.MovImm(rTmp, tagOf(vkBool))
+		a.Or(rTmp, k.ireg(v))
+		a.Store(o.base, o.off+offN, rTmp)
+		a.MovImm(rTmp, uint64(uintptr(boolPtr())))
+		a.Store(o.base, o.off+offP, rTmp)
+	default:
+		c.storeNumber(o, k.reg(v))
+	}
+}
+
+// ordinaryAt returns the label of the ordinary code for pc, past any
+// kernels that start there: a while loop's kernel leaves at its start.
+func (c *amd64Compiler) ordinaryAt(pc int) Label {
+	if l, ok := c.ordinary[pc]; ok {
+		return l
+	}
+	return c.pcs[pc]
 }

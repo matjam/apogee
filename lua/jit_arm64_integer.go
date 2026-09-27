@@ -10,10 +10,9 @@ import (
 )
 
 // divide compiles % and // of two integers, as IntMod and IntFloorDiv
-// compute them, // of floats, and % of floats by a constant
-// floatModDivisor accepts. A zero divisor exits, for Go to raise the
-// error, as does % of floats by anything else, which Go computes with
-// fmod.
+// compute them, and // and % of floats: by a constant floatModDivisor
+// accepts in a few instructions, and by anything else with math.Mod's
+// steps (floatModAny). A zero divisor exits, for Go to raise the error.
 func (c *arm64Compiler) divide(ip int, op bytecode.OpCode, i bytecode.Instruction) {
 	a := &c.a
 	b, kb, okB := c.rkArith(i.B())
@@ -23,17 +22,13 @@ func (c *arm64Compiler) divide(ip int, op bytecode.OpCode, i bytecode.Instructio
 	if op == bytecode.OpMod && bytecode.IsConstant(i.C()) {
 		modBy, floatMod = floatModDivisor(c.p.Constants[bytecode.ConstantIndex(i.C())])
 	}
-	floatsExit := op == bytecode.OpMod && !floatMod
-	if !okB || !okC || floatsExit && (kb == kindFloat || kc == kindFloat) {
+	if !okB || !okC {
 		c.exitAlways(ip)
 		return
 	}
 	dst := reg(i.A())
 	c.guardStore(dst, noReg, ip)
 	floats, done := a.NewLabel(), a.NewLabel()
-	if floatsExit {
-		floats = c.exit(ip)
-	}
 	if plan, ok := constantDivisor(c.p, i.C()); ok && kb != kindFloat {
 		c.branchUnlessInteger(b, kb, floats)
 		a.Ldr(rP, b.base, b.off+offN)
@@ -74,28 +69,102 @@ func (c *arm64Compiler) divide(ip int, op bytecode.OpCode, i bytecode.Instructio
 		}
 		a.B(done)
 	}
-	if !floatsExit {
-		a.Bind(floats)
-		c.loadFloat(0, b, kb, false, ip)
-		if op == bytecode.OpMod {
-			c.floatMod(modBy, c.exit(ip))
-			c.storeNumber(dst, 3)
-		} else {
-			c.loadFloat(1, cc, kc, false, ip)
-			a.Fdiv(0, 0, 1)
-			a.Frintm(0, 0)
-			c.storeNumber(dst, 0)
-		}
+	a.Bind(floats)
+	c.loadFloat(0, b, kb, false, ip)
+	switch {
+	case floatMod:
+		c.floatMod(modBy)
+		c.storeNumber(dst, 3)
+	case op == bytecode.OpMod:
+		c.loadFloat(1, cc, kc, false, ip)
+		c.floatModAny(c.exit(ip))
+		c.storeNumber(dst, 3)
+	default:
+		c.loadFloat(1, cc, kc, false, ip)
+		a.Fdiv(0, 0, 1)
+		a.Frintm(0, 0)
+		c.storeNumber(dst, 0)
 	}
+	a.Bind(done)
+}
+
+// floatModAny computes D0 % D1 into D3, as FloatMod does, with math.Mod's
+// own steps: while r = |a| >= |b|, subtract |b| scaled by the power of
+// two that leaves r nonnegative, each step exact. Positive floats order
+// as their bits do, so it works on those; the scaling adds to the
+// exponent. An infinite or NaN a, and a zero or NaN b, give Go's NaN, as
+// math.Mod does; an infinite b leaves a. A subnormal b goes to other,
+// for Go. It uses D2 to D4, rTmp, rTmp2, rP, rN, rT, rT2 and rIdx.
+func (c *arm64Compiler) floatModAny(other Label) {
+	a := &c.a
+	a.FmovFromF(rP, 0) // a's bits, for its sign
+	a.FmovFromF(rT2, 1)
+	a.MovImm(rTmp, 1<<63-1)
+	a.And(rT2, rT2, rTmp) // |b|
+	a.And(rN, rP, rTmp)   // r = |a|
+	loop, out, nan, finite := a.NewLabel(), a.NewLabel(), a.NewLabel(), a.NewLabel()
+	a.Lsr(rIdx, rN, 52)
+	a.CmpImm(rIdx, 0x7ff)
+	a.BCond(EQ, nan)   // a is infinite or NaN
+	a.Cbz(rT2, nan)    // b is zero
+	a.Lsr(rT, rT2, 52) // b's exponent
+	a.CmpImm(rT, 0x7ff)
+	a.BCond(NE, finite)
+	a.MovImm(rTmp, 0x7ff<<52)
+	a.Cmp(rT2, rTmp)
+	a.BCond(NE, nan)
+	a.B(out) // b is infinite: r is |a|
+	a.Bind(finite)
+	a.Cbz(rT, other) // b is subnormal
+	a.Bind(loop)
+	a.Cmp(rN, rT2)
+	a.BCond(LO, out)
+	a.Lsr(rIdx, rN, 52)
+	a.Sub(rIdx, rIdx, rT) // r's exponent over b's
+	a.AddShifted(rTmp, ZR, rN, 12)
+	a.AddShifted(rTmp2, ZR, rT2, 12)
+	whole := a.NewLabel()
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(HS, whole)
+	a.SubImm(rIdx, rIdx, 1) // r's significand is less than b's
+	a.Bind(whole)
+	a.AddShifted(rIdx, rT2, rIdx, 52) // |b| * 2^n
+	a.FmovToF(2, rN)
+	a.FmovToF(3, rIdx)
+	a.Fsub(2, 2, 3)
+	a.FmovFromF(rN, 2)
+	a.B(loop)
+	a.Bind(out)
+	a.MovImm(rTmp, 1<<63)
+	a.And(rP, rP, rTmp)
+	a.Orr(rN, rN, rP) // a's sign
+	a.FmovToF(3, rN)
+	// Lua's correction: m takes b's sign.
+	a.FmovToF(4, ZR)
+	done, positive := a.NewLabel(), a.NewLabel()
+	a.Fcmp(3, 4)
+	a.BCond(EQ, done)
+	a.BCond(GT, positive)
+	a.Fcmp(1, 4)
+	a.BCond(LS, done) // m < 0: add a positive b
+	a.Fadd(3, 3, 1)
+	a.B(done)
+	a.Bind(positive)
+	a.Fcmp(1, 4)
+	a.BCond(GE, done) // m > 0: add a negative b
+	a.Fadd(3, 3, 1)
+	a.B(done)
+	a.Bind(nan)
+	c.goNaN(3)
 	a.Bind(done)
 }
 
 // floatMod computes D0 % d into D3, as FloatMod does, for d that
 // floatModDivisor accepts: fmod exactly, as a - trunc(a / d) * d, with the
 // sign of a when it is zero, then Lua's correction toward d's sign. An
-// infinite or NaN a goes to nonFinite: Go's NaN may have another sign
-// bit. It uses D1 to D4 and rTmp, which kernels leave free.
-func (c *arm64Compiler) floatMod(d float64, nonFinite Label) {
+// infinite or NaN a gives Go's NaN, as math.Mod does. It uses D1 to D4
+// and rTmp, which kernels leave free.
+func (c *arm64Compiler) floatMod(d float64) {
 	a := &c.a
 	a.MovImm(rTmp, math.Float64bits(d))
 	a.FmovToF(1, rTmp)
@@ -103,10 +172,10 @@ func (c *arm64Compiler) floatMod(d float64, nonFinite Label) {
 	a.Frintz(2, 2)
 	a.Fmul(2, 2, 1)
 	a.Fsub(3, 0, 2)
+	nonzero, done, nan := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	a.Fcmp(3, 3)
-	a.BCond(VS, nonFinite) // NaN only from an infinite or NaN a
+	a.BCond(VS, nan) // NaN only from an infinite or NaN a
 	a.FmovToF(4, ZR)
-	nonzero, done := a.NewLabel(), a.NewLabel()
 	a.Fcmp(3, 4)
 	a.BCond(NE, nonzero) // unordered too
 	a.Fmul(3, 0, 4)      // a zero with a's sign, as fmod gives
@@ -118,7 +187,17 @@ func (c *arm64Compiler) floatMod(d float64, nonFinite Label) {
 		a.BCond(LS, done) // add d to a positive m
 	}
 	a.Fadd(3, 3, 1)
+	a.B(done)
+	a.Bind(nan)
+	c.goNaN(3)
 	a.Bind(done)
+}
+
+// goNaN loads math.NaN(), which math.Mod returns and arm64 arithmetic
+// does not, into d. It uses rTmp.
+func (c *arm64Compiler) goNaN(d FReg) {
+	c.a.MovImm(rTmp, math.Float64bits(math.NaN()))
+	c.a.FmovToF(d, rTmp)
 }
 
 // divideByConstant computes n % d or n // d, floored, for the constant d

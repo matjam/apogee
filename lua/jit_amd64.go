@@ -519,8 +519,24 @@ func (c *amd64Compiler) compare(op bytecode.OpCode, jump bool, x, y XReg, yes, n
 	a.Jmp(no)
 }
 
-// equal compiles EQ, whose operands may be any values. Numbers compare as
-// floats. Other values are equal when both words are, and when they are
+// floatEqualsInt branches to eq when the float in X0 equals the integer
+// in r, which it does when it converts to that integer and back to
+// itself, and to ne otherwise. It uses rT and X1.
+func (c *amd64Compiler) floatEqualsInt(r Reg, eq, ne Label) {
+	a := &c.a
+	a.Cvttsd2si(rT, 0) // -2^63 for NaN and out of range, which convert back to another float
+	c.toFloat(1, rT)
+	a.Ucomisd(0, 1)
+	a.J(P, ne)
+	a.J(NE, ne)
+	a.Cmp(rT, r)
+	a.J(E, eq)
+	a.Jmp(ne)
+}
+
+// equal compiles EQ, whose operands may be any values. Floats compare as
+// floats, and a float and an integer exactly (floatEqualsInt). Other
+// values, integers among them, are equal when both words are, and when they are
 // not can be equal only as strings of the same length, whose bytes it
 // compares up to maxInlineCompare, or through __eq, which only two tables or two userdata try: it exits
 // for those, unless both tables' metatables are known to lack __eq.
@@ -545,18 +561,21 @@ func (c *amd64Compiler) equal(ip int, i bytecode.Instruction) {
 		eq, ne = no, yes
 	}
 	if kb, kc := c.isNumberConstant(i.B()), c.isNumberConstant(i.C()); kb || kc {
-		// Against a float, only another number can be equal; Go compares
-		// an integer with it.
-		if o := cc; !kb || !kc {
+		// Against a float, only another number can be equal.
+		if o, k := cc, b; !kb || !kc {
 			if !kb {
-				o = b
+				o, k = b, cc
 			}
-			floats := a.NewLabel()
+			floats, integer := a.NewLabel(), a.NewLabel()
 			a.Load(rP, o.base, o.off+offP)
 			a.Cmp(rP, rNumber)
 			a.J(E, floats)
-			c.branchNumber(rP, c.exit(ip))
+			c.branchNumber(rP, integer)
 			a.Jmp(ne)
+			a.Bind(integer)
+			a.LoadSD(0, k.base, k.off+offN)
+			a.Load(rIdx, o.base, o.off+offN)
+			c.floatEqualsInt(rIdx, eq, ne)
 			a.Bind(floats)
 		}
 		a.LoadSD(0, b.base, b.off+offN)
@@ -574,11 +593,15 @@ func (c *amd64Compiler) equal(ip int, i bytecode.Instruction) {
 	a.Load(rTmp, cc.base, cc.off+offP)
 	a.Cmp(rP, rNumber)
 	a.J(NE, notNumber)
-	floats := a.NewLabel()
+	floats, integer := a.NewLabel(), a.NewLabel()
 	a.Cmp(rTmp, rNumber)
 	a.J(E, floats)
-	c.branchNumber(rTmp, exit) // a float and an integer: Go compares them
+	c.branchNumber(rTmp, integer)
 	a.Jmp(ne)
+	a.Bind(integer) // a float and an integer
+	a.LoadSD(0, b.base, b.off+offN)
+	a.Load(rIdx, cc.base, cc.off+offN)
+	c.floatEqualsInt(rIdx, eq, ne)
 	a.Bind(floats)
 	a.LoadSD(0, b.base, b.off+offN)
 	a.LoadSD(1, cc.base, cc.off+offN)
@@ -592,16 +615,17 @@ func (c *amd64Compiler) equal(ip int, i bytecode.Instruction) {
 	a.J(E, eq)
 	a.Jmp(ne) // one address, other bits: true and false, integers, or strings' lengths
 	a.Bind(differ)
-	// Other first words. An integer and a float may be equal, which Go
-	// decides; a number and anything else are not.
+	// Other first words. An integer and a float may be equal; a number
+	// and anything else are not.
 	notInteger := a.NewLabel()
 	a.Mov(rIdx, rP)
 	a.Sub(rIdx, rNumber)
 	a.CmpImm(rIdx, 1)
 	a.J(NE, notInteger)
 	a.Cmp(rTmp, rNumber)
-	a.J(E, exit)
-	a.Jmp(ne)
+	a.J(NE, ne)
+	a.MovqToX(0, rTmp2)
+	c.floatEqualsInt(rN, eq, ne)
 	a.Bind(notInteger)
 	a.Mov(rIdx, rTmp)
 	a.Sub(rIdx, rNumber)
@@ -674,12 +698,92 @@ func (c *amd64Compiler) length(ip int, i bytecode.Instruction) {
 	a.Load(rN, src.base, src.off+offN)
 	a.Mov(rTmp, rN)
 	a.Shr(rTmp, kindShift)
+	done, notString, table := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	a.CmpImm(rTmp, int32(vkString))
-	a.J(NE, exit)
+	a.J(NE, notString)
 	a.MovImm(rTmp, tagOf(vkString))
 	a.Sub(rN, rTmp)
+	a.Jmp(done)
+	a.Bind(notString)
+	a.CmpImm(rTmp, int32(vkTable))
+	a.J(E, table)
+	a.CmpImm(rTmp, int32(vkUserData))
+	a.J(NE, exit)
+	a.Load(rTmp, rP, offUDBuf) // a buffer's length; other userdata's is Go's
+	a.Test(rTmp, rTmp)
+	a.J(E, exit)
+	a.Load(rN, rTmp, offBufLen)
+	a.Jmp(done)
+	a.Bind(table)
+	c.tableLength(exit)
+	a.Bind(done)
 	c.guardStore(dst, noReg, ip)
 	c.storeInteger(dst, rN)
+}
+
+// tableLength computes the length of the table in rP into rN, as
+// table.length does: the array part's length when its last element is
+// not nil and there is no hash part, and a border found by binary search
+// when it is nil. It exits for a table whose metatable may have __len,
+// or whose border may be in its hash part. It uses rTmp, rIdx, rT and
+// rT2.
+func (c *amd64Compiler) tableLength(exit Label) {
+	a := &c.a
+	noMeta := a.NewLabel()
+	a.Load(rT, rP, offTMeta)
+	a.Test(rT, rT)
+	a.J(E, noMeta)
+	a.Load8(rIdx, rT, offTFlags)
+	a.Bt(rIdx, uint8(tmLen))
+	a.J(AE, exit) // the metatable may have __len
+	a.Bind(noMeta)
+	done, full, search := a.NewLabel(), a.NewLabel(), a.NewLabel()
+	a.Load(rN, rP, offTArray+offSliceLen) // j
+	a.Test(rN, rN)
+	a.J(E, full)
+	a.Load(rTmp, rP, offTArray)
+	a.Mov(rIdx, rN)
+	c.elementP(rIdx)
+	a.J(E, search) // array[j-1] is nil
+	a.Bind(full)
+	a.Load(rT, rP, offTHash)
+	a.Test(rT, rT)
+	a.J(NE, exit)
+	a.Jmp(done)
+	a.Bind(search) // for a border between i, in rT2, and j
+	loop, found := a.NewLabel(), a.NewLabel()
+	a.MovImm(rT2, 0)
+	a.Bind(loop)
+	a.Mov(rIdx, rN)
+	a.Sub(rIdx, rT2)
+	a.CmpImm(rIdx, 1)
+	a.J(BE, found)
+	a.Mov(rIdx, rN)
+	a.Add(rIdx, rT2)
+	a.Shr(rIdx, 1) // m
+	a.Mov(rT, rIdx)
+	c.elementP(rT)
+	nonNil := a.NewLabel()
+	a.J(NE, nonNil)
+	a.Mov(rN, rIdx)
+	a.Jmp(loop)
+	a.Bind(nonNil)
+	a.Mov(rT2, rIdx)
+	a.Jmp(loop)
+	a.Bind(found)
+	a.Mov(rN, rT2)
+	a.Bind(done)
+}
+
+// elementP loads the first word of array element r-1, from the array at
+// rTmp, into r and tests it: E when the element is nil.
+func (c *amd64Compiler) elementP(r Reg) {
+	a := &c.a
+	a.SubImm(r, 1)
+	a.Shl(r, 4)
+	a.Add(r, rTmp)
+	a.Load(r, r, offP)
+	a.Test(r, r)
 }
 
 // signMask loads the sign bit into x.

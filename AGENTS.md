@@ -369,7 +369,8 @@ nothing compiles.
     check sits out of line, after the Lua closure check, so Lua-to-Lua
     calls neither run it nor have it in their code path.
   - Other exits at CALL and at RETURN are run by the driver, as are
-    CLOSURE, NEWTABLE, LEN, generic table access, SETLIST into a short
+    CLOSURE, NEWTABLE, LEN of a table with a hash part or `__len`,
+    generic table access, SETLIST into a short
     array and upvalue-closing JMPs (`jitStep`). Compiled code then carries
     on after the instruction.
   - `runJIT` reloads the closure and prototype only when `l.callInfo`
@@ -630,7 +631,7 @@ The gap is architectural:
   - calls into Go, including a tail call of one, such as
     `return setmetatable(obj, mt)`;
   - NEWTABLE and CLOSURE;
-  - CONCAT and table LEN;
+  - CONCAT, and LEN of a table with a hash part or `__len`;
   - GETTABLE and SETTABLE with keys other than constant strings and
     array indices;
   - the generic for's TFORCALL.
@@ -714,10 +715,10 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
   which about 4.5 ns is compiled code around it, and the rest is the
   API's Go frame and the round trip. The other exits left on every
   iteration are allocations (`NEWTABLE`, `CLOSURE`), tail calls of Go
-  functions (every `return setmetatable(obj, mt)` constructor), CALL
-  with a variable number of results, GETTABLE and SETTABLE with keys that
-  are not constant strings or array indices, LEN of a table, CONCAT, and
-  the sort comparator's return to Go.
+  functions (every `return setmetatable(obj, mt)` constructor), calls of
+  vararg functions, GETTABLE and SETTABLE with keys that are not constant
+  strings or array indices, CONCAT, and the sort comparator's return to
+  Go.
 - CD, the one standard benchmark slower than C Lua 5.5, spends about a
   fifth of its time in `jitStep`, most of that creating tables
   (`newTableAt`) and storing into their hash parts (`setTableAt`): the
@@ -816,7 +817,7 @@ In order of expected payoff for real-time scripts such as visualisers:
    compiled code from a pre-allocated pool.
 6. **More native instructions:** TFORCALL/TFORLOOP with fast paths for
    `ipairs` and `pairs` over array parts; CONCAT into a reusable buffer;
-   vararg; LEN of a table; GETTABLE and SETTABLE with string keys in
+   vararg; GETTABLE and SETTABLE with string keys in
    registers.
 
 7. **The barrier and budget in registers on amd64**, where they live in

@@ -275,9 +275,12 @@ func (c *amd64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	a.J(LE, exit)
 	c.spend(ip) // a loop of tail calls has no back-edge
 	// Move the callee and its arguments down to stack[ci.function:], one
-	// slot below the frame.
-	a.Mov(DX, rFrame)
-	a.SubImm(DX, int32(valueSize))
+	// slot below the frame, or further in a vararg function, whose
+	// arguments lie between; the callee's frame starts after it.
+	a.Load(DX, R8, offCIFunction)
+	a.Shl(DX, 4)
+	a.Load(AX, R12, offStack)
+	a.Add(DX, AX)
 	for k := range b {
 		src := reg(ra + k)
 		a.Load(AX, rFrame, src.off+offP)
@@ -285,6 +288,8 @@ func (c *amd64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 		a.Load(AX, rFrame, src.off+offN)
 		a.Store(DX, uint32(k)*valueSize+offN, AX)
 	}
+	a.Mov(rFrame, DX)
+	a.AddImm(rFrame, int32(valueSize))
 	// Clear the parameters the call does not pass.
 	loop, cleared := a.NewLabel(), a.NewLabel()
 	a.Load(CX, R11, offPParams)
@@ -312,6 +317,7 @@ func (c *amd64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	a.Store(DX, offLClosure, R10)
 	a.Load(R13, R8, offCIFunction)
 	a.AddImm(R13, 1) // base
+	a.Store(DX, offLFrame, rFrame)
 	a.Load(AX, R11, offPMaxStack)
 	a.Store(DX, offLFrame+offSliceLen, AX)
 	a.Add(AX, R13) // top

@@ -221,8 +221,10 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	a.BCond(LE, exit)
 	c.spend(ip) // a loop of tail calls has no back-edge
 	// Move the callee and its arguments down to stack[ci.function:], one
-	// slot below the frame.
-	a.SubImm(rSlot, rFrame, valueSize)
+	// slot below the frame, or further in a vararg function, whose
+	// arguments lie between; the callee's frame starts after it.
+	a.Ldr(rTmp, rState, offStack)
+	a.AddShifted(rSlot, rTmp, rIdx, 4)
 	for k := range b {
 		src := reg(ra + k)
 		a.Ldr(rTmp, rFrame, src.off+offP)
@@ -230,6 +232,7 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 		a.Ldr(rTmp, rFrame, src.off+offN)
 		a.Str(rTmp, rSlot, uint32(k)*valueSize+offN)
 	}
+	a.AddImm(rFrame, rSlot, valueSize)
 	// Clear the parameters the call does not pass.
 	loop, cleared := a.NewLabel(), a.NewLabel()
 	a.Ldr(rN, rT2, offPParams)
@@ -254,6 +257,7 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	}
 	a.Str(rT, rP, offLClosure)
 	a.AddImm(rSlot, rIdx, 1) // base
+	a.Str(rFrame, rP, offLFrame)
 	a.Str(rLen, rP, offLFrame+offSliceLen)
 	a.AddShifted(rLen, rSlot, rLen, 0) // top = base + maxStackSize
 	a.Str(rLen, rCI, offCITop)

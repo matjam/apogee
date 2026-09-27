@@ -1099,6 +1099,86 @@ func TestJITOpenCalls(t *testing.T) {
 	}
 }
 
+// # of strings, buffers and tables without __len runs in compiled code:
+// a table's array length, or a border by binary search when its last
+// element is nil. A hash part, __len or other userdata exit, and agree.
+func TestJITLength(t *testing.T) {
+	skipWithoutJIT(t)
+	exits, stop := exitsAt("LEN")
+	defer stop()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBothWith(t, `
+		local full, holes, empty = {}, {1, 2, 3, nil, 5, nil, nil, nil}, {}
+		for i = 1, 100 do full[i] = i end
+		local sparse = {1, 2, 3}
+		sparse[1000] = 1 -- a hash part: Go searches it
+		local plain = setmetatable({1, 2}, {}) -- the first # caches its metatable's lack of __len
+		local counted = setmetatable({1}, {__len = function() return 42 end})
+		function run()
+		  local s = 0
+		  for i = 1, 2000 do -- no exits
+		    s = s + #full + #holes + #empty + #plain + #"abc" + #f64
+		    holes[i % 8 + 1] = (i % 3 == 0) and i or nil
+		  end
+		  local t = {}
+		  for i = 1, 20 do t[#t + 1] = #sparse + #counted end
+		  return s, #full, #holes, #empty, #plain, #t, #sparse, #counted, pcall(function() return #io.stdout end)
+		end`, func(l *State) {
+		l.PushBuffer(make([]float64, 7))
+		l.SetGlobal("f64")
+	})
+	if jit != interp {
+		t.Fatalf("JIT %q, interpreter %q", jit, interp)
+	}
+	if *exits != 21+21+1+1 { // sparse, counted, io.stdout and the first plain
+		t.Fatalf("LEN exited %d times", *exits)
+	}
+}
+
+// exitsAt counts compiled code's exits at instructions whose exitKind
+// starts with kind, until stop.
+func exitsAt(kind string) (count *int, stop func()) {
+	n := 0
+	jitExitHook = func(p *prototype, ip int, reason uint64) {
+		if strings.HasPrefix(exitKind(p, ip, reason), kind) {
+			n++
+		}
+	}
+	return &n, func() { jitExitHook = nil }
+}
+
+// EQ of a float and an integer runs in compiled code, exactly: equal only
+// when the float has that integer value.
+func TestJITMixedEqual(t *testing.T) {
+	skipWithoutJIT(t)
+	exits, stop := exitsAt("EQ")
+	defer stop()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBoth(t, `
+		local xs = {0, -0.0, 1, 1.0, 1.5, -3, -3.0, 2^53, 2^53 + 1, 2^63, -2^63, math.maxinteger,
+		  math.mininteger, 0/0, 1/0, -1/0, 9007199254740993, 2^53 + 2.0, "1", true}
+		local n = #xs
+		function run()
+		  local out = {}
+		  for i = 1, n do
+		    for j = 1, n do
+		      if xs[i] == xs[j] then out[#out + 1] = i .. "=" .. j end
+		    end
+		    local x = xs[i]
+		    out[#out + 1] = tostring(x == 1) .. tostring(x == 1.0) .. tostring(1 == x) .. tostring(x ~= -3.0) .. tostring(2^63 == x)
+		  end
+		  return table.concat(out, " ")
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q, interpreter %q", jit, interp)
+	}
+	if *exits != 0 {
+		t.Fatalf("EQ exited %d times", *exits)
+	}
+}
+
 // math.floor, ceil, abs, min and max compile inline, and agree with Go's
 // for every kind of argument.
 func TestJITMathFunctions(t *testing.T) {

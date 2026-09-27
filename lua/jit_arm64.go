@@ -289,18 +289,88 @@ func (c *arm64Compiler) isNumberConstant(field int) bool {
 // the kind, as an integer; anything else exits, and Go measures a table.
 func (c *arm64Compiler) length(ip int, i bytecode.Instruction) {
 	a := &c.a
+	exit := c.exit(ip)
 	src, dst := reg(i.B()), reg(i.A())
 	a.Ldr(rP, src.base, src.off+offP)
-	c.branchNumber(rP, c.exit(ip)) // a number whose bits match the tag
+	c.branchNumber(rP, exit) // a number whose bits match the tag
 	a.Ldr(rN, src.base, src.off+offN)
 	a.Lsr(rTmp, rN, kindShift)
+	done, notString, table := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	a.CmpImm(rTmp, uint32(vkString))
-	a.BCond(NE, c.exit(ip))
+	a.BCond(NE, notString)
 	a.MovImm(rTmp, tagOf(vkString))
 	a.Sub(rN, rN, rTmp)
+	a.B(done)
+	a.Bind(notString)
+	a.CmpImm(rTmp, uint32(vkTable))
+	a.BCond(EQ, table)
+	a.CmpImm(rTmp, uint32(vkUserData))
+	a.BCond(NE, exit)
+	a.Ldr(rTmp, rP, offUDBuf) // a buffer's length; other userdata's is Go's
+	a.Cbz(rTmp, exit)
+	a.Ldr(rN, rTmp, offBufLen)
+	a.B(done)
+	a.Bind(table)
+	c.tableLength(exit)
+	a.Bind(done)
 	c.guardStore(dst, noReg, ip)
 	a.Str(rN, dst.base, dst.off+offN)
 	a.Str(rInteger, dst.base, dst.off+offP)
+}
+
+// tableLength computes the length of the table in rP into rN, as
+// table.length does: the array part's length when its last element is
+// not nil and there is no hash part, and a border found by binary search
+// when it is nil. It exits for a table whose metatable may have __len,
+// or whose border may be in its hash part. It uses rTmp, rIdx, rT and
+// rT2.
+func (c *arm64Compiler) tableLength(exit Label) {
+	a := &c.a
+	noMeta := a.NewLabel()
+	a.Ldr(rT, rP, offTMeta)
+	a.Cbz(rT, noMeta)
+	a.Ldrb(rIdx, rT, offTFlags)
+	a.Tbz(rIdx, uint32(tmLen), exit) // the metatable may have __len
+	a.Bind(noMeta)
+	done, full, search := a.NewLabel(), a.NewLabel(), a.NewLabel()
+	a.Ldr(rN, rP, offTArray+offSliceLen) // j
+	a.Cbz(rN, full)
+	a.Ldr(rTmp, rP, offTArray)
+	c.elementP(rIdx, rN)
+	a.Cbz(rIdx, search) // array[j-1] is nil
+	a.Bind(full)
+	a.Ldr(rT, rP, offTHash)
+	a.Cbnz(rT, exit)
+	a.B(done)
+	a.Bind(search) // for a border between i, in rT2, and j
+	loop, found := a.NewLabel(), a.NewLabel()
+	a.MovImm(rT2, 0)
+	a.Bind(loop)
+	a.Sub(rIdx, rN, rT2)
+	a.CmpImm(rIdx, 1)
+	a.BCond(LS, found)
+	a.Add(rIdx, rN, rT2)
+	a.Lsr(rIdx, rIdx, 1) // m
+	c.elementP(rT, rIdx)
+	nonNil := a.NewLabel()
+	a.Cbnz(rT, nonNil)
+	a.Mov(rN, rIdx)
+	a.B(loop)
+	a.Bind(nonNil)
+	a.Mov(rT2, rIdx)
+	a.B(loop)
+	a.Bind(found)
+	a.Mov(rN, rT2)
+	a.Bind(done)
+}
+
+// elementP loads the first word of array element n-1, from the array at
+// rTmp, into d: zero when the element is nil.
+func (c *arm64Compiler) elementP(d, n Reg) {
+	a := &c.a
+	a.SubImm(d, n, 1)
+	a.AddShifted(d, rTmp, d, 4)
+	a.Ldr(d, d, offP)
 }
 
 // rk returns the operand for an RK field.
@@ -311,8 +381,26 @@ func (c *arm64Compiler) rk(field int) (operand, bool) {
 	return c.constant(bytecode.ConstantIndex(field))
 }
 
-// equal compiles EQ, whose operands may be any values. Numbers compare as
-// floats. Other values are equal when both words are, and when they are
+// floatEqualsInt branches to eq when the float in D0 equals the integer
+// in r, which it does when it converts to that integer and back to
+// itself, and to ne otherwise. It uses rT, rT2 and D1.
+func (c *arm64Compiler) floatEqualsInt(r Reg, eq, ne Label) {
+	a := &c.a
+	a.Fcvtzs(rT, 0) // saturating: 0 for NaN, and the nearest end out of range
+	a.Scvtf(1, rT)
+	a.Fcmp(0, 1)
+	a.BCond(NE, ne) // or unordered
+	a.MovImm(rT2, 1<<63-1)
+	a.Cmp(rT, rT2)
+	a.BCond(EQ, ne) // 2^63 saturates to 2^63-1, which no float equals
+	a.Cmp(rT, r)
+	a.BCond(EQ, eq)
+	a.B(ne)
+}
+
+// equal compiles EQ, whose operands may be any values. Floats compare as
+// floats, and a float and an integer exactly (floatEqualsInt). Other
+// values, integers among them, are equal when both words are, and when they are
 // not can be equal only as strings of the same length, whose bytes it
 // compares up to maxInlineCompare, or through __eq, which only two tables or two userdata try: it exits
 // for those, unless both tables' metatables are known to lack __eq.
@@ -336,18 +424,21 @@ func (c *arm64Compiler) equal(ip int, i bytecode.Instruction) {
 		eq, ne = no, yes
 	}
 	if kb, kc := c.isNumberConstant(i.B()), c.isNumberConstant(i.C()); kb || kc {
-		// Against a float, only another number can be equal; Go compares
-		// an integer with it.
-		if o := cc; !kb || !kc {
+		// Against a float, only another number can be equal.
+		if o, k := cc, b; !kb || !kc {
 			if !kb {
-				o = b
+				o, k = b, cc
 			}
-			floats := a.NewLabel()
+			floats, integer := a.NewLabel(), a.NewLabel()
 			a.Ldr(rP, o.base, o.off+offP)
 			a.Cmp(rP, rNumber)
 			a.BCond(EQ, floats)
-			c.branchNumber(rP, c.exit(ip))
+			c.branchNumber(rP, integer)
 			a.B(ne)
+			a.Bind(integer)
+			a.LdrD(0, k.base, k.off+offN)
+			a.Ldr(rIdx, o.base, o.off+offN)
+			c.floatEqualsInt(rIdx, eq, ne)
 			a.Bind(floats)
 		}
 		a.LdrD(0, b.base, b.off+offN)
@@ -367,11 +458,15 @@ func (c *arm64Compiler) equal(ip int, i bytecode.Instruction) {
 	a.Ldr(rTmp, cc.base, cc.off+offP)
 	a.Cmp(rP, rNumber)
 	a.BCond(NE, notNumber)
-	floats := a.NewLabel()
+	floats, integer := a.NewLabel(), a.NewLabel()
 	a.Cmp(rTmp, rNumber)
 	a.BCond(EQ, floats)
-	c.branchNumber(rTmp, exit) // a float and an integer: Go compares them
+	c.branchNumber(rTmp, integer)
 	a.B(ne)
+	a.Bind(integer) // a float and an integer
+	a.LdrD(0, b.base, b.off+offN)
+	a.Ldr(rIdx, cc.base, cc.off+offN)
+	c.floatEqualsInt(rIdx, eq, ne)
 	a.Bind(floats)
 	a.LdrD(0, b.base, b.off+offN)
 	a.LdrD(1, cc.base, cc.off+offN)
@@ -387,15 +482,16 @@ func (c *arm64Compiler) equal(ip int, i bytecode.Instruction) {
 	a.BCond(EQ, eq)
 	a.B(ne) // one address, other bits: true and false, integers, or strings' lengths
 	a.Bind(differ)
-	// Other first words. An integer and a float may be equal, which Go
-	// decides; a number and anything else are not.
+	// Other first words. An integer and a float may be equal; a number
+	// and anything else are not.
 	notInteger := a.NewLabel()
 	a.Sub(rIdx, rP, rNumber)
 	a.CmpImm(rIdx, 1)
 	a.BCond(NE, notInteger)
 	a.Cmp(rTmp, rNumber)
-	a.BCond(EQ, exit)
-	a.B(ne)
+	a.BCond(NE, ne)
+	a.FmovToF(0, rTmp2)
+	c.floatEqualsInt(rN, eq, ne)
 	a.Bind(notInteger)
 	a.Sub(rIdx, rTmp, rNumber)
 	a.CmpImm(rIdx, 1)

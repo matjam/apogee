@@ -463,11 +463,12 @@ func (c *arm64Compiler) getIndex(ip int, i bytecode.Instruction, up bool) {
 }
 
 // setIndex compiles SETTABLE, or SETTABUP when up is set, storing to an
-// element of a table's array part, as tryPut, or put for a table without a
-// metatable, does, or to a buffer's element. Other keys exit.
+// element of a table's array part, nil included, as tryPut, or put for a
+// table without a metatable, does, or to a buffer's element. Other keys
+// exit.
 func (c *arm64Compiler) setIndex(ip int, i bytecode.Instruction, up bool) {
 	a := &c.a
-	if !c.loadRK(i.C(), ip, false) {
+	if !c.loadRK(i.C(), ip, true) {
 		c.exitAlways(ip)
 		return
 	}

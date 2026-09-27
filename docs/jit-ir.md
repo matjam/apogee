@@ -121,6 +121,15 @@ geometric mean; a phase that loses somewhere says where and why.
    `break` on a rare path run 2.7 to 3.6 times as fast; the benchmark
    suites do not change, since their loops' tables and calls are on every
    path: that is phases 3 and 4.
+3. **Phase 3.** Array elements and own fields read and write in the
+   kernel, tables live in general-purpose registers, and loaded values
+   are guarded to the type their uses, or the registers when the function
+   compiled, suggest. nbody is 27% faster, fannkuch-redux 7%, richards
+   and records 2 to 3%; nothing slows. The shape is checked at each
+   access, not hoisted: the check is two loads and a compare against the
+   field cache. array-fill-sum stays: its first loop appends, which Go
+   does, and its second was cheap already. The rest of the standard
+   benchmarks' hot loops call methods or functions: phase 4.
 
 ## What this does not change
 

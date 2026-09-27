@@ -27,7 +27,7 @@ func irOf(t *testing.T, src string, maxFloats, maxInts int) (*irFunc, bool) {
 		}
 		plan := planKernel(p, ip, true, func(int) bool { return true },
 			func(int) (uint64, mathFn, bool) { return 0, mathNone, false },
-			func(int) (numKind, bool) { return kindAny, false }, true)
+			func(int) (numKind, bool) { return kindAny, false }, true, func(int) numKind { return kindAny })
 		if plan == nil {
 			t.Fatal("the loop is not a kernel")
 		}

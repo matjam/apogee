@@ -743,7 +743,7 @@ func TestJITKernels(t *testing.T) {
 		{"calls are not kernels", "", `function run() local s = 0; for i = 1, 10 do s = s + math.floor(i / 2) end; return s end`},
 		{"a call on a rare path leaves the kernel", "int", `function run() local s, t = 0, {}; for i = 1, 1000 do s = s + i * 3; if i % 100 == 0 then t[#t + 1] = s end end; return s, #t, t[4] end`},
 		{"a return on a rare path", "int", `function run() local s = 0; for i = 1, 1000 do s = s + i; if s > 5000 then return s, i end end; return s end`},
-		{"an exit on every path is not a kernel", "", `function run() local s, t = 0, {}; for i = 1, 100 do s = s + i; t[i] = s end; return s, t[50] end`},
+		{"an exit on every path is not a kernel", "", `function run() local s = 0; for i = 1, 100 do s = s + i; local _ = tostring(s) end; return s end`},
 		{"locals written after an exit", "int", `function run() local a, b, t = 0, 0, {}; for i = 1, 300 do a = a + i; if i % 7 == 0 then t[#t + 1] = a end; b = b + a end; return a, b, #t end`},
 		{"temporaries live across an exit", "int", `function run() local s, t = 0, {}; for i = 1, 200 do local x = i * 2; local y = i * 3; if i % 50 == 0 then t[#t + 1] = x end; s = s + y end; return s, t[1], t[4] end`},
 	}
@@ -1050,6 +1050,62 @@ func TestJITKernelRegisters(t *testing.T) {
 			}
 			if lj.jitCtx.kernels[1] == 0 {
 				t.Fatal("no kernel ran")
+			}
+		})
+	}
+}
+
+// Kernels read and write tables' arrays and fields, guarding each value's
+// type, and leave where a guess or the table does not hold.
+func TestJITKernelTables(t *testing.T) {
+	skipWithoutJIT(t)
+	tests := []struct{ name, src string }{
+		{"array sum", `function run() local t = {} for i = 1, 100 do t[i] = i end local s = 0 for i = 1, #t do s = s + t[i] end return s end`},
+		{"float array", `function run() local t = {} for i = 1, 100 do t[i] = i * 0.5 end local s = 0.0 for i = 1, 100 do s = s + t[i] * 2 end return s end`},
+		{"array written in place", `function run() local t = {} for i = 1, 50 do t[i] = 0 end for i = 1, 50 do t[i] = t[i] + i * 3 end return t[1], t[50] end`},
+		{"array of mixed numbers leaves", `function run() local t = {} for i = 1, 100 do t[i] = i % 7 == 0 and i + 0.5 or i end local s = 0 for i = 1, 100 do s = s + t[i] end return s end`},
+		{"hole in the array", `function run() local t = {} for i = 1, 100 do t[i] = i end t[40] = nil local s, n = 0, 0 for i = 1, 100 do local v = t[i] if v then s = s + v else n = n + 1 end end return s, n end`},
+		{"key past the array", `function run() local t = {1, 2, 3} local s = 0 for i = 1, 6 do local v = t[i]; if i > 3 then v = 10 end; s = s + v end return s end`},
+		{"fields", `function run() local p = {x = 1.5, y = 2.5} for i = 1, 100 do p.x = p.x + p.y * 0.5; p.y = p.y - 0.25 end return p.x, p.y end`},
+		{"records", `function run() local ps = {} for i = 1, 100 do ps[i] = {x = i, y = i * 2} end local s = 0 for i = 1, #ps do local p = ps[i]; s = s + p.x + p.y end return s end`},
+		{"records of floats", `function run() local ps = {} for i = 1, 100 do ps[i] = {x = i * 0.5, v = 1.0} end for i = 1, #ps do local p = ps[i]; p.x = p.x + p.v * 0.1 end return ps[1].x, ps[100].x end`},
+		{"field through __index leaves", `function run() local mt = {__index = {y = 3}} local s = 0 local p = setmetatable({x = 1}, mt) for i = 1, 100 do s = s + p.x + p.y end return s end`},
+		{"__newindex on a missing field", `function run() local log = 0 local p = setmetatable({}, {__newindex = function(t, k, v) log = log + v end}) for i = 1, 10 do p.x = i end return log end`},
+		{"a field turns into a float", `function run() local p = {x = 1} local s = 0 for i = 1, 100 do if i == 50 then p.x = 2.5 end s = s + p.x end return s end`},
+		{"table values", `function run() local a, b = {v = 1}, {v = 2} local t = {a, b, a} local s = 0 for i = 1, 3 do s = s + t[i].v end return s end`},
+		{"nbody-like", `
+			local sqrt = math.sqrt
+			function run()
+			  local bodies = {}
+			  for i = 1, 5 do bodies[i] = {x = i * 1.0, y = i * 2.0, vx = 0.0, vy = 0.0, mass = i * 0.5} end
+			  for step = 1, 20 do
+			    for i = 1, #bodies do
+			      local bi = bodies[i]
+			      for j = i + 1, #bodies do
+			        local bj = bodies[j]
+			        local dx, dy = bi.x - bj.x, bi.y - bj.y
+			        local d2 = dx * dx + dy * dy
+			        local mag = 0.01 / (d2 * sqrt(d2))
+			        bi.vx = bi.vx - dx * bj.mass * mag
+			        bj.vx = bj.vx + dx * bi.mass * mag
+			        bi.vy = bi.vy - dy * bj.mass * mag
+			        bj.vy = bj.vy + dy * bi.mass * mag
+			      end
+			    end
+			  end
+			  return bodies[1].vx, bodies[5].vy
+			end`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime.GC()
+			defer debug.SetGCPercent(debug.SetGCPercent(-1)) // kernels run while the barrier is off
+			jit, interp, lj := runBoth(t, tt.src)
+			if jit != interp {
+				t.Fatalf("JIT %q, interpreter %q", jit, interp)
+			}
+			if lj.jitCtx.kernels[0]+lj.jitCtx.kernels[1] == 0 {
+				t.Error("no kernel ran")
 			}
 		})
 	}

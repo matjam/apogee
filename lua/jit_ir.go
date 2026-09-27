@@ -57,11 +57,12 @@ const (
 	irMath                  // dst = math function imm (a, b), of a's type
 	irBufGet                // dst = buffer[a]
 	irBufSet                // buffer[a] = b
+	irExit                  // leave, for the ordinary code to run the instruction at pc
 )
 
 var irOpNames = [...]string{"label", "move", "const", "hoist", "add", "sub", "mul", "div", "floordiv",
 	"fmod", "idiv", "imod", "and", "or", "xor", "not", "shift", "neg", "branch", "jump", "intrinsic",
-	"math", "bufget", "bufset"}
+	"math", "bufget", "bufset", "exit"}
 
 func (o irOp) String() string { return irOpNames[o] }
 
@@ -87,7 +88,7 @@ type irInst struct {
 	imm    int64
 	flag   bool
 	cmp    bytecode.OpCode // a branch's comparison: EQ, LT or LE
-	target int             // a label's or a jump's pc
+	target int             // a label's or a jump's pc; a branch's is -1 when it leaves by snap
 	buf    int             // a buffer access's hoisted slot, or -1 for register obj's
 	obj    int
 	tmp    vreg // an integer scratch register: a float buffer key's
@@ -121,12 +122,25 @@ type irFunc struct {
 	vregs  []kslot // each one's Lua register and type
 	index  map[kslot]vreg
 	snaps  []irSnap
-	snapAt map[int]int // snapshot indices by pc
-	loop   [4]vreg     // the FORLOOP's index, limit (or count), step and variable
-	end    int         // the latch's snapshot, for leaving at the end of an iteration
-	share  bool        // the variable shares the index's vreg
-	loc    []int       // each vreg's machine register, in its class: see allocate
+	snapAt map[int]int  // snapshot indices by pc
+	loop   [4]vreg      // the FORLOOP's index, limit (or count), step and variable
+	end    int          // the latch's snapshot, for leaving at the end of an iteration
+	leaves bool         // whether an instruction or a branch leaves: see irExit
+	share  bool         // the variable shares the index's vreg
+	loc    []int        // each vreg's machine register, in its class, or -1: see allocate
+	reload [2]int       // the first of the float and integer registers holding spilled values, or -1
+	cur    map[vreg]int // spilled vregs the operation being lowered uses, and their reload registers
 }
+
+// A kernel that can leave (irFunc.leaves) counts its short runs: those
+// that leave within kernelShortRun iterations of starting, one after
+// another, in a word of its prototype's jitRuns. Its entry check fails once
+// there have been kernelRunsOff: the kernel leaves at most iterations, and
+// costs more than the ordinary code.
+const (
+	kernelShortRun = 4
+	kernelRunsOff  = 64
+)
 
 // kslot is a Lua register holding a type, which has a virtual register.
 type kslot struct {
@@ -205,7 +219,7 @@ func (f *irFunc) snapshot(p *prototype, ip int) int {
 // buildIR returns k's IR.
 func buildIR(p *prototype, k *kernelPlan) *irFunc {
 	code := p.Code
-	f := &irFunc{kernelPlan: k, index: map[kslot]vreg{}, snapAt: map[int]int{}, share: k.shareVar}
+	f := &irFunc{kernelPlan: k, index: map[kslot]vreg{}, snapAt: map[int]int{}, share: k.shareVar, cur: map[vreg]int{}}
 	base := k.base
 	// Virtual registers in the order allocate colours them: the loop's,
 	// the live-in ones, then as the body writes them.
@@ -232,7 +246,15 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 	}
 	for ip := k.start; ip < k.latch; ip++ {
 		i := code[ip]
+		if k.unreached[ip] {
+			continue
+		}
 		emit(irInst{op: irLabel, pc: ip, target: ip, dst: noVreg, a: noArg, b: noArg, snap: -1, buf: -1, tmp: noVreg})
+		if k.exits[ip] {
+			f.leaves = true
+			emit(irInst{op: irExit, pc: ip, dst: noVreg, a: noArg, b: noArg, snap: f.snapshot(p, ip), buf: -1, tmp: noVreg})
+			continue
+		}
 		in := irInst{pc: ip, dst: noVreg, a: noArg, b: noArg, snap: -1, buf: -1, tmp: noVreg}
 		res := k.results[ip]
 		dst := func() vreg { return f.value(i.A(), res) }
@@ -283,9 +305,12 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 		case bytecode.OpUnaryMinus:
 			in.op, in.dst, in.a = irNeg, dst(), f.arg(p, ip, i.B())
 		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
-			t, _ := kernelJump(code, ip, k.latch)
+			t, ok := kernelJump(code, ip, k.latch)
 			in.op, in.cmp, in.flag, in.target = irBranch, op, i.A() != 0, t
 			in.a, in.b = f.arg(p, ip, i.B()), f.arg(p, ip, i.C())
+			if !ok { // it leaves the loop: the ordinary code tests again
+				in.target, in.snap, f.leaves = -1, f.snapshot(p, ip), true
+			}
 			emit(in)
 			ip++ // the JMP
 			continue
@@ -330,9 +355,17 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 	return f
 }
 
-// uses returns the virtual registers in reads.
-func (in *irInst) uses() []vreg {
+// uses returns the virtual registers in reads. An exit reads what it
+// writes back: the ordinary code may read any of it.
+func (f *irFunc) uses(in *irInst) []vreg {
 	var vs []vreg
+	if in.op == irExit {
+		for _, r := range f.snaps[in.snap].regs {
+			if r.v != noVreg {
+				vs = append(vs, r.v)
+			}
+		}
+	}
 	for _, a := range []irArg{in.a, in.b} {
 		if a.v != noVreg {
 			vs = append(vs, a.v)
@@ -376,7 +409,11 @@ func (f *irFunc) allocate(maxFloats, maxInts int) bool {
 		case irJump:
 			succ = []int{labels[in.target]}
 		case irBranch:
-			succ = append(succ, labels[in.target])
+			if in.target >= 0 {
+				succ = append(succ, labels[in.target])
+			}
+		case irExit:
+			succ = nil
 		}
 		out := map[vreg]bool{}
 		for _, s := range succ {
@@ -388,7 +425,7 @@ func (f *irFunc) allocate(maxFloats, maxInts int) bool {
 			delete(in2, in.dst)
 			needed = append(needed, in.dst)
 		}
-		for _, v := range in.uses() {
+		for _, v := range f.uses(in) {
 			if !f.pinned(v) {
 				in2[v] = true
 			}
@@ -411,20 +448,59 @@ func (f *irFunc) allocate(maxFloats, maxInts int) bool {
 		}
 	}
 
-	f.loc = make([]int, n)
-	floats, ints := 0, 0
+	f.reload = [2]int{-1, -1}
+	floats, ints := f.colour(conflict, maxFloats, maxInts, false)
+	if floats <= maxFloats && ints <= maxInts {
+		return true
+	}
+	// Too few: keep the last two of each class that runs out for loading
+	// spilled values, which live in their Lua registers' stack slots, and
+	// spill what does not fit in the rest.
+	limitF, limitI := maxFloats, maxInts
+	if floats > maxFloats {
+		limitF -= spillRegs
+		f.reload[0] = limitF
+	}
+	if ints > maxInts {
+		limitI -= spillRegs
+		f.reload[1] = limitI
+	}
+	floats, ints = f.colour(conflict, limitF, limitI, true)
+	return floats <= limitF && ints <= limitI
+}
+
+// spillRegs is how many machine registers of a class hold spilled values
+// while an operation uses them: operations read at most two of a class,
+// and a result may take an operand's.
+const spillRegs = 2
+
+// colour gives each virtual register the first machine register in its
+// class no earlier one it conflicts with has, in loc, and returns how
+// many of each class it used. With spill, one that would take register
+// limitF or limitI or above spills, loc -1, unless it is one of the
+// loop's, or the scratch key, which then take it.
+func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill bool) (floats, ints int) {
+	f.loc = make([]int, len(f.vregs))
 	for x := range f.vregs {
 		v := vreg(x)
 		taken := map[int]bool{}
 		for y := range x {
 			w := vreg(y)
-			if f.vregs[y].t == f.vregs[x].t && (f.pinned(v) || f.pinned(w) || conflict[x][y]) {
+			if f.vregs[y].t == f.vregs[x].t && f.loc[y] >= 0 && (f.pinned(v) || f.pinned(w) || conflict[x][y]) {
 				taken[f.loc[y]] = true
 			}
 		}
 		m := 0
 		for taken[m] {
 			m++
+		}
+		limit := limitF
+		if f.vregs[x].t == kindInt {
+			limit = limitI
+		}
+		if spill && m >= limit && f.vregs[x].r >= 0 && !slices.Contains(f.loop[:], v) {
+			f.loc[x] = -1
+			continue
 		}
 		f.loc[x] = m
 		if f.vregs[x].t == kindInt {
@@ -433,7 +509,58 @@ func (f *irFunc) allocate(maxFloats, maxInts int) bool {
 			floats = max(floats, m+1)
 		}
 	}
-	return floats <= maxFloats && ints <= maxInts
+	return floats, ints
+}
+
+// spilled reports whether v lives in its Lua register's stack slot.
+func (f *irFunc) spilled(v vreg) bool { return f.loc[v] < 0 }
+
+// class is the index of v's class in reload: 0 for floats, 1 for
+// integers.
+func (f *irFunc) class(v vreg) int {
+	if f.vregs[v].t == kindInt {
+		return 1
+	}
+	return 0
+}
+
+// machine returns the index, in its class, of the machine register that
+// holds v: its own, or the reload register it has while an operation uses
+// it, when it is spilled.
+func (f *irFunc) machine(v vreg) int {
+	if l := f.loc[v]; l >= 0 {
+		return l
+	}
+	o, ok := f.cur[v]
+	if !ok {
+		panic("kernel: a spilled register used without loading")
+	}
+	return f.reload[f.class(v)] + o
+}
+
+// spills gives the spilled virtual registers in uses reload registers
+// for it, and returns those to load before it and the one to store after,
+// or noVreg.
+func (f *irFunc) spills(in *irInst) (loads []vreg, store vreg) {
+	clear(f.cur)
+	next := [2]int{}
+	for _, a := range []irArg{in.a, in.b} {
+		if v := a.v; v != noVreg && f.spilled(v) {
+			if _, ok := f.cur[v]; !ok {
+				f.cur[v] = next[f.class(v)]
+				next[f.class(v)]++
+				loads = append(loads, v)
+			}
+		}
+	}
+	store = noVreg
+	if v := in.dst; v != noVreg && f.spilled(v) {
+		if _, ok := f.cur[v]; !ok {
+			f.cur[v] = 0 // it reads its operands first
+		}
+		store = v
+	}
+	return loads, store
 }
 
 // String lists f's operations and their virtual registers, for tests and

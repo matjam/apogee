@@ -4,6 +4,7 @@ package lua
 
 import (
 	"math"
+	"unsafe"
 
 	"github.com/matjam/apogee/internal/bytecode"
 	. "github.com/matjam/apogee/internal/jit/arm64"
@@ -24,13 +25,15 @@ var kernelInts = []Reg{12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25}
 
 type kernel struct {
 	*irFunc
-	exits []Label // each snapshot's side exit, or -1 until it has one
+	exits   []Label // each snapshot's side exit, or -1 until it has one
+	counted []Label // likewise, counting short runs: see kernelRuns
+	runs    *uint64 // the short runs, when the kernel can leave
 }
 
 // reg and ireg return virtual register v's machine register, a float's
 // and an integer's.
-func (k *kernel) reg(v vreg) FReg { return kernelFirst + FReg(k.loc[v]) }
-func (k *kernel) ireg(v vreg) Reg { return kernelInts[k.loc[v]] }
+func (k *kernel) reg(v vreg) FReg { return kernelFirst + FReg(k.machine(v)) }
+func (k *kernel) ireg(v vreg) Reg { return kernelInts[k.machine(v)] }
 
 // findKernels returns the kernels for the FORLOOP at latch, an integer
 // loop's first, or nil when its loop does not qualify.
@@ -58,9 +61,13 @@ func (c *arm64Compiler) findKernels(latch int) []*kernel {
 		if !f.allocate(kernelCount, len(kernelInts)) {
 			continue
 		}
-		k := &kernel{irFunc: f, exits: make([]Label, len(f.snaps))}
+		k := &kernel{irFunc: f, exits: make([]Label, len(f.snaps)), counted: make([]Label, len(f.snaps))}
 		for i := range k.exits {
-			k.exits[i] = -1
+			k.exits[i], k.counted[i] = -1, -1
+		}
+		if f.leaves {
+			k.runs = new(uint64)
+			c.p.jitRuns = append(c.p.jitRuns, k.runs)
 		}
 		ks = append(ks, k)
 	}
@@ -77,6 +84,12 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 	// kernel was compiled for, and the live-in registers hold numbers of
 	// their types.
 	a.Cbnz(rBarrier, normal)
+	if k.runs != nil {
+		a.MovImm(rTmp, uint64(uintptr(unsafe.Pointer(k.runs))))
+		a.Ldr(rTmp, rTmp, 0)
+		a.CmpImm(rTmp, kernelRunsOff)
+		a.BCond(HS, normal)
+	}
 	c.kernelGuards(k, normal)
 	for _, r := range k.liveIn {
 		a.Ldr(rTmp, rFrame, reg(r).off+offP)
@@ -88,7 +101,9 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 		a.BCond(NE, normal)
 	}
 	for _, r := range k.liveIn {
-		if v := k.value(r, k.types[r]); k.types[r] == kindInt {
+		if v := k.value(r, k.types[r]); k.spilled(v) {
+			continue // in its stack slot already
+		} else if k.types[r] == kindInt {
 			a.Ldr(k.ireg(v), rFrame, reg(r).off+offN)
 		} else {
 			a.LdrD(k.reg(v), rFrame, reg(r).off+offN)
@@ -102,6 +117,9 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 	a.Ldr(rTmp, rCtx, counter)
 	a.AddImm(rTmp, rTmp, 1)
 	a.Str(rTmp, rCtx, counter)
+	if k.runs != nil {
+		a.Str(rBudget, rCtx, offEntry)
+	}
 	body, latch, done := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	// The first FORLOOP: nothing has changed if the loop does not run.
 	c.kernelStep(k, body, c.pcs[k.latch+1])
@@ -120,7 +138,22 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 		if in := &k.insts[x]; in.op == irLabel {
 			a.Bind(label(in.target))
 		} else {
+			loads, store := k.spills(in)
+			for _, v := range loads {
+				if r := reg(k.vregs[v].r); k.typeOf(v) == kindInt {
+					a.Ldr(k.ireg(v), r.base, r.off+offN)
+				} else {
+					a.LdrD(k.reg(v), r.base, r.off+offN)
+				}
+			}
 			c.kernelInstruction(k, in, label)
+			if store != noVreg {
+				if r := reg(k.vregs[store].r); k.typeOf(store) == kindInt {
+					c.storeInteger(r, k.ireg(store))
+				} else {
+					c.storeNumber(r, k.reg(store))
+				}
+			}
 		}
 	}
 	a.Bind(latch)
@@ -221,17 +254,24 @@ func (c *arm64Compiler) kernelGuards(k *kernel, normal Label) {
 // kernelSideExit returns a label that leaves k by snapshot n: it writes
 // k's registers back, and the ordinary code runs the instruction and the
 // rest of the iteration.
-func (c *arm64Compiler) kernelSideExit(k *kernel, n int) Label {
-	if k.exits[n] >= 0 {
-		return k.exits[n]
+func (c *arm64Compiler) kernelSideExit(k *kernel, n int, counted bool) Label {
+	cache := k.exits
+	if counted {
+		cache = k.counted
+	}
+	if cache[n] >= 0 {
+		return cache[n]
 	}
 	a := &c.a
 	l := a.NewLabel()
-	k.exits[n] = l
+	cache[n] = l
 	c.outOfLine = append(c.outOfLine, func() {
 		s := &k.snaps[n]
 		a.Bind(l)
 		c.flush(k, s)
+		if counted {
+			c.kernelRuns(k)
+		}
 		for _, kc := range s.callees { // after the flush: it uses kernel registers
 			c.upValueAddr(kc.upValue)
 			c.load(operand{rAddr, 0})
@@ -243,6 +283,25 @@ func (c *arm64Compiler) kernelSideExit(k *kernel, n int) Label {
 		a.B(c.pcs[s.pc])
 	})
 	return l
+}
+
+// kernelRuns counts a short run of k, or clears the count after a long
+// one; see kernelShortRun.
+func (c *arm64Compiler) kernelRuns(k *kernel) {
+	a := &c.a
+	long, done := a.NewLabel(), a.NewLabel()
+	a.Ldr(rTmp, rCtx, offEntry)
+	a.Sub(rTmp, rTmp, rBudget) // the iterations since it started
+	a.MovImm(rTmp2, uint64(uintptr(unsafe.Pointer(k.runs))))
+	a.CmpImm(rTmp, kernelShortRun)
+	a.BCond(HS, long)
+	a.Ldr(rTmp, rTmp2, 0)
+	a.AddImm(rTmp, rTmp, 1)
+	a.Str(rTmp, rTmp2, 0)
+	a.B(done)
+	a.Bind(long)
+	a.Str(ZR, rTmp2, 0)
+	a.Bind(done)
 }
 
 // intrinsicSaved are the kernel registers sin and cos use.
@@ -276,7 +335,7 @@ func (c *arm64Compiler) kernelCall(k *kernel, in *irInst) {
 		a.Fmov(0, x)
 	}
 	save()
-	side, exit := a.NewLabel(), c.kernelSideExit(k, in.snap)
+	side, exit := a.NewLabel(), c.kernelSideExit(k, in.snap, false)
 	c.outOfLine = append(c.outOfLine, func() {
 		a.Bind(side)
 		restore()
@@ -328,7 +387,7 @@ func (c *arm64Compiler) kernelMath(k *kernel, in *irInst) {
 			a.Frintp(0, x)
 		}
 		// An integer when -2^63 <= f < 2^63; otherwise Go gives the float.
-		side := c.kernelSideExit(k, in.snap)
+		side := c.kernelSideExit(k, in.snap, false)
 		a.MovImm(rTmp, math.Float64bits(1<<63))
 		a.FmovToF(1, rTmp)
 		a.Fcmp(0, 1)
@@ -392,7 +451,7 @@ func (c *arm64Compiler) kernelBuffer(k *kernel, in *irInst, side Label) Reg {
 // kernelGetBuffer compiles in, a buffer of floats' element.
 func (c *arm64Compiler) kernelGetBuffer(k *kernel, in *irInst) {
 	a := &c.a
-	key := c.kernelBuffer(k, in, c.kernelSideExit(k, in.snap))
+	key := c.kernelBuffer(k, in, c.kernelSideExit(k, in.snap, false))
 	d := k.reg(in.dst)
 	f32, done := a.NewLabel(), a.NewLabel()
 	a.Cbnz(rTmp, f32)
@@ -411,7 +470,7 @@ func (c *arm64Compiler) kernelGetBuffer(k *kernel, in *irInst) {
 // for Go to check it has an integer value.
 func (c *arm64Compiler) kernelSetBuffer(k *kernel, in *irInst) {
 	a := &c.a
-	side := c.kernelSideExit(k, in.snap)
+	side := c.kernelSideExit(k, in.snap, false)
 	key := c.kernelBuffer(k, in, side)
 	val := in.b
 	var constant value
@@ -479,7 +538,7 @@ func (c *arm64Compiler) kernelSetBuffer(k *kernel, in *irInst) {
 // r.
 func (k *kernel) usesInt(r Reg) bool {
 	for v, s := range k.vregs {
-		if s.t == kindInt && kernelInts[k.loc[v]] == r {
+		if s.t == kindInt && k.loc[v] >= 0 && kernelInts[k.loc[v]] == r {
 			return true
 		}
 	}
@@ -527,6 +586,9 @@ func (c *arm64Compiler) kernelStep(k *kernel, take, end Label) {
 // flush writes snapshot s's registers back to the frame.
 func (c *arm64Compiler) flush(k *kernel, s *irSnap) {
 	for _, r := range s.regs {
+		if r.v != noVreg && k.spilled(r.v) {
+			continue // in its stack slot already
+		}
 		switch r.t {
 		case kindInt:
 			c.storeInteger(reg(r.r), k.ireg(r.v))
@@ -711,10 +773,18 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		if !in.flag {
 			when = negate(when)
 		}
-		a.BCond(when, label(in.target))
+		var yes Label
+		if in.target >= 0 {
+			yes = label(in.target)
+		} else {
+			yes = c.kernelSideExit(k, in.snap, true)
+		}
+		a.BCond(when, yes)
 		a.B(label(in.pc + 2))
 	case irJump:
 		a.B(label(in.target))
+	case irExit:
+		a.B(c.kernelSideExit(k, in.snap, true))
 	case irHoist: // a number, from the context
 		if isInt {
 			a.Ldr(k.ireg(in.dst), rCtx, offHoist+uint32(in.imm)*8)

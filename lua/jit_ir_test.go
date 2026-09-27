@@ -66,3 +66,29 @@ func TestIRTemporariesShare(t *testing.T) {
 		t.Error("allocated the accumulator and a temporary into the loop's registers")
 	}
 }
+
+func TestIRSpills(t *testing.T) {
+	src := `function run() local a, b, c, d = 0.5, 1.5, 2.5, 3.5; for i = 1, 100 do a = a + i * 0.5; b = b * 0.5 + a; c = c - b; d = d + c * a end; return a, b, c, d end`
+	if _, ok := irOf(t, src, 5, 7); !ok { // four accumulators and a temporary
+		t.Fatal("five floats did not fit five registers")
+	}
+	f, ok := irOf(t, src, 4, 7)
+	if !ok {
+		t.Fatal("allocation failed instead of spilling")
+	}
+	spilled := 0
+	for v := range f.vregs {
+		if f.spilled(vreg(v)) {
+			spilled++
+		}
+	}
+	// Two registers of four hold spilled values: three of the five spill.
+	if spilled != 3 || f.reload[0] != 2 || f.reload[1] != -1 {
+		t.Errorf("%d spilled, reload registers from %v\n%s", spilled, f.reload, f)
+	}
+	for _, v := range f.loop {
+		if f.spilled(v) {
+			t.Error("a loop register spilled")
+		}
+	}
+}

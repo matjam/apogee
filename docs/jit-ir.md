@@ -112,6 +112,15 @@ geometric mean; a phase that loses somewhere says where and why.
    phases replace with guards where they add instructions it cannot type.
    Every kernel compiles to the same size of code as before on both
    architectures, over the JIT tests and the benchmark suites.
+2. **Phase 2.** An instruction the kernel cannot run leaves it where it
+   runs (`irExit`, and a branch whose jump leaves the body), for the
+   ordinary code to run it and the rest of the iteration, instead of
+   rejecting the loop; one on every path still does. A kernel whose exits
+   turn out common switches itself off (`kernelRuns`). Values that do not
+   fit the registers spill to their stack slots. Loops with a call or a
+   `break` on a rare path run 2.7 to 3.6 times as fast; the benchmark
+   suites do not change, since their loops' tables and calls are on every
+   path: that is phases 3 and 4.
 
 ## What this does not change
 

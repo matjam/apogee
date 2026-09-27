@@ -186,7 +186,7 @@ func (g *fuzzGen) pick(xs ...string) string { return xs[g.r.IntN(len(xs))] }
 
 // stmt returns a statement; depth bounds nested ifs.
 func (g *fuzzGen) stmt(depth int) string {
-	switch n := g.r.IntN(10); {
+	switch n := g.r.IntN(11); {
 	case n < 3:
 		return g.pick("i1", "i2") + " = " + g.intExpr(2)
 	case n < 6:
@@ -210,6 +210,19 @@ func (g *fuzzGen) stmt(depth int) string {
 			"small[i % 3 + 1] = nil; small[i % 3 + 1] = "+g.floatExpr(1),
 			"tab[i % 64 + 1] = nil; tab[i % 64 + 1] = "+g.floatExpr(1),
 		)
+	case n == 10 && depth < 2:
+		// On a rare path, or one taken every time a compiler cannot tell:
+		// what kernels leave at.
+		cond := g.pick("i % 17 == 0", "i % 50 == 3", "i > 0", "i == n - 3", "f1 > 1e300", "i1 < -1e15")
+		return "if " + cond + " then " + g.pick(
+			"tab[i % 64 + 1] = "+g.floatExpr(1),
+			"obj.y = "+g.intExpr(1),
+			"f1 = g("+g.floatExpr(1)+")",
+			"i1 = i1 + #tab",
+			"break",
+			"return i1, i2, f1, f2",
+			g.stmt(depth+1),
+		) + " end"
 	default:
 		return g.pick("tab[i % 64 + 1] = "+g.floatExpr(1), "obj.y = "+g.intExpr(1), "obj.x = "+g.floatExpr(1))
 	}

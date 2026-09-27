@@ -4,6 +4,7 @@ package lua
 
 import (
 	"math"
+	"unsafe"
 
 	"github.com/matjam/apogee/internal/bytecode"
 	. "github.com/matjam/apogee/internal/jit/amd64"
@@ -23,13 +24,15 @@ var kernelInts = []Reg{R8, R9, R10, R11, R12, R13, CX}
 
 type kernel struct {
 	*irFunc
-	exits []Label // each snapshot's side exit, or -1 until it has one
+	exits   []Label // each snapshot's side exit, or -1 until it has one
+	counted []Label // likewise, counting short runs: see kernelRuns
+	runs    *uint64 // the short runs, when the kernel can leave
 }
 
 // reg and ireg return virtual register v's machine register, a float's
 // and an integer's.
-func (k *kernel) reg(v vreg) XReg { return kernelFirst + XReg(k.loc[v]) }
-func (k *kernel) ireg(v vreg) Reg { return kernelInts[k.loc[v]] }
+func (k *kernel) reg(v vreg) XReg { return kernelFirst + XReg(k.machine(v)) }
+func (k *kernel) ireg(v vreg) Reg { return kernelInts[k.machine(v)] }
 
 // findKernels returns the kernels for the FORLOOP at latch, an integer
 // loop's first, or nil when its loop does not qualify.
@@ -57,9 +60,13 @@ func (c *amd64Compiler) findKernels(latch int) []*kernel {
 		if !f.allocate(kernelCount, len(kernelInts)) {
 			continue
 		}
-		k := &kernel{irFunc: f, exits: make([]Label, len(f.snaps))}
+		k := &kernel{irFunc: f, exits: make([]Label, len(f.snaps)), counted: make([]Label, len(f.snaps))}
 		for i := range k.exits {
-			k.exits[i] = -1
+			k.exits[i], k.counted[i] = -1, -1
+		}
+		if f.leaves {
+			k.runs = new(uint64)
+			c.p.jitRuns = append(c.p.jitRuns, k.runs)
 		}
 		ks = append(ks, k)
 	}
@@ -73,6 +80,11 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 
 	a.CmpMem(rCtx, offBarrier, 0)
 	a.J(NE, normal)
+	if k.runs != nil {
+		a.MovImm(rTmp, uint64(uintptr(unsafe.Pointer(k.runs))))
+		a.CmpMem(rTmp, 0, kernelRunsOff)
+		a.J(AE, normal)
+	}
 	c.kernelGuards(k, normal)
 	for _, r := range k.liveIn {
 		a.Load(rTmp, rFrame, reg(r).off+offP)
@@ -85,7 +97,9 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 		a.J(NE, normal)
 	}
 	for _, r := range k.liveIn {
-		if v := k.value(r, k.types[r]); k.types[r] == kindInt {
+		if v := k.value(r, k.types[r]); k.spilled(v) {
+			continue // in its stack slot already
+		} else if k.types[r] == kindInt {
 			a.Load(k.ireg(v), rFrame, reg(r).off+offN)
 		} else {
 			a.LoadSD(k.reg(v), rFrame, reg(r).off+offN)
@@ -96,6 +110,10 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 		counter += 8
 	}
 	a.SubMem(rCtx, counter, -1)
+	if k.runs != nil {
+		a.Load(rTmp, rCtx, offBudget)
+		a.Store(rCtx, offEntry, rTmp)
+	}
 	body, latch, done := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	// The first FORLOOP: nothing has changed if the loop does not run.
 	c.kernelStep(k, body, c.pcs[k.latch+1])
@@ -114,7 +132,22 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 		if in := &k.insts[x]; in.op == irLabel {
 			a.Bind(label(in.target))
 		} else {
+			loads, store := k.spills(in)
+			for _, v := range loads {
+				if r := reg(k.vregs[v].r); k.typeOf(v) == kindInt {
+					a.Load(k.ireg(v), r.base, r.off+offN)
+				} else {
+					a.LoadSD(k.reg(v), r.base, r.off+offN)
+				}
+			}
 			c.kernelInstruction(k, in, label)
+			if store != noVreg {
+				if r := reg(k.vregs[store].r); k.typeOf(store) == kindInt {
+					c.storeInteger(r, k.ireg(store))
+				} else {
+					c.storeNumber(r, k.reg(store))
+				}
+			}
 		}
 	}
 	a.Bind(latch)
@@ -217,17 +250,24 @@ func (c *amd64Compiler) kernelGuards(k *kernel, normal Label) {
 // kernelSideExit returns a label that leaves k by snapshot n: it writes
 // k's registers back, and the ordinary code runs the instruction and the
 // rest of the iteration.
-func (c *amd64Compiler) kernelSideExit(k *kernel, n int) Label {
-	if k.exits[n] >= 0 {
-		return k.exits[n]
+func (c *amd64Compiler) kernelSideExit(k *kernel, n int, counted bool) Label {
+	cache := k.exits
+	if counted {
+		cache = k.counted
+	}
+	if cache[n] >= 0 {
+		return cache[n]
 	}
 	a := &c.a
 	l := a.NewLabel()
-	k.exits[n] = l
+	cache[n] = l
 	c.outOfLine = append(c.outOfLine, func() {
 		s := &k.snaps[n]
 		a.Bind(l)
 		c.flush(k, s)
+		if counted {
+			c.kernelRuns(k)
+		}
 		for _, kc := range s.callees { // after the flush: it uses kernel registers
 			c.upValueAddr(kc.upValue)
 			c.load(operand{rAddr, 0})
@@ -239,6 +279,24 @@ func (c *amd64Compiler) kernelSideExit(k *kernel, n int) Label {
 		a.Jmp(c.pcs[s.pc])
 	})
 	return l
+}
+
+// kernelRuns counts a short run of k, or clears the count after a long
+// one; see kernelShortRun.
+func (c *amd64Compiler) kernelRuns(k *kernel) {
+	a := &c.a
+	long, done := a.NewLabel(), a.NewLabel()
+	a.Load(rTmp, rCtx, offEntry)
+	a.Load(DX, rCtx, offBudget)
+	a.Sub(rTmp, DX) // the iterations since it started
+	a.MovImm(DX, uint64(uintptr(unsafe.Pointer(k.runs))))
+	a.CmpImm(rTmp, kernelShortRun)
+	a.J(AE, long)
+	a.SubMem(DX, 0, -1)
+	a.Jmp(done)
+	a.Bind(long)
+	a.StoreZero(DX, 0)
+	a.Bind(done)
 }
 
 // intrinsicSaved are the kernel registers sin and cos use.
@@ -272,7 +330,7 @@ func (c *amd64Compiler) kernelCall(k *kernel, in *irInst) {
 		a.MovSD(0, x)
 	}
 	save()
-	side, exit := a.NewLabel(), c.kernelSideExit(k, in.snap)
+	side, exit := a.NewLabel(), c.kernelSideExit(k, in.snap, false)
 	c.outOfLine = append(c.outOfLine, func() {
 		a.Bind(side)
 		restore()
@@ -330,7 +388,7 @@ func (c *amd64Compiler) kernelMath(k *kernel, in *irInst) {
 		a.Cvttsd2si(AX, 0) // 1<<63 for NaN and out of range, and -2^63
 		a.MovImm(DX, 1<<63)
 		a.Cmp(AX, DX)
-		a.J(E, c.kernelSideExit(k, in.snap))
+		a.J(E, c.kernelSideExit(k, in.snap, false))
 		a.Mov(k.ireg(in.dst), AX)
 		return
 	case mathAbs:
@@ -412,7 +470,7 @@ func (c *amd64Compiler) elementAddr(keyReg Reg, keyConst int64, isConst bool, sc
 // kernelGetBuffer compiles in, a buffer of floats' element.
 func (c *amd64Compiler) kernelGetBuffer(k *kernel, in *irInst) {
 	a := &c.a
-	keyReg, keyConst, isConst := c.kernelBuffer(k, in, c.kernelSideExit(k, in.snap))
+	keyReg, keyConst, isConst := c.kernelBuffer(k, in, c.kernelSideExit(k, in.snap, false))
 	f32, done := a.NewLabel(), a.NewLabel()
 	a.Test(rTmp, rTmp)
 	a.J(NE, f32)
@@ -430,7 +488,7 @@ func (c *amd64Compiler) kernelGetBuffer(k *kernel, in *irInst) {
 // for Go to check it has an integer value.
 func (c *amd64Compiler) kernelSetBuffer(k *kernel, in *irInst) {
 	a := &c.a
-	side := c.kernelSideExit(k, in.snap)
+	side := c.kernelSideExit(k, in.snap, false)
 	keyReg, keyConst, isConst := c.kernelBuffer(k, in, side)
 	val := in.b
 	var constant value
@@ -499,7 +557,7 @@ func (c *amd64Compiler) kernelSetBuffer(k *kernel, in *irInst) {
 // r.
 func (k *kernel) usesInt(r Reg) bool {
 	for v, s := range k.vregs {
-		if s.t == kindInt && kernelInts[k.loc[v]] == r {
+		if s.t == kindInt && k.loc[v] >= 0 && kernelInts[k.loc[v]] == r {
 			return true
 		}
 	}
@@ -535,6 +593,9 @@ func (c *amd64Compiler) kernelStep(k *kernel, take, end Label) {
 // flush writes snapshot s's registers back to the frame.
 func (c *amd64Compiler) flush(k *kernel, s *irSnap) {
 	for _, r := range s.regs {
+		if r.v != noVreg && k.spilled(r.v) {
+			continue // in its stack slot already
+		}
 		switch r.t {
 		case kindInt:
 			c.storeInteger(reg(r.r), k.ireg(r.v))
@@ -725,7 +786,13 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		a.XorPD(4, 3)
 		a.MovSD(k.reg(in.dst), 4)
 	case irBranch:
-		yes, no := label(in.target), label(in.pc+2)
+		var yes Label
+		if in.target >= 0 {
+			yes = label(in.target)
+		} else {
+			yes = c.kernelSideExit(k, in.snap, true)
+		}
+		no := label(in.pc + 2)
 		if in.a.t == kindInt && in.b.t == kindInt {
 			a.Cmp(c.intArg(k, in.a, AX), c.intArg(k, in.b, DX))
 			when := map[bytecode.OpCode]Cond{bytecode.OpEqual: E, bytecode.OpLessThan: L, bytecode.OpLessOrEqual: LE}[in.cmp]
@@ -740,6 +807,8 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		c.compare(in.cmp, in.flag, b, cc, yes, no)
 	case irJump:
 		a.Jmp(label(in.target))
+	case irExit:
+		a.Jmp(c.kernelSideExit(k, in.snap, true))
 	case irHoist: // a number, from the context
 		if isInt {
 			a.Load(k.ireg(in.dst), rCtx, offHoist+uint32(in.imm)*8)

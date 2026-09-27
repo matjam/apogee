@@ -58,11 +58,15 @@ const (
 	irBufGet                // dst = buffer[a]
 	irBufSet                // buffer[a] = b
 	irExit                  // leave, for the ordinary code to run the instruction at pc
+	irArrayGet              // dst = a[b], guarded to have dst's type
+	irArraySet              // a[b] = c, over a value or with no metatable
+	irFieldGet              // dst = a's own field that the fieldCache at pc names, guarded
+	irFieldSet              // that field = c, over a value
 )
 
 var irOpNames = [...]string{"label", "move", "const", "hoist", "add", "sub", "mul", "div", "floordiv",
 	"fmod", "idiv", "imod", "and", "or", "xor", "not", "shift", "neg", "branch", "jump", "intrinsic",
-	"math", "bufget", "bufset", "exit"}
+	"math", "bufget", "bufset", "exit", "aget", "aset", "fget", "fset"}
 
 func (o irOp) String() string { return irOpNames[o] }
 
@@ -85,6 +89,7 @@ type irInst struct {
 	pc     int
 	dst    vreg
 	a, b   irArg
+	c      irArg // a store's value
 	imm    int64
 	flag   bool
 	cmp    bytecode.OpCode // a branch's comparison: EQ, LT or LE
@@ -198,7 +203,7 @@ func (f *irFunc) snapshot(p *prototype, ip int) int {
 	s := irSnap{pc: ip, top: -1}
 	for _, r := range f.writtenOnce() {
 		switch t := types[r]; {
-		case isNumKind(t):
+		case isRegKind(t):
 			s.regs = append(s.regs, irSnapReg{r: r, v: f.value(r, t), t: t, alias: -1})
 		default:
 			if slot, ok := bufferSlot(t); ok {
@@ -230,7 +235,7 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 		f.value(r, k.types[r])
 	}
 	for ip := k.start; ip < k.latch; ip++ {
-		if t := k.results[ip]; isNumKind(t) {
+		if t := k.results[ip]; isRegKind(t) {
 			f.value(code[ip].A(), t)
 		}
 	}
@@ -249,18 +254,18 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 		if k.unreached[ip] {
 			continue
 		}
-		emit(irInst{op: irLabel, pc: ip, target: ip, dst: noVreg, a: noArg, b: noArg, snap: -1, buf: -1, tmp: noVreg})
+		emit(irInst{op: irLabel, pc: ip, target: ip, dst: noVreg, a: noArg, b: noArg, c: noArg, snap: -1, buf: -1, tmp: noVreg})
 		if k.exits[ip] {
 			f.leaves = true
-			emit(irInst{op: irExit, pc: ip, dst: noVreg, a: noArg, b: noArg, snap: f.snapshot(p, ip), buf: -1, tmp: noVreg})
+			emit(irInst{op: irExit, pc: ip, dst: noVreg, a: noArg, b: noArg, c: noArg, snap: f.snapshot(p, ip), buf: -1, tmp: noVreg})
 			continue
 		}
-		in := irInst{pc: ip, dst: noVreg, a: noArg, b: noArg, snap: -1, buf: -1, tmp: noVreg}
+		in := irInst{pc: ip, dst: noVreg, a: noArg, b: noArg, c: noArg, snap: -1, buf: -1, tmp: noVreg}
 		res := k.results[ip]
 		dst := func() vreg { return f.value(i.A(), res) }
 		switch op := i.OpCode(); op {
 		case bytecode.OpMove:
-			if !isNumKind(res) {
+			if !isRegKind(res) {
 				continue // an alias of a hoisted buffer: nothing to move
 			}
 			in.op, in.dst, in.a = irMove, dst(), f.arg(p, ip, i.B())
@@ -321,7 +326,7 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			// The function an intrinsic call checked on entry, or a buffer the
 			// context holds: nothing. A number, from the context.
 			s, ok := k.upLoads[ip]
-			if !ok || !isNumKind(res) {
+			if !ok || !isRegKind(res) {
 				continue
 			}
 			in.op, in.dst, in.imm = irHoist, dst(), int64(s)
@@ -340,11 +345,32 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 				in.snap = f.snapshot(p, ip) // no integer: Go gives the float
 			}
 		case bytecode.OpGetTable, bytecode.OpGetTableUp: // GETTABUP's B, the upvalue, is hoisted
+			in.snap = f.snapshot(p, ip)
+			if field, ok := k.tabUses[ip]; ok {
+				in.op, in.dst, in.a = irArrayGet, dst(), f.arg(p, ip, i.B())
+				if field {
+					in.op = irFieldGet
+				} else {
+					in.b = f.arg(p, ip, i.C())
+				}
+				break
+			}
 			in.op, in.dst, in.a, in.buf, in.obj = irBufGet, dst(), f.arg(p, ip, i.C()), k.bufFrom[ip], i.B()
-			in.snap = f.snapshot(p, ip)
 		case bytecode.OpSetTable, bytecode.OpSetTableUp:
-			in.op, in.a, in.b, in.buf, in.obj = irBufSet, f.arg(p, ip, i.B()), f.arg(p, ip, i.C()), k.bufFrom[ip], i.A()
 			in.snap = f.snapshot(p, ip)
+			if field, ok := k.tabUses[ip]; ok {
+				in.op, in.a, in.c = irArraySet, f.arg(p, ip, i.A()), f.arg(p, ip, i.C())
+				if field {
+					in.op = irFieldSet
+				} else {
+					in.b = f.arg(p, ip, i.B())
+				}
+				break
+			}
+			in.op, in.a, in.b, in.buf, in.obj = irBufSet, f.arg(p, ip, i.B()), f.arg(p, ip, i.C()), k.bufFrom[ip], i.A()
+		}
+		if in.op >= irArrayGet { // a guess about a table may fail at every iteration
+			f.leaves = true
 		}
 		if (in.op == irBufGet || in.op == irBufSet) && in.a.t == kindFloat {
 			in.tmp = scratch
@@ -366,7 +392,7 @@ func (f *irFunc) uses(in *irInst) []vreg {
 			}
 		}
 	}
-	for _, a := range []irArg{in.a, in.b} {
+	for _, a := range []irArg{in.a, in.b, in.c} {
 		if a.v != noVreg {
 			vs = append(vs, a.v)
 		}
@@ -486,7 +512,7 @@ func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill bool) (floa
 		taken := map[int]bool{}
 		for y := range x {
 			w := vreg(y)
-			if f.vregs[y].t == f.vregs[x].t && f.loc[y] >= 0 && (f.pinned(v) || f.pinned(w) || conflict[x][y]) {
+			if f.class(w) == f.class(v) && f.loc[y] >= 0 && (f.pinned(v) || f.pinned(w) || conflict[x][y]) {
 				taken[f.loc[y]] = true
 			}
 		}
@@ -495,7 +521,7 @@ func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill bool) (floa
 			m++
 		}
 		limit := limitF
-		if f.vregs[x].t == kindInt {
+		if f.class(v) == 1 {
 			limit = limitI
 		}
 		if spill && m >= limit && f.vregs[x].r >= 0 && !slices.Contains(f.loop[:], v) {
@@ -503,7 +529,7 @@ func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill bool) (floa
 			continue
 		}
 		f.loc[x] = m
-		if f.vregs[x].t == kindInt {
+		if f.class(v) == 1 {
 			ints = max(ints, m+1)
 		} else {
 			floats = max(floats, m+1)
@@ -516,13 +542,16 @@ func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill bool) (floa
 func (f *irFunc) spilled(v vreg) bool { return f.loc[v] < 0 }
 
 // class is the index of v's class in reload: 0 for floats, 1 for
-// integers.
+// integers and tables, which general-purpose registers hold.
 func (f *irFunc) class(v vreg) int {
-	if f.vregs[v].t == kindInt {
-		return 1
+	if f.vregs[v].t == kindFloat {
+		return 0
 	}
-	return 0
+	return 1
 }
+
+// isInt reports whether a general-purpose register holds v.
+func (f *irFunc) isInt(v vreg) bool { return f.class(v) == 1 }
 
 // machine returns the index, in its class, of the machine register that
 // holds v: its own, or the reload register it has while an operation uses
@@ -544,7 +573,7 @@ func (f *irFunc) machine(v vreg) int {
 func (f *irFunc) spills(in *irInst) (loads []vreg, store vreg) {
 	clear(f.cur)
 	next := [2]int{}
-	for _, a := range []irArg{in.a, in.b} {
+	for _, a := range []irArg{in.a, in.b, in.c} {
 		if v := a.v; v != noVreg && f.spilled(v) {
 			if _, ok := f.cur[v]; !ok {
 				f.cur[v] = next[f.class(v)]
@@ -569,10 +598,7 @@ func (f *irFunc) String() string {
 	var b strings.Builder
 	name := func(v vreg) string {
 		s := f.vregs[v]
-		t := "f"
-		if s.t == kindInt {
-			t = "i"
-		}
+		t := map[numKind]string{kindFloat: "f", kindInt: "i", kindTable: "t"}[s.t]
 		return fmt.Sprintf("%s%d.r%d", t, v, s.r)
 	}
 	arg := func(a irArg) string {
@@ -598,7 +624,7 @@ func (f *irFunc) String() string {
 		case irHoist:
 			fmt.Fprintf(&b, " #%d", in.imm)
 		default:
-			for j, a := range []irArg{in.a, in.b} {
+			for j, a := range []irArg{in.a, in.b, in.c} {
 				if a.v != noVreg || a.isConst() {
 					if j > 0 {
 						b.WriteByte(',')

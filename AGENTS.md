@@ -520,6 +520,20 @@ nothing compiles.
     writes, with an integer key, reads or writes a buffer's element; the
     entry check confirms a buffer (of floats, if read). A register the
     function puts a new table in is never taken for one.
+  - **Tables.** GETTABLE and SETTABLE of a table's array element, at an
+    integer key, or its own field, at a constant string key through the
+    instruction's `fieldCache`, run in the kernel (`tableSlot`); a table
+    is a `kindTable` virtual register holding the pointer, from a live-in
+    register checked on entry, an upvalue, or another GETTABLE. A read
+    guards the value's type (`tableValue`); a write stores only over a
+    value, or into the array's nil without a metatable, and a field write
+    clears the tag-method cache. Anything else leaves, and counts toward
+    switching the kernel off. Which register holds a table and which a
+    buffer (`isTable`), and a value's type (`guessLoad`: indexing it makes
+    it a table and keying with it an integer, else a number by what meets
+    it, else a float), come partly from what the registers held when the
+    function compiled at a loop latch (`observed`, from `countJIT`'s
+    frame), which also types live-in registers before `guess`.
   - **Upvalues.** Numbers and buffers in upvalues (GETUPVAL, GETTABUP,
     SETTABUP) are checked on entry and kept in `jitContext.hoist`
     (`hoisted`, at most `maxHoisted`). A register holding such a buffer

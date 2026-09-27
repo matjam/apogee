@@ -51,9 +51,25 @@ func (c *arm64Compiler) findKernels(latch int) []*kernel {
 		return fn, m, m != mathNone
 	}
 	upValue := func(n int) (numKind, bool) { return upValueKind(c.cl, n) }
+	observed := func(r int) numKind {
+		if r >= len(c.frame) {
+			return kindAny
+		}
+		switch v := c.frame[r]; {
+		case v.isFloat():
+			return kindFloat
+		case v.isInteger():
+			return kindInt
+		case v.table() != nil:
+			return kindTable
+		case v.userData() != nil && v.userData().buf != nil:
+			return kindBuffer
+		}
+		return kindAny
+	}
 	var ks []*kernel
 	for _, intLoop := range []bool{true, false} {
-		plan := planKernel(c.p, latch, intLoop, constOK, intrinsic, upValue, true)
+		plan := planKernel(c.p, latch, intLoop, constOK, intrinsic, upValue, true, observed)
 		if plan == nil {
 			continue
 		}
@@ -92,6 +108,15 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 	}
 	c.kernelGuards(k, normal)
 	for _, r := range k.liveIn {
+		if k.types[r] == kindTable {
+			a.Ldr(rTmp, rFrame, reg(r).off+offN)
+			a.MovImm(rExitPC, tagOf(vkTable))
+			a.Cmp(rTmp, rExitPC)
+			a.BCond(NE, normal)
+			a.Ldr(rTmp, rFrame, reg(r).off+offP)
+			c.branchNumber(rTmp, normal) // a number whose bits match the tag
+			continue
+		}
 		a.Ldr(rTmp, rFrame, reg(r).off+offP)
 		if k.types[r] == kindInt {
 			a.Cmp(rTmp, rInteger)
@@ -103,6 +128,8 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 	for _, r := range k.liveIn {
 		if v := k.value(r, k.types[r]); k.spilled(v) {
 			continue // in its stack slot already
+		} else if k.types[r] == kindTable {
+			a.Ldr(k.ireg(v), rFrame, reg(r).off+offP)
 		} else if k.types[r] == kindInt {
 			a.Ldr(k.ireg(v), rFrame, reg(r).off+offN)
 		} else {
@@ -140,7 +167,9 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 		} else {
 			loads, store := k.spills(in)
 			for _, v := range loads {
-				if r := reg(k.vregs[v].r); k.typeOf(v) == kindInt {
+				if r := reg(k.vregs[v].r); k.typeOf(v) == kindTable {
+					a.Ldr(k.ireg(v), r.base, r.off+offP)
+				} else if k.typeOf(v) == kindInt {
 					a.Ldr(k.ireg(v), r.base, r.off+offN)
 				} else {
 					a.LdrD(k.reg(v), r.base, r.off+offN)
@@ -148,7 +177,9 @@ func (c *arm64Compiler) emitKernel(k *kernel, normal Label) {
 			}
 			c.kernelInstruction(k, in, label)
 			if store != noVreg {
-				if r := reg(k.vregs[store].r); k.typeOf(store) == kindInt {
+				if r := reg(k.vregs[store].r); k.typeOf(store) == kindTable {
+					c.storeTable(r, k.ireg(store))
+				} else if k.typeOf(store) == kindInt {
 					c.storeInteger(r, k.ireg(store))
 				} else {
 					c.storeNumber(r, k.reg(store))
@@ -237,6 +268,13 @@ func (c *arm64Compiler) kernelGuards(k *kernel, normal Label) {
 				a.CmpImm(rTmp2, uint32(bufferFloat32))
 				a.BCond(HI, normal)
 			}
+		} else if h.kind == kindTable {
+			a.Ldr(rTmp, rAddr, offN)
+			a.MovImm(rTmp2, tagOf(vkTable))
+			a.Cmp(rTmp, rTmp2)
+			a.BCond(NE, normal)
+			a.Ldr(rTmp, rAddr, offP)
+			c.branchNumber(rTmp, normal)
 		} else {
 			a.Ldr(rTmp, rAddr, offP)
 			if h.kind == kindInt {
@@ -590,6 +628,8 @@ func (c *arm64Compiler) flush(k *kernel, s *irSnap) {
 			continue // in its stack slot already
 		}
 		switch r.t {
+		case kindTable:
+			c.storeTable(reg(r.r), k.ireg(r.v))
 		case kindInt:
 			c.storeInteger(reg(r.r), k.ireg(r.v))
 		case kindFloat:
@@ -645,7 +685,7 @@ func (c *arm64Compiler) intArg(k *kernel, x irArg, tmp Reg) Reg {
 func (c *arm64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int) Label) {
 	a := &c.a
 	p := c.p
-	isInt := in.dst != noVreg && k.typeOf(in.dst) == kindInt
+	isInt := in.dst != noVreg && k.isInt(in.dst)
 	switch in.op {
 	case irMove:
 		if isInt {
@@ -799,5 +839,124 @@ func (c *arm64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		c.kernelGetBuffer(k, in)
 	case irBufSet:
 		c.kernelSetBuffer(k, in)
+	case irArrayGet, irFieldGet:
+		exit := c.kernelSideExit(k, in.snap, true)
+		c.tableSlot(k, in, exit)
+		c.tableValue(k, in, exit)
+	case irArraySet, irFieldSet:
+		exit, t := c.kernelSideExit(k, in.snap, true), k.ireg(in.a.v)
+		c.tableSlot(k, in, exit)
+		a.Ldr(rTmp2, rTmp, offP)
+		if in.op == irFieldSet { // over a value only
+			a.Cbz(rTmp2, exit)
+		} else { // over a value, or nil in a table without a metatable
+			present := a.NewLabel()
+			a.Cbnz(rTmp2, present)
+			a.Ldr(rTmp2, t, offTMeta)
+			a.Cbnz(rTmp2, exit)
+			a.Bind(present)
+		}
+		c.tableStore(k, in)
+		if in.op == irFieldSet {
+			a.Strb(ZR, t, offTFlags) // invalidateTagMethodCache
+		}
+	}
+}
+
+// storeTable stores the table r points to at dst.
+func (c *arm64Compiler) storeTable(dst operand, r Reg) {
+	c.a.MovImm(rTmp, tagOf(vkTable))
+	c.a.Str(rTmp, dst.base, dst.off+offN)
+	c.a.Str(r, dst.base, dst.off+offP)
+}
+
+// tableSlot leaves in rTmp the address of the value the table operation
+// in reads or writes: the array element at key b, or the own field the
+// fieldCache at in.pc names. It branches to exit when there is none, and
+// uses rTmp2 and rExitPC.
+func (c *arm64Compiler) tableSlot(k *kernel, in *irInst, exit Label) {
+	a := &c.a
+	t := k.ireg(in.a.v)
+	if in.op == irArrayGet || in.op == irArraySet {
+		if in.b.isConst() {
+			a.MovImm(rTmp, uint64(c.p.Constants[in.b.k].i()-1))
+		} else {
+			a.SubImm(rTmp, k.ireg(in.b.v), 1)
+		}
+		a.Ldr(rTmp2, t, offTArray+offSliceLen)
+		a.Cmp(rTmp, rTmp2)
+		a.BCond(HS, exit) // unsigned: keys below 1 too
+		a.Ldr(rTmp2, t, offTArray)
+		a.AddShifted(rTmp, rTmp2, rTmp, 4)
+		return
+	}
+	a.Ldr(rTmp, t, offTShape)
+	a.Cbz(rTmp, exit)
+	a.MovImm(rTmp2, uint64(uintptr(unsafe.Pointer(&c.p.fields[in.pc]))))
+	a.Ldr(rExitPC, rTmp2, offCShape)
+	a.Cmp(rTmp, rExitPC)
+	a.BCond(NE, exit)
+	a.Ldrsw(rExitPC, rTmp2, offCSlot)
+	a.Ldr(rTmp, t, offTSlots+offSliceLen)
+	a.Cmp(rExitPC, rTmp)
+	a.BCond(HS, exit) // unsigned: a slot below 0, not the table's own, too
+	a.Ldr(rTmp2, t, offTSlots)
+	a.AddShifted(rTmp, rTmp2, rExitPC, 4)
+}
+
+// tableValue loads the value at rTmp into in's result, branching to exit
+// unless it has the result's type. It uses rTmp2 and rExitPC.
+func (c *arm64Compiler) tableValue(k *kernel, in *irInst, exit Label) {
+	a := &c.a
+	switch k.typeOf(in.dst) {
+	case kindFloat:
+		a.Ldr(rTmp2, rTmp, offP)
+		a.Cmp(rTmp2, rNumber)
+		a.BCond(NE, exit)
+		a.LdrD(k.reg(in.dst), rTmp, offN)
+	case kindInt:
+		a.Ldr(rTmp2, rTmp, offP)
+		a.Cmp(rTmp2, rInteger)
+		a.BCond(NE, exit)
+		a.Ldr(k.ireg(in.dst), rTmp, offN)
+	case kindTable:
+		a.Ldr(rTmp2, rTmp, offN)
+		a.MovImm(rExitPC, tagOf(vkTable))
+		a.Cmp(rTmp2, rExitPC)
+		a.BCond(NE, exit)
+		a.Ldr(rExitPC, rTmp, offP)
+		c.branchNumber(rExitPC, exit) // a number whose bits match the tag
+		a.Mov(k.ireg(in.dst), rExitPC)
+	}
+}
+
+// tableStore stores in's value, c, at rTmp. It uses rTmp2.
+func (c *arm64Compiler) tableStore(k *kernel, in *irInst) {
+	a := &c.a
+	v := in.c
+	t := v.t
+	switch {
+	case v.isConst():
+		n := c.p.Constants[v.k]
+		if t == kindFloat {
+			a.MovImm(rTmp2, math.Float64bits(n.toFloat()))
+		} else {
+			a.MovImm(rTmp2, uint64(n.i()))
+		}
+		a.Str(rTmp2, rTmp, offN)
+	case t == kindFloat:
+		a.StrD(k.reg(v.v), rTmp, offN)
+	case t == kindInt:
+		a.Str(k.ireg(v.v), rTmp, offN)
+	case t == kindTable:
+		a.MovImm(rTmp2, tagOf(vkTable))
+		a.Str(rTmp2, rTmp, offN)
+		a.Str(k.ireg(v.v), rTmp, offP)
+		return
+	}
+	if t == kindFloat {
+		a.Str(rNumber, rTmp, offP)
+	} else {
+		a.Str(rInteger, rTmp, offP)
 	}
 }

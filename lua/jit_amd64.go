@@ -42,6 +42,7 @@ type amd64Compiler struct {
 	p       *prototype
 	g       *globalState // the state p runs in, whose string metatable SELF reads
 	cl      *luaClosure  // the closure being compiled, whose upvalues kernels speculate on
+	frame   []value      // its registers when it compiled at a loop latch, which hint kernels' types, or nil
 	code    []bytecode.Instruction
 	pcs     []Label
 	exits   []Label
@@ -70,11 +71,11 @@ func (c *amd64Compiler) intrinsicExit() Label {
 	return c.exit(c.ip)
 }
 
-func compileJIT(p *prototype, g *globalState, cl *luaClosure) (code []byte, offsets []int32, entries []int, kernels int) {
+func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (code []byte, offsets []int32, entries []int, kernels int) {
 	if len(p.Code) > 1<<16 {
 		return nil, nil, nil, 0
 	}
-	c := &amd64Compiler{p: p, g: g, cl: cl, code: p.jitOrig, sse41: HasSSE41(), kernelExit: -1}
+	c := &amd64Compiler{p: p, g: g, cl: cl, frame: frame, code: p.jitOrig, sse41: HasSSE41(), kernelExit: -1}
 	c.pcs = make([]Label, len(c.code))
 	c.exits = make([]Label, len(c.code))
 	c.budget = make([]Label, len(c.code))

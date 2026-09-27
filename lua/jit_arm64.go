@@ -49,6 +49,7 @@ type arm64Compiler struct {
 	p       *prototype
 	g       *globalState // the state p runs in, whose string metatable SELF reads
 	cl      *luaClosure  // the closure being compiled, whose upvalues kernels speculate on
+	frame   []value      // its registers when it compiled at a loop latch, which hint kernels' types, or nil
 	code    []bytecode.Instruction
 	pcs     []Label // start of each pc's code
 	exits   []Label // exit to the interpreter at each pc, created on demand
@@ -75,15 +76,15 @@ func (c *arm64Compiler) intrinsicExit(ip int) Label {
 	return c.exit(ip)
 }
 
-func compileJIT(p *prototype, g *globalState, cl *luaClosure) (code []byte, offsets []int32, entries []int, kernels int) {
+func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (code []byte, offsets []int32, entries []int, kernels int) {
 	if len(p.Code) > 1<<16 || uint32(p.MaxStackSize+3)*valueSize >= maxOffset {
 		return nil, nil, nil, 0
 	}
-	code, offsets, entries, kernels, err := compileARM64(p, g, cl, false)
+	code, offsets, entries, kernels, err := compileARM64(p, g, cl, frame, false)
 	if errors.Is(err, ErrTestRange) {
 		// Over 32 KB of code, which a function of a hundred instructions
 		// can be: test branches take two instructions to reach.
-		code, offsets, entries, kernels, err = compileARM64(p, g, cl, true)
+		code, offsets, entries, kernels, err = compileARM64(p, g, cl, frame, true)
 	}
 	if err != nil {
 		if jitStrict && !errors.Is(err, ErrRange) { // too long is no bug
@@ -94,8 +95,8 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure) (code []byte, offs
 	return code, offsets, entries, kernels
 }
 
-func compileARM64(p *prototype, g *globalState, cl *luaClosure, longTests bool) (code []byte, offsets []int32, entries []int, kernels int, err error) {
-	c := &arm64Compiler{p: p, g: g, cl: cl, code: p.jitOrig, kernelExit: -1}
+func compileARM64(p *prototype, g *globalState, cl *luaClosure, frame []value, longTests bool) (code []byte, offsets []int32, entries []int, kernels int, err error) {
+	c := &arm64Compiler{p: p, g: g, cl: cl, frame: frame, code: p.jitOrig, kernelExit: -1}
 	c.a.LongTests = longTests
 	c.pcs = make([]Label, len(c.code))
 	c.exits = make([]Label, len(c.code))

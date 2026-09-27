@@ -71,6 +71,16 @@ type kernelPlan struct {
 	exits, unreached map[int]bool
 	badPC            int
 
+	// Tables: registers the loop only reads that hold them (tables), the
+	// GETTABLE and SETTABLE pcs that access them, true for a field by a
+	// constant string key and false for an array element (tabUses), and
+	// the type each GETTABLE's value is guarded to have, kindAny until
+	// inferTypes decides (loads).
+	tables   map[int]bool
+	tabUses  map[int]bool
+	loads    map[int]numKind
+	observed func(r int) numKind
+
 	// Upvalues the body reads, checked and loaded on entry into
 	// jitContext.hoist, by slot; nothing in a kernel can change them.
 	hoisted []hoistedUpValue
@@ -169,11 +179,12 @@ func kernelDivisor(v value) bool {
 // number function's code, or a math function (mathFn) and its code;
 // upValue returns the kind of number, or kindBuffer, upvalue n holds, if
 // it holds one; floor reports whether the machine rounds a float down in
-// one instruction, for // of floats.
-func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool) *kernelPlan {
+// one instruction, for // of floats; observed returns the type register r
+// held when the function compiled, a hint, or kindAny.
+func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool, observed func(r int) numKind) *kernelPlan {
 	exits := map[int]bool{}
 	for range maxExits + 1 {
-		k, bad := planKernelWith(p, latch, intLoop, constOK, intrinsic, upValue, floor, exits)
+		k, bad := planKernelWith(p, latch, intLoop, constOK, intrinsic, upValue, floor, observed, exits)
 		if k != nil || bad < 0 || exits[bad] || len(exits) == maxExits {
 			return k
 		}
@@ -188,7 +199,7 @@ const maxExits = 8
 // planKernelWith is planKernel with the instructions at exits left to the
 // ordinary code. When the loop does not qualify it returns the pc of an
 // instruction that stops it, or -1.
-func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool, exits map[int]bool) (*kernelPlan, int) {
+func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool, observed func(r int) numKind, exits map[int]bool) (*kernelPlan, int) {
 	code := p.Code
 	fl := code[latch]
 	start := latch + 1 + fl.SBx()
@@ -197,7 +208,8 @@ func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) b
 	}
 	k := &kernelPlan{start: start, latch: latch, base: fl.A(), intLoop: intLoop, types: map[int]numKind{},
 		calls: map[int]kernelCall{}, virtual: map[int]bool{}, buffers: map[int]bool{},
-		upLoads: map[int]int{}, bufFrom: map[int]int{}, floor: floor, exits: map[int]bool{}, unreached: map[int]bool{}}
+		upLoads: map[int]int{}, bufFrom: map[int]int{}, floor: floor, exits: map[int]bool{}, unreached: map[int]bool{},
+		tables: map[int]bool{}, tabUses: map[int]bool{}, loads: map[int]numKind{}, observed: observed}
 	wrote := map[int]bool{} // registers the body writes, which cannot hold buffers
 	used := map[int]bool{}  // registers holding numbers
 	base := fl.A()
@@ -234,6 +246,7 @@ func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) b
 	// live in only if the body reads it: one only an exit reads is dead
 	// where the write is skipped.
 	maybe := map[int]bool{}
+	aliases := map[int]bool{} // registers holding a buffer upvalue's alias
 	read := func(field int) bool {
 		if bytecode.IsConstant(field) {
 			return number(bytecode.ConstantIndex(field))
@@ -253,6 +266,7 @@ func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) b
 	}
 	write := func(r, ip int) bool {
 		wrote[r] = true
+		delete(aliases, r)
 		use(r)
 		if !seen[r] {
 			seen[r] = true
@@ -365,6 +379,7 @@ func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) b
 			if !ok || !write(i.A(), ip) {
 				return nil, ip
 			}
+			aliases[i.A()] = kind == kindBuffer
 			s := k.hoist(i.B(), kind)
 			if s < 0 {
 				return nil, ip
@@ -374,16 +389,32 @@ func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) b
 			if kc, ok := k.calls[ip]; !ok || !read(i.A()+1) || kc.args == 2 && !read(i.A()+2) || !write(i.A(), ip) {
 				return nil, ip
 			}
-		case bytecode.OpGetTable: // a buffer's element, at a key checked below
-			if !read(i.C()) || !write(i.A(), ip) {
+		case bytecode.OpGetTable, bytecode.OpSetTable:
+			get := i.OpCode() == bytecode.OpGetTable
+			obj, key := i.B(), i.C()
+			if !get {
+				obj, key = i.A(), i.B()
+			}
+			if field := stringKey(p, key); field || k.isTable(code, obj, wrote[obj] && !aliases[obj]) {
+				// A table's field by a constant string key, or its array's
+				// element; checkTypes checks the object holds a table.
+				if !field && !read(key) || !read(obj) || get && !write(i.A(), ip) || !get && !read(i.C()) {
+					return nil, ip
+				}
+				if !wrote[obj] {
+					k.tables[obj] = true
+				}
+				k.tabUses[ip] = field
+				if get {
+					k.loads[ip] = kindAny
+				}
+				break
+			}
+			// A buffer's element, at a key checked below.
+			if get && (!read(i.C()) || !write(i.A(), ip)) || !get && (!read(i.B()) || !read(i.C())) {
 				return nil, ip
 			}
-			k.bufUses = append(k.bufUses, bufUse{ip, i.B(), true})
-		case bytecode.OpSetTable:
-			if !read(i.B()) || !read(i.C()) {
-				return nil, ip
-			}
-			k.bufUses = append(k.bufUses, bufUse{ip, i.A(), false})
+			k.bufUses = append(k.bufUses, bufUse{ip, obj, get})
 		case bytecode.OpGetTableUp, bytecode.OpSetTableUp: // an upvalue buffer's element
 			up, key, get := i.B(), i.C(), i.OpCode() == bytecode.OpGetTableUp
 			if !get {
@@ -416,7 +447,9 @@ func planKernelWith(p *prototype, latch int, intLoop bool, constOK func(k int) b
 		}
 	}
 	for _, r := range k.liveIn {
-		if _, ok := k.types[r]; !ok {
+		if _, ok := k.types[r]; !ok && k.tables[r] {
+			k.types[r] = kindTable
+		} else if !ok {
 			k.types[r] = kindAny // decided by inferTypes
 		}
 	}
@@ -509,7 +542,7 @@ func (k *kernelPlan) floatUses(p *prototype, ip, r int) ([][2]int, bool) {
 		reads := func(f int) bool { return !bytecode.IsConstant(f) && f == r }
 		switch op := i.OpCode(); op {
 		case bytecode.OpSetTable, bytecode.OpSetTableUp:
-			if reads(i.B()) || op == bytecode.OpSetTable && i.A() == r {
+			if _, table := k.tabUses[j]; reads(i.B()) || op == bytecode.OpSetTable && i.A() == r || table && reads(i.C()) {
 				return nil, false
 			}
 		case bytecode.OpDiv:
@@ -621,6 +654,8 @@ func upValueKind(cl *luaClosure, n int) (numKind, bool) {
 		return kindInt, true
 	case v.userData() != nil && v.userData().buf != nil:
 		return kindBuffer, true
+	case v.table() != nil:
+		return kindTable, true
 	}
 	return kindAny, false
 }
@@ -852,12 +887,131 @@ func (k *kernelPlan) inferTypes(p *prototype) bool {
 			}
 		}
 		if undecided >= 0 {
-			k.types[undecided] = k.guess(p, at, undecided)
+			if t := k.observed(undecided); isNumKind(t) {
+				k.types[undecided] = t
+			} else {
+				k.types[undecided] = k.guess(p, at, undecided)
+			}
 			continue
+		}
+		if ip := k.undecidedLoad(); ip >= 0 {
+			k.loads[ip] = k.guessLoad(p, at, ip)
+			if k.loads[ip] != kindAny {
+				continue
+			}
+			k.at, k.results = at, results
+			return k.fail(ip) // nothing in the kernel uses it
 		}
 		k.at, k.results = at, results
 		return k.checkTypes(p)
 	}
+}
+
+// undecidedLoad returns the first GETTABLE of a table whose value's type
+// is undecided, or -1.
+func (k *kernelPlan) undecidedLoad() int {
+	first := -1
+	for ip, t := range k.loads {
+		if t == kindAny && (first < 0 || ip < first) {
+			first = ip
+		}
+	}
+	return first
+}
+
+// guessLoad returns the type the GETTABLE at ip guards its value to have,
+// from what the body does with it before writing its register again: a
+// table if it indexes it, an integer if it is a key; otherwise the type it
+// held when the function compiled, or that of what arithmetic and
+// comparisons meet it with, or a float. It returns kindAny when nothing in
+// the kernel reads it.
+func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) numKind {
+	code := p.Code
+	r := code[ip].A()
+	used, meets := false, kindAny
+	seen := map[int]bool{}
+	work := []int{ip + 1}
+	for len(work) > 0 {
+		j := work[len(work)-1]
+		work = work[:len(work)-1]
+		if j >= k.latch || seen[j] || k.exits[j] {
+			continue
+		}
+		seen[j] = true
+		i := code[j]
+		reads := func(f int) bool { return !bytecode.IsConstant(f) && f == r }
+		other := func(f int) numKind {
+			if bytecode.IsConstant(f) {
+				return constKind(p.Constants[bytecode.ConstantIndex(f)])
+			}
+			return at[j-k.start][f]
+		}
+		switch op := i.OpCode(); op {
+		case bytecode.OpGetTable, bytecode.OpSetTable:
+			obj, key := i.B(), i.C()
+			if op == bytecode.OpSetTable {
+				obj, key = i.A(), i.B()
+			}
+			switch {
+			case reads(obj):
+				return kindTable
+			case reads(key):
+				return kindInt
+			case op == bytecode.OpSetTable && reads(i.C()):
+				used = true
+			}
+		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpMod, bytecode.OpIDiv,
+			bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
+			for _, f := range [][2]int{{i.B(), i.C()}, {i.C(), i.B()}} {
+				if reads(f[0]) {
+					used = true
+					if t := other(f[1]); isNumKind(t) && meets == kindAny {
+						meets = t
+					}
+				}
+			}
+		case bytecode.OpDiv, bytecode.OpUnaryMinus, bytecode.OpMove, bytecode.OpCall:
+			used = used || reads(i.B()) || reads(i.C()) || op == bytecode.OpCall && r > i.A()
+		case bytecode.OpBitwise:
+			if reads(i.B()) || reads(i.C()) {
+				return kindInt
+			}
+		}
+		// The next pcs, unless this one writes r.
+		switch i.OpCode() {
+		case bytecode.OpBitwise:
+			if i.A() != r {
+				work = append(work, j+2)
+			}
+			continue
+		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
+			work = append(work, j+2)
+			if t, ok := kernelJump(code, j, k.latch); ok {
+				work = append(work, t)
+			}
+			continue
+		case bytecode.OpJump:
+			if t, ok := kernelJump(code, j, k.latch); ok {
+				work = append(work, t)
+			}
+			continue
+		case bytecode.OpSetTable, bytecode.OpSetTableUp:
+		default:
+			if i.A() == r {
+				continue
+			}
+		}
+		work = append(work, j+1)
+	}
+	switch t := k.observed(r); {
+	case !used:
+		return kindAny
+	case isNumKind(t):
+		return t
+	case meets != kindAny:
+		return meets
+	}
+	return kindFloat
 }
 
 // guess returns the likelier type of live-in register r, which nothing in
@@ -961,6 +1115,13 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 			}
 			results[ip] = t
 			cur[i.A()] = t
+		case bytecode.OpGetTable:
+			t := kindFloat // a buffer's element
+			if _, ok := k.tabUses[ip]; ok {
+				t = k.loads[ip]
+			}
+			results[ip] = t
+			cur[i.A()] = t
 		case bytecode.OpSetTable, bytecode.OpSetTableUp: // nothing written
 		case bytecode.OpGetUpValue: // an intrinsic's writes nothing
 			if s, ok := k.upLoads[ip]; ok {
@@ -1023,7 +1184,7 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 		}
 	}
 	for _, r := range k.liveIn {
-		if !isNumKind(k.types[r]) { // not an alias, checked on entry as a number
+		if !isRegKind(k.types[r]) { // not an alias, checked on entry
 			return false
 		}
 	}
@@ -1051,11 +1212,24 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 		case bytecode.OpJump, bytecode.OpGetUpValue:
 			continue
 		case bytecode.OpSetTable, bytecode.OpSetTableUp:
+			if field, ok := k.tabUses[ip]; ok {
+				if k.typeAt(ip, i.A()) != kindTable || !field && k.kind(p, ip, i.B()) != kindInt ||
+					!isRegKind(k.kind(p, ip, i.C())) {
+					return k.fail(ip)
+				}
+				continue
+			}
 			if !k.bufferKey(p, ip, i.B()) || !known(i.C()) {
 				return k.fail(ip)
 			}
 			continue
 		case bytecode.OpGetTable, bytecode.OpGetTableUp:
+			if field, ok := k.tabUses[ip]; ok {
+				if k.typeAt(ip, i.B()) != kindTable || !field && k.kind(p, ip, i.C()) != kindInt {
+					return k.fail(ip)
+				}
+				break
+			}
 			if !k.bufferKey(p, ip, i.C()) {
 				return k.fail(ip)
 			}
@@ -1172,6 +1346,37 @@ func kernelJump(code []bytecode.Instruction, ip, latch int) (int, bool) {
 	return t, t > ip && t <= latch
 }
 
+// stringKey reports whether RK field is a constant string, a field's key.
+func stringKey(p *prototype, field int) bool {
+	if !bytecode.IsConstant(field) {
+		return false
+	}
+	_, ok := p.Constants[bytecode.ConstantIndex(field)].str()
+	return ok
+}
+
+// isTable reports whether register r, which a GETTABLE or SETTABLE with a
+// number key indexes, holds a table rather than a buffer: one the body
+// wrote holds what a table gave (checkTypes checks it is a table), one the
+// function compiled holding a table, or one it puts a new table in.
+func (k *kernelPlan) isTable(code []bytecode.Instruction, r int, wrote bool) bool {
+	if wrote {
+		return true
+	}
+	switch k.observed(r) {
+	case kindTable:
+		return true
+	case kindBuffer:
+		return false
+	}
+	for _, i := range code {
+		if i.OpCode() == bytecode.OpNewTable && i.A() == r {
+			return true
+		}
+	}
+	return false
+}
+
 // kernelOp reports whether a kernel may run op; it leaves at any other.
 func kernelOp(op bytecode.OpCode) bool {
 	switch op {
@@ -1220,6 +1425,7 @@ const (
 	kindFloat
 	kindInt
 	kindBuffer // an upvalue holding a buffer, in hoistedUpValue
+	kindTable  // a table, which a kernel holds in a general-purpose register
 
 	// kindBufferAlias + s is a kernel register holding hoisted slot s's
 	// buffer, which the kernel keeps in the context, not the register.
@@ -1228,6 +1434,10 @@ const (
 
 // isNumKind reports whether t is a number's type.
 func isNumKind(t numKind) bool { return t == kindFloat || t == kindInt }
+
+// isRegKind reports whether a kernel holds a value of type t in a
+// register: a number or a table.
+func isRegKind(t numKind) bool { return isNumKind(t) || t == kindTable }
 
 // bufferSlot returns the hoisted slot a register of type t aliases, if it
 // is an alias.

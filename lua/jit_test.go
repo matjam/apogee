@@ -1199,6 +1199,44 @@ func TestJITGenericFor(t *testing.T) {
 	}
 }
 
+// Tail calls run in compiled code with arguments up to l.top (return
+// f(...)) and into vararg functions, whose frame then starts above their
+// arguments, as a call's does.
+func TestJITVarArgTailCalls(t *testing.T) {
+	skipWithoutJIT(t)
+	exits := map[string]int{}
+	jitExitHook = func(p *prototype, ip int, reason uint64) {
+		if p.LineDefined > 0 { // not the chunk, which makes the functions
+			exits[exitKind(p, ip, reason)]++
+		}
+	}
+	defer func() { jitExitHook = nil }()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBoth(t, `
+		local function sum(...) local a, b, c = ... return (a or 0) + (b or 0) + (c or 0) end
+		local function wrap(...) return sum(...) end
+		local function fixed(x, y) return x - (y or 0) end
+		local function wrap2(...) return fixed(...) end
+		local function vt(a, ...) return sum(a, ...) end
+		local function nested(a, ...) if a == 0 then return sum(...) end return nested(a - 1, a, ...) end
+		function run()
+		  local s = 0
+		  for i = 1, 300 do
+		    s = s + wrap(i, 2, 3, 4) + wrap() + wrap2(i, 1, 9) + wrap2(i) + vt(i) + vt(i, 5, 6) + nested(3)
+		  end
+		  return s
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q\ninterpreter %q", jit, interp)
+	}
+	for kind, n := range exits { // a call's first, before its callee compiles
+		if n > 5 {
+			t.Fatalf("%s exited %d times in 300 iterations: %v", kind, n, exits)
+		}
+	}
+}
+
 // A tail call from a vararg function puts the callee at the caller's
 // function slot, below the extra arguments, as the interpreter does, so
 // Go sees the callee's frame where it is when the callee calls Go.

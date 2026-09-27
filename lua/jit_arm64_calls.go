@@ -110,7 +110,7 @@ func (c *arm64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	a.Bind(based)
 	c.outOfLine = append(c.outOfLine, func() {
 		a.Bind(varArgs)
-		c.adjustVarArgs()
+		c.adjustVarArgs(rCI)
 		a.B(based)
 	})
 	a.AddShifted(rLen, rSlot, rLen, 0) // top = base + maxStackSize
@@ -171,8 +171,8 @@ func (c *arm64Compiler) exitIfUpValuesOpen(ip int) {
 // end in rSlot, the prototype in rT2 and &stack[0] in rStack, it leaves the
 // base in rSlot, the fixed parameters moved there and nil where they were,
 // and the vararg marker after them: nil, or the view of a named vararg
-// table only indexed. It uses rTmp, rTmp2, rN and rCI.
-func (c *arm64Compiler) adjustVarArgs() {
+// table only indexed. It uses rTmp, rTmp2, rN and tmp.
+func (c *arm64Compiler) adjustVarArgs(tmp Reg) {
 	a := &c.a
 	a.Ldr(rN, rT2, offPParams)
 	a.Add(rTmp, rIdx, rN)
@@ -185,10 +185,10 @@ func (c *arm64Compiler) adjustVarArgs() {
 	loop, marker := a.NewLabel(), a.NewLabel()
 	a.Bind(loop)
 	a.Cbz(rN, marker)
-	a.Ldr(rCI, rTmp, offP)
-	a.Str(rCI, rTmp2, offP)
-	a.Ldr(rCI, rTmp, offN)
-	a.Str(rCI, rTmp2, offN)
+	a.Ldr(tmp, rTmp, offP)
+	a.Str(tmp, rTmp2, offP)
+	a.Ldr(tmp, rTmp, offN)
+	a.Str(tmp, rTmp2, offN)
 	a.Str(ZR, rTmp, offP)
 	a.Str(ZR, rTmp, offN)
 	a.AddImm(rTmp, rTmp, valueSize)
@@ -335,10 +335,6 @@ func (c *arm64Compiler) tailSetMeta(ip int, i bytecode.Instruction) {
 func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	a := &c.a
 	ra, b := i.A(), i.B()
-	if b == 0 {
-		c.exitAlways(ip)
-		return
-	}
 	fn := reg(ra)
 	exit := c.exit(ip)
 	a.Ldr(rTmp, fn.base, fn.off+offN)
@@ -358,8 +354,9 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	c.branchNumber(rT, exit) // a number whose bits match the tag
 	a.Cbnz(rBarrier, exit)
 	a.Ldr(rT2, rT, offClProto)
-	a.Ldrb(rTmp, rT2, offPVarArg)
-	a.Cbnz(rTmp, exit)
+	a.Ldrb(rTmp, rT2, offPVarKind)
+	a.CmpImm(rTmp, uint32(bytecode.VarArgTable))
+	a.BCond(EQ, exit) // Go makes the table
 	a.Ldr(rCache, rT2, offPJit)
 	a.Cbz(rCache, exit)
 	a.Ldr(rState, rCtx, offCtxS)
@@ -367,34 +364,68 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	if len(c.p.Prototypes) > 0 {
 		c.exitIfUpValuesOpen(ip)
 	}
-	// checkStack(p.maxStackSize) with l.top at ci.function + b.
 	a.Ldr(rIdx, rCI, offCIFunction)
+	a.Ldr(rStack, rState, offStack)
+	// rN: the callee and its arguments, b, or up to l.top for B 0.
+	if b == 0 {
+		a.Ldr(rN, rState, offLTop)
+		a.AddShifted(rN, rStack, rN, 4)
+		a.Sub(rN, rN, rFrame)
+		a.SubImm(rN, rN, uint32(ra)*valueSize)
+		a.Lsr(rN, rN, 4)
+	} else {
+		a.MovImm(rN, uint64(b))
+	}
+	// checkStack(p.maxStackSize) with l.top at ci.function + rN, and the
+	// parameters for a vararg function: this checks both.
 	a.Ldr(rLen, rT2, offPMaxStack)
 	a.Ldr(rNext, rState, offLStackLast)
 	a.Sub(rNext, rNext, rIdx)
-	a.SubImm(rNext, rNext, uint32(b))
-	a.Cmp(rNext, rLen)
+	a.Sub(rNext, rNext, rN)
+	a.Ldr(rTmp, rT2, offPParams)
+	a.Add(rTmp, rTmp, rLen)
+	a.Cmp(rNext, rTmp)
 	a.BCond(LE, exit)
 	c.spend(ip) // a loop of tail calls has no back-edge
 	// Move the callee and its arguments down to stack[ci.function:], one
 	// slot below the frame, or further in a vararg function, whose
-	// arguments lie between; the callee's frame starts after it.
-	a.Ldr(rTmp, rState, offStack)
-	a.AddShifted(rSlot, rTmp, rIdx, 4)
-	for k := range b {
-		src := reg(ra + k)
-		a.Ldr(rTmp, rFrame, src.off+offP)
-		a.Str(rTmp, rSlot, uint32(k)*valueSize+offP)
-		a.Ldr(rTmp, rFrame, src.off+offN)
-		a.Str(rTmp, rSlot, uint32(k)*valueSize+offN)
+	// arguments lie between; the callee's frame starts after it, and
+	// l.top after its arguments.
+	a.AddShifted(rSlot, rStack, rIdx, 4)
+	if b != 0 {
+		for k := range b {
+			src := reg(ra + k)
+			a.Ldr(rTmp, rFrame, src.off+offP)
+			a.Str(rTmp, rSlot, uint32(k)*valueSize+offP)
+			a.Ldr(rTmp, rFrame, src.off+offN)
+			a.Str(rTmp, rSlot, uint32(k)*valueSize+offN)
+		}
+		a.AddImm(rFrame, rSlot, valueSize)
+	} else {
+		moved, next := a.NewLabel(), a.NewLabel()
+		a.AddImm(rTmp2, rFrame, uint32(ra)*valueSize)
+		a.AddImm(rFrame, rSlot, valueSize)
+		a.Mov(rAddr, rN)
+		a.Bind(next)
+		a.Cbz(rAddr, moved)
+		a.Ldr(rTmp, rTmp2, offP)
+		a.Str(rTmp, rSlot, offP)
+		a.Ldr(rTmp, rTmp2, offN)
+		a.Str(rTmp, rSlot, offN)
+		a.AddImm(rTmp2, rTmp2, valueSize)
+		a.AddImm(rSlot, rSlot, valueSize)
+		a.SubImm(rAddr, rAddr, 1)
+		a.B(next)
+		a.Bind(moved)
 	}
-	a.AddImm(rFrame, rSlot, valueSize)
+	a.Add(rTmp, rIdx, rN)
+	a.Str(rTmp, rState, offLTop)
 	// Clear the parameters the call does not pass.
 	loop, cleared := a.NewLabel(), a.NewLabel()
-	a.Ldr(rN, rT2, offPParams)
-	a.MovImm(rTmp, uint64(b-1))
+	a.Ldr(rNext, rT2, offPParams)
+	a.SubImm(rTmp, rN, 1)
 	a.Bind(loop)
-	a.Cmp(rTmp, rN)
+	a.Cmp(rTmp, rNext)
 	a.BCond(GE, cleared)
 	a.AddShifted(rTmp2, rFrame, rTmp, 4)
 	a.Str(ZR, rTmp2, offP)
@@ -412,7 +443,18 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 		a.Str(rTmp2, rP, offLCode+w)
 	}
 	a.Str(rT, rP, offLClosure)
+	varArgs, based := a.NewLabel(), a.NewLabel()
+	a.Ldrb(rTmp, rT2, offPVarArg)
+	a.Cbnz(rTmp, varArgs)
 	a.AddImm(rSlot, rIdx, 1) // base
+	a.Bind(based)
+	c.outOfLine = append(c.outOfLine, func() {
+		a.Bind(varArgs) // the frame starts above the arguments
+		a.Add(rSlot, rIdx, rN)
+		c.adjustVarArgs(rNext)
+		a.AddShifted(rFrame, rStack, rSlot, 4)
+		a.B(based)
+	})
 	a.Str(rFrame, rP, offLFrame)
 	a.Str(rLen, rP, offLFrame+offSliceLen)
 	a.AddShifted(rLen, rSlot, rLen, 0) // top = base + maxStackSize

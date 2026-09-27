@@ -22,14 +22,14 @@ const (
 var kernelInts = []Reg{R8, R9, R10, R11, R12, R13, CX}
 
 type kernel struct {
-	*kernelPlan
-	labels []Label
+	*irFunc
+	exits []Label // each snapshot's side exit, or -1 until it has one
 }
 
-// reg and ireg return register r's machine register as a float and as an
-// integer.
-func (k *kernel) reg(r int) XReg { return kernelFirst + XReg(k.slot(r, kindFloat)) }
-func (k *kernel) ireg(r int) Reg { return kernelInts[k.slot(r, kindInt)] }
+// reg and ireg return virtual register v's machine register, a float's
+// and an integer's.
+func (k *kernel) reg(v vreg) XReg { return kernelFirst + XReg(k.loc[v]) }
+func (k *kernel) ireg(v vreg) Reg { return kernelInts[k.loc[v]] }
 
 // findKernels returns the kernels for the FORLOOP at latch, an integer
 // loop's first, or nil when its loop does not qualify.
@@ -49,13 +49,17 @@ func (c *amd64Compiler) findKernels(latch int) []*kernel {
 	upValue := func(n int) (numKind, bool) { return upValueKind(c.cl, n) }
 	var ks []*kernel
 	for _, intLoop := range []bool{true, false} {
-		plan := planKernel(c.p, latch, intLoop, kernelCount, len(kernelInts), constOK, intrinsic, upValue, c.sse41)
+		plan := planKernel(c.p, latch, intLoop, constOK, intrinsic, upValue, c.sse41)
 		if plan == nil {
 			continue
 		}
-		k := &kernel{kernelPlan: plan, labels: make([]Label, latch-plan.start)}
-		for i := range k.labels {
-			k.labels[i] = c.a.NewLabel()
+		f := buildIR(c.p, plan)
+		if !f.allocate(kernelCount, len(kernelInts)) {
+			continue
+		}
+		k := &kernel{irFunc: f, exits: make([]Label, len(f.snaps))}
+		for i := range k.exits {
+			k.exits[i] = -1
 		}
 		ks = append(ks, k)
 	}
@@ -66,7 +70,6 @@ func (c *amd64Compiler) findKernels(latch int) []*kernel {
 // kernel or the ordinary FORLOOP code, when the entry check fails.
 func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 	a := &c.a
-	base := c.p.Code[k.latch].A()
 
 	a.CmpMem(rCtx, offBarrier, 0)
 	a.J(NE, normal)
@@ -82,10 +85,10 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 		a.J(NE, normal)
 	}
 	for _, r := range k.liveIn {
-		if k.types[r] == kindInt {
-			a.Load(k.ireg(r), rFrame, reg(r).off+offN)
+		if v := k.value(r, k.types[r]); k.types[r] == kindInt {
+			a.Load(k.ireg(v), rFrame, reg(r).off+offN)
 		} else {
-			a.LoadSD(k.reg(r), rFrame, reg(r).off+offN)
+			a.LoadSD(k.reg(v), rFrame, reg(r).off+offN)
 		}
 	}
 	counter := offKernels
@@ -95,23 +98,35 @@ func (c *amd64Compiler) emitKernel(k *kernel, normal Label) {
 	a.SubMem(rCtx, counter, -1)
 	body, latch, done := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	// The first FORLOOP: nothing has changed if the loop does not run.
-	c.kernelStep(k, base, body, c.pcs[k.latch+1])
+	c.kernelStep(k, body, c.pcs[k.latch+1])
 
 	a.Bind(body)
-	for ip := k.start; ip < k.latch; ip++ {
-		a.Bind(k.labels[ip-k.start])
-		ip += c.kernelInstruction(k, ip, latch)
+	labels := map[int]Label{k.latch: latch}
+	label := func(pc int) Label {
+		l, ok := labels[pc]
+		if !ok {
+			l = a.NewLabel()
+			labels[pc] = l
+		}
+		return l
+	}
+	for x := range k.insts {
+		if in := &k.insts[x]; in.op == irLabel {
+			a.Bind(label(in.target))
+		} else {
+			c.kernelInstruction(k, in, label)
+		}
 	}
 	a.Bind(latch)
 	next := a.NewLabel()
-	c.kernelStep(k, base, next, done)
+	c.kernelStep(k, next, done)
 	a.Bind(next)
 	out := a.NewLabel()
 	a.SubMem(rCtx, offBudget, 1)
 	a.J(E, out)
 	a.Jmp(body)
 	a.Bind(out)
-	end := k.at[k.latch-k.start]
+	end := &k.snaps[k.end]
 	c.flush(k, end)
 	if c.budget[k.start] < 0 {
 		c.budget[k.start] = a.NewLabel()
@@ -199,24 +214,29 @@ func (c *amd64Compiler) kernelGuards(k *kernel, normal Label) {
 	}
 }
 
-// kernelSideExit returns a label that leaves k at ip: it writes k's
-// registers back, and the ordinary code runs the instruction and the rest
-// of the iteration.
-func (c *amd64Compiler) kernelSideExit(k *kernel, ip int) Label {
+// kernelSideExit returns a label that leaves k by snapshot n: it writes
+// k's registers back, and the ordinary code runs the instruction and the
+// rest of the iteration.
+func (c *amd64Compiler) kernelSideExit(k *kernel, n int) Label {
+	if k.exits[n] >= 0 {
+		return k.exits[n]
+	}
 	a := &c.a
 	l := a.NewLabel()
+	k.exits[n] = l
 	c.outOfLine = append(c.outOfLine, func() {
+		s := &k.snaps[n]
 		a.Bind(l)
-		c.flush(k, k.at[ip-k.start])
-		for _, kc := range k.calleesAt(ip) { // after the flush: it uses kernel registers
+		c.flush(k, s)
+		for _, kc := range s.callees { // after the flush: it uses kernel registers
 			c.upValueAddr(kc.upValue)
 			c.load(operand{rAddr, 0})
 			c.store(reg(kc.a))
 		}
-		if kc, ok := k.calls[ip]; ok && c.p.Code[ip].B() == 0 { // its arguments run to l.top
-			c.setTop(kc.a + 1 + kc.args)
+		if s.top >= 0 {
+			c.setTop(s.top)
 		}
-		a.Jmp(c.pcs[ip])
+		a.Jmp(c.pcs[s.pc])
 	})
 	return l
 }
@@ -224,19 +244,15 @@ func (c *amd64Compiler) kernelSideExit(k *kernel, ip int) Label {
 // intrinsicSaved are the kernel registers sin and cos use.
 var intrinsicSaved = []Reg{rN, rT2, rIdx}
 
-// kernelCall compiles the CALL i at ip that k computes an intrinsic for:
-// on the argument in X0, saving the kernel registers the intrinsic's code
-// uses, into register A. The intrinsic's own exits leave the kernel with
-// register A holding the function again, as the ordinary CALL expects.
-func (c *amd64Compiler) kernelCall(k *kernel, ip int, i bytecode.Instruction) {
+// kernelCall compiles in, a number function's intrinsic: on the argument
+// in X0, saving the kernel registers the intrinsic's code uses. The
+// intrinsic's own exits leave the kernel with register A holding the
+// function again, as the ordinary CALL expects.
+func (c *amd64Compiler) kernelCall(k *kernel, in *irInst) {
 	a := &c.a
-	kc := k.calls[ip]
-	if kc.math != mathNone {
-		c.kernelMath(k, ip, i, kc.math)
-		return
-	}
 	var saved []Reg
-	if kc.fn != funcValue(math.Sqrt) { // sqrt is one instruction
+	fn := uint64(in.imm)
+	if fn != funcValue(math.Sqrt) { // sqrt is one instruction
 		for _, r := range intrinsicSaved {
 			if k.usesInt(r) {
 				saved = append(saved, r)
@@ -252,39 +268,36 @@ func (c *amd64Compiler) kernelCall(k *kernel, ip int, i bytecode.Instruction) {
 			a.Load(r, rCtx, offSpill+uint32(j)*8)
 		}
 	}
-	arg := i.A() + 1
-	if k.typeAt(ip, arg) == kindInt {
-		c.toFloat(0, k.ireg(arg))
-	} else {
-		a.MovSD(0, k.reg(arg))
+	if x := c.floatArg(k, in.a, 0); x != 0 {
+		a.MovSD(0, x)
 	}
 	save()
-	side, exit := a.NewLabel(), c.kernelSideExit(k, ip)
+	side, exit := a.NewLabel(), c.kernelSideExit(k, in.snap)
 	c.outOfLine = append(c.outOfLine, func() {
 		a.Bind(side)
 		restore()
 		a.Jmp(exit)
 	})
 	c.kernelExit = side
-	c.ip = ip
+	c.ip = in.pc
 	for _, in := range c.intrinsics() {
-		if in.fn == kc.fn {
+		if in.fn == fn {
 			in.emit()
 		}
 	}
 	c.kernelExit = -1
 	restore()
-	a.MovSD(k.reg(i.A()), 0)
+	a.MovSD(k.reg(in.dst), 0)
 }
 
-// kernelMath compiles the CALL i at ip of math function m on registers,
-// typed as callResult says. floor or ceil of a float leaves the kernel
-// when the result holds no integer, for Go to give the float.
-func (c *amd64Compiler) kernelMath(k *kernel, ip int, i bytecode.Instruction, m mathFn) {
+// kernelMath compiles in, a math function on registers, typed as
+// callResult says. floor or ceil of a float leaves the kernel when the
+// result holds no integer, for Go to give the float.
+func (c *amd64Compiler) kernelMath(k *kernel, in *irInst) {
 	a := &c.a
-	dst, arg := i.A(), i.A()+1
-	if k.typeAt(ip, arg) == kindInt {
-		a.Mov(AX, k.ireg(arg))
+	m := mathFn(in.imm)
+	if in.a.t == kindInt {
+		a.Mov(AX, k.ireg(in.a.v))
 		switch m {
 		case mathAbs:
 			pos := a.NewLabel()
@@ -293,7 +306,7 @@ func (c *amd64Compiler) kernelMath(k *kernel, ip int, i bytecode.Instruction, m 
 			a.Neg(AX) // minint stays minint
 			a.Bind(pos)
 		case mathMin, mathMax:
-			keep, b := a.NewLabel(), k.ireg(arg+1)
+			keep, b := a.NewLabel(), k.ireg(in.b.v)
 			if m == mathMin {
 				a.Cmp(b, AX) // the second if it is less
 			} else {
@@ -303,10 +316,10 @@ func (c *amd64Compiler) kernelMath(k *kernel, ip int, i bytecode.Instruction, m 
 			a.Mov(AX, b)
 			a.Bind(keep)
 		}
-		a.Mov(k.ireg(dst), AX) // floor and ceil: the integer itself
+		a.Mov(k.ireg(in.dst), AX) // floor and ceil: the integer itself
 		return
 	}
-	a.MovSD(0, k.reg(arg))
+	a.MovSD(0, k.reg(in.a.v))
 	switch m {
 	case mathFloor, mathCeil:
 		mode := byte(1)
@@ -317,15 +330,15 @@ func (c *amd64Compiler) kernelMath(k *kernel, ip int, i bytecode.Instruction, m 
 		a.Cvttsd2si(AX, 0) // 1<<63 for NaN and out of range, and -2^63
 		a.MovImm(DX, 1<<63)
 		a.Cmp(AX, DX)
-		a.J(E, c.kernelSideExit(k, ip))
-		a.Mov(k.ireg(dst), AX)
+		a.J(E, c.kernelSideExit(k, in.snap))
+		a.Mov(k.ireg(in.dst), AX)
 		return
 	case mathAbs:
 		a.MovImm(AX, 1<<63-1)
 		a.MovqToX(1, AX)
 		a.AndPD(0, 1)
 	case mathMin, mathMax:
-		keep, b := a.NewLabel(), k.reg(arg+1)
+		keep, b := a.NewLabel(), k.reg(in.b.v)
 		if m == mathMin {
 			a.Ucomisd(b, 0)
 		} else {
@@ -336,24 +349,23 @@ func (c *amd64Compiler) kernelMath(k *kernel, ip int, i bytecode.Instruction, m 
 		a.MovSD(0, b)
 		a.Bind(keep)
 	}
-	a.MovSD(k.reg(dst), 0)
+	a.MovSD(k.reg(in.dst), 0)
 }
 
-// kernelBuffer checks that key is inside the buffer the access at ip
-// reads, in register obj or hoisted, branching to side otherwise, and
-// leaves the address of its first element in DX and its kind in AX. The
-// key is in keyReg, or a constant.
-func (c *amd64Compiler) kernelBuffer(k *kernel, ip, obj, key int, side Label) (keyReg Reg, keyConst int64, isConst bool) {
+// kernelBuffer checks that in's key is inside the buffer it accesses,
+// branching to side otherwise, and leaves the address of its first
+// element in DX and its kind in AX. The key is in keyReg, or a constant.
+func (c *amd64Compiler) kernelBuffer(k *kernel, in *irInst, side Label) (keyReg Reg, keyConst int64, isConst bool) {
 	a := &c.a
-	if s := k.bufFrom[ip]; s >= 0 {
-		a.Load(rTmp, rCtx, offHoist+uint32(s)*8) // the *buffer
+	if in.buf >= 0 {
+		a.Load(rTmp, rCtx, offHoist+uint32(in.buf)*8) // the *buffer
 	} else {
-		a.Load(rTmp, rFrame, reg(obj).off+offP) // the userdata
+		a.Load(rTmp, rFrame, reg(in.obj).off+offP) // the userdata
 		a.Load(rTmp, rTmp, offUDBuf)
 	}
 	a.Load(DX, rTmp, offBufLen)
-	if bytecode.IsConstant(key) {
-		keyConst, isConst = c.p.Constants[bytecode.ConstantIndex(key)].i(), true
+	if key := in.a; key.isConst() {
+		keyConst, isConst = c.p.Constants[key.k].i(), true
 		if keyConst < 0 || keyConst >= 1<<31 {
 			a.Jmp(side)
 		} else {
@@ -361,10 +373,10 @@ func (c *amd64Compiler) kernelBuffer(k *kernel, ip, obj, key int, side Label) (k
 			a.J(BE, side) // unsigned: len <= key
 		}
 	} else {
-		if k.typeAt(ip, key) == kindFloat {
-			keyReg = c.floatKey(k, key, side)
+		if key.t == kindFloat {
+			keyReg = c.floatKey(k, key.v, in.tmp, side)
 		} else {
-			keyReg = k.ireg(key)
+			keyReg = k.ireg(key.v)
 		}
 		a.Cmp(keyReg, DX)
 		a.J(AE, side)
@@ -374,11 +386,11 @@ func (c *amd64Compiler) kernelBuffer(k *kernel, ip, obj, key int, side Label) (k
 	return
 }
 
-// floatKey converts the float key in register key to an integer in the
-// scratch register, leaving by side unless it has an integer value.
-func (c *amd64Compiler) floatKey(k *kernel, key int, side Label) Reg {
+// floatKey converts the float key in key to an integer in tmp, leaving
+// by side unless it has an integer value.
+func (c *amd64Compiler) floatKey(k *kernel, key, tmp vreg, side Label) Reg {
 	a := &c.a
-	x, s := k.reg(key), k.ireg(keyScratch)
+	x, s := k.reg(key), k.ireg(tmp)
 	a.Cvttsd2si(s, x)
 	c.toFloat(0, s)
 	a.Ucomisd(0, x)
@@ -397,35 +409,33 @@ func (c *amd64Compiler) elementAddr(keyReg Reg, keyConst int64, isConst bool, sc
 	return 0
 }
 
-// kernelGetBuffer compiles GETTABLE A B C in k: a buffer of floats' element.
-func (c *amd64Compiler) kernelGetBuffer(k *kernel, ip int, i bytecode.Instruction) {
+// kernelGetBuffer compiles in, a buffer of floats' element.
+func (c *amd64Compiler) kernelGetBuffer(k *kernel, in *irInst) {
 	a := &c.a
-	side := c.kernelSideExit(k, ip)
-	keyReg, keyConst, isConst := c.kernelBuffer(k, ip, i.B(), i.C(), side)
+	keyReg, keyConst, isConst := c.kernelBuffer(k, in, c.kernelSideExit(k, in.snap))
 	f32, done := a.NewLabel(), a.NewLabel()
 	a.Test(rTmp, rTmp)
 	a.J(NE, f32)
 	off := c.elementAddr(keyReg, keyConst, isConst, 3)
-	a.LoadSD(k.reg(i.A()), DX, off)
+	a.LoadSD(k.reg(in.dst), DX, off)
 	a.Jmp(done)
 	a.Bind(f32)
 	off = c.elementAddr(keyReg, keyConst, isConst, 2)
-	a.LoadSSToSD(k.reg(i.A()), DX, off)
+	a.LoadSSToSD(k.reg(in.dst), DX, off)
 	a.Bind(done)
 }
 
-// kernelSetBuffer compiles SETTABLE A B C in k: to a buffer's element,
-// converting as putBuffer does. An integer buffer given a float leaves
-// the kernel, for Go to check it has an integer value.
-func (c *amd64Compiler) kernelSetBuffer(k *kernel, ip int, i bytecode.Instruction) {
+// kernelSetBuffer compiles in, a store to a buffer's element, converting
+// as putBuffer does. An integer buffer given a float leaves the kernel,
+// for Go to check it has an integer value.
+func (c *amd64Compiler) kernelSetBuffer(k *kernel, in *irInst) {
 	a := &c.a
-	side := c.kernelSideExit(k, ip)
-	keyReg, keyConst, isConst := c.kernelBuffer(k, ip, i.A(), i.B(), side)
-	val := i.C()
-	kind := k.kind(c.p, ip, val)
+	side := c.kernelSideExit(k, in.snap)
+	keyReg, keyConst, isConst := c.kernelBuffer(k, in, side)
+	val := in.b
 	var constant value
-	if bytecode.IsConstant(val) {
-		constant = c.p.Constants[bytecode.ConstantIndex(val)]
+	if val.isConst() {
+		constant = c.p.Constants[val.k]
 	}
 	notF64, notF32, done := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	a.Test(rTmp, rTmp)
@@ -435,11 +445,11 @@ func (c *amd64Compiler) kernelSetBuffer(k *kernel, ip int, i bytecode.Instructio
 	case constant.isNumber(): // the bits, from a general register: see setIndex
 		a.MovImm(rTmp, math.Float64bits(constant.toFloat()))
 		a.Store(DX, off, rTmp)
-	case kind == kindInt:
-		c.toFloat(0, k.ireg(val))
+	case val.t == kindInt:
+		c.toFloat(0, k.ireg(val.v))
 		a.StoreSD(DX, off, 0)
 	default:
-		a.StoreSD(DX, off, k.reg(val))
+		a.StoreSD(DX, off, k.reg(val.v))
 	}
 	a.Jmp(done)
 	a.Bind(notF64)
@@ -450,17 +460,17 @@ func (c *amd64Compiler) kernelSetBuffer(k *kernel, ip int, i bytecode.Instructio
 	case constant.isNumber():
 		a.MovImm(rTmp, uint64(math.Float32bits(float32(constant.toFloat()))))
 		a.Store32(DX, off, rTmp)
-	case kind == kindInt:
-		c.toFloat(0, k.ireg(val))
+	case val.t == kindInt:
+		c.toFloat(0, k.ireg(val.v))
 		a.Cvtsd2ss(0, 0)
 		a.StoreSS(DX, off, 0)
 	default:
-		a.Cvtsd2ss(0, k.reg(val))
+		a.Cvtsd2ss(0, k.reg(val.v))
 		a.StoreSS(DX, off, 0)
 	}
 	a.Jmp(done)
 	a.Bind(notF32) // an integer buffer: an integer value, or Go converts
-	if kind != kindInt {
+	if val.t != kindInt {
 		a.Jmp(side)
 	} else {
 		r := rTmp
@@ -470,7 +480,7 @@ func (c *amd64Compiler) kernelSetBuffer(k *kernel, ip int, i bytecode.Instructio
 		if constant.isNumber() {
 			a.MovImm(rTmp, uint64(constant.i()))
 		} else {
-			r = k.ireg(val)
+			r = k.ireg(val.v)
 		}
 		off = c.elementAddr(keyReg, keyConst, isConst, 2)
 		a.Store32(DX, off, r)
@@ -485,10 +495,11 @@ func (c *amd64Compiler) kernelSetBuffer(k *kernel, ip int, i bytecode.Instructio
 	a.Bind(done)
 }
 
-// usesInt reports whether k keeps a Lua register in machine register r.
+// usesInt reports whether k keeps a virtual register in machine register
+// r.
 func (k *kernel) usesInt(r Reg) bool {
-	for s, n := range k.slots {
-		if s.t == kindInt && kernelInts[n] == r {
+	for v, s := range k.vregs {
+		if s.t == kindInt && kernelInts[k.loc[v]] == r {
 			return true
 		}
 	}
@@ -496,10 +507,10 @@ func (k *kernel) usesInt(r Reg) bool {
 }
 
 // kernelStep is FORLOOP on registers.
-func (c *amd64Compiler) kernelStep(k *kernel, base int, take, end Label) {
+func (c *amd64Compiler) kernelStep(k *kernel, take, end Label) {
 	a := &c.a
 	if k.intLoop {
-		idx, count, step, ext := k.ireg(base), k.ireg(base+1), k.ireg(base+2), k.ireg(base+3)
+		idx, count, step, ext := k.ireg(k.loop[0]), k.ireg(k.loop[1]), k.ireg(k.loop[2]), k.ireg(k.loop[3])
 		a.Test(count, count)
 		a.J(E, end)
 		a.SubImm(count, 1)
@@ -510,7 +521,7 @@ func (c *amd64Compiler) kernelStep(k *kernel, base int, take, end Label) {
 		a.Jmp(take)
 		return
 	}
-	idx, limit, step, ext := k.reg(base), k.reg(base+1), k.reg(base+2), k.reg(base+3)
+	idx, limit, step, ext := k.reg(k.loop[0]), k.reg(k.loop[1]), k.reg(k.loop[2]), k.reg(k.loop[3])
 	yes := a.NewLabel()
 	c.forStep(idx, limit, step, yes, end)
 	a.Bind(yes)
@@ -521,134 +532,124 @@ func (c *amd64Compiler) kernelStep(k *kernel, base int, take, end Label) {
 	a.Jmp(take)
 }
 
-// flush writes k's registers back to the frame, where they have types:
-// those the loop writes that are defined there.
-func (c *amd64Compiler) flush(k *kernel, types map[int]numKind) {
-	for _, r := range k.writtenOnce() {
-		switch types[r] {
+// flush writes snapshot s's registers back to the frame.
+func (c *amd64Compiler) flush(k *kernel, s *irSnap) {
+	for _, r := range s.regs {
+		switch r.t {
 		case kindInt:
-			c.storeInteger(reg(r), k.ireg(r))
+			c.storeInteger(reg(r.r), k.ireg(r.v))
 		case kindFloat:
-			c.storeNumber(reg(r), k.reg(r))
+			c.storeNumber(reg(r.r), k.reg(r.v))
 		}
 	}
 	// A register aliasing a hoisted buffer gets the upvalue's value, as
 	// the ordinary code expects. This uses kernel registers, so comes last.
-	for _, r := range k.writtenOnce() {
-		if s, ok := bufferSlot(types[r]); ok {
-			c.upValueAddr(k.hoisted[s].n)
+	for _, r := range s.regs {
+		if r.v == noVreg {
+			c.upValueAddr(k.hoisted[r.alias].n)
 			c.load(operand{rAddr, 0})
-			c.store(reg(r))
+			c.store(reg(r.r))
 		}
 	}
 }
 
-// floatOperand returns an SSE register holding RK field as a float before
-// ip: its kernel register, or tmp, into which it loads a constant or
-// converts an integer.
-func (c *amd64Compiler) floatOperand(k *kernel, ip, field int, tmp XReg) XReg {
+// floatArg returns an SSE register holding x as a float: its kernel
+// register, or tmp, into which it loads a constant or converts an
+// integer.
+func (c *amd64Compiler) floatArg(k *kernel, x irArg, tmp XReg) XReg {
 	a := &c.a
-	if !bytecode.IsConstant(field) {
-		if k.typeAt(ip, field) == kindInt {
-			c.toFloat(tmp, k.ireg(field))
+	if !x.isConst() {
+		if x.t == kindInt {
+			c.toFloat(tmp, k.ireg(x.v))
 			return tmp
 		}
-		return k.reg(field)
+		return k.reg(x.v)
 	}
-	kk := bytecode.ConstantIndex(field)
-	if v := c.p.Constants[kk]; v.isInteger() {
+	if v := c.p.Constants[x.k]; v.isInteger() {
 		a.MovImm(rTmp, math.Float64bits(float64(v.i())))
 		a.MovqToX(tmp, rTmp)
 		return tmp
 	}
-	o, _ := c.constant(kk)
+	o, _ := c.constant(x.k)
 	a.LoadSD(tmp, o.base, o.off+offN)
 	return tmp
 }
 
-// intOperand returns a register holding the integer RK field: its kernel
-// register, or tmp, into which it loads a constant.
-func (c *amd64Compiler) intOperand(k *kernel, field int, tmp Reg) Reg {
-	if !bytecode.IsConstant(field) {
-		return k.ireg(field)
+// intArg returns a register holding the integer x: its kernel register,
+// or tmp, into which it loads a constant.
+func (c *amd64Compiler) intArg(k *kernel, x irArg, tmp Reg) Reg {
+	if !x.isConst() {
+		return k.ireg(x.v)
 	}
-	o, _ := c.constant(bytecode.ConstantIndex(field))
+	o, _ := c.constant(x.k)
 	c.a.Load(tmp, o.base, o.off+offN)
 	return tmp
 }
 
-func (k *kernel) target(t int, latch Label) Label {
-	if t == k.latch {
-		return latch
-	}
-	return k.labels[t-k.start]
-}
+// irArith is the bytecode operator an arithmetic operation computes.
+var irArith = map[irOp]bytecode.OpCode{irAdd: bytecode.OpAdd, irSub: bytecode.OpSub, irMul: bytecode.OpMul, irDiv: bytecode.OpDiv}
 
-func (c *amd64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
+// kernelInstruction lowers the operation in; label returns a body pc's
+// label.
+func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int) Label) {
 	a := &c.a
 	p := c.p
-	i := p.Code[ip]
-	isInt := k.results[ip] == kindInt // what the instruction writes to A
-	switch op := i.OpCode(); op {
-	case bytecode.OpMove:
-		if !isNumKind(k.results[ip]) {
-			break // an alias of a hoisted buffer: nothing to move
-		}
+	isInt := in.dst != noVreg && k.typeOf(in.dst) == kindInt
+	switch in.op {
+	case irMove:
 		if isInt {
-			a.Mov(k.ireg(i.A()), k.ireg(i.B()))
+			a.Mov(k.ireg(in.dst), k.ireg(in.a.v))
 		} else {
-			a.MovSD(k.reg(i.A()), k.reg(i.B()))
+			a.MovSD(k.reg(in.dst), k.reg(in.a.v))
 		}
-	case bytecode.OpLoadConstant:
-		o, _ := c.constant(i.Bx())
-		switch v := p.Constants[i.Bx()]; {
+	case irConst:
+		o, _ := c.constant(in.a.k)
+		switch v := p.Constants[in.a.k]; {
 		case isInt:
-			a.Load(k.ireg(i.A()), o.base, o.off+offN)
+			a.Load(k.ireg(in.dst), o.base, o.off+offN)
 		case v.isInteger(): // promoted: see promoteConstants
 			a.MovImm(rTmp, math.Float64bits(float64(v.i())))
-			a.MovqToX(k.reg(i.A()), rTmp)
+			a.MovqToX(k.reg(in.dst), rTmp)
 		default:
-			a.LoadSD(k.reg(i.A()), o.base, o.off+offN)
+			a.LoadSD(k.reg(in.dst), o.base, o.off+offN)
 		}
-	case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv:
+	case irAdd, irSub, irMul, irDiv:
 		if isInt {
 			// In AX, as the destination may be an operand.
-			if b := c.intOperand(k, i.B(), AX); b != AX {
+			if b := c.intArg(k, in.a, AX); b != AX {
 				a.Mov(AX, b)
 			}
-			cc := c.intOperand(k, i.C(), DX)
-			switch op {
-			case bytecode.OpAdd:
+			cc := c.intArg(k, in.b, DX)
+			switch in.op {
+			case irAdd:
 				a.Add(AX, cc)
-			case bytecode.OpSub:
+			case irSub:
 				a.Sub(AX, cc)
-			case bytecode.OpMul:
+			case irMul:
 				a.Imul(AX, cc)
 			}
-			a.Mov(k.ireg(i.A()), AX)
+			a.Mov(k.ireg(in.dst), AX)
 			break
 		}
-		b, cc := c.floatOperand(k, ip, i.B(), 0), c.floatOperand(k, ip, i.C(), 1)
-		c.arith(op, 4, b, cc) // in X4, as the destination may be an operand
-		a.MovSD(k.reg(i.A()), 4)
-	case bytecode.OpBitwise:
-		op := bytecode.ArithOp(p.Code[ip+1].Ax())
-		if b := c.intOperand(k, i.B(), AX); b != AX {
+		b, cc := c.floatArg(k, in.a, 0), c.floatArg(k, in.b, 1)
+		c.arith(irArith[in.op], 4, b, cc) // in X4, as the destination may be an operand
+		a.MovSD(k.reg(in.dst), 4)
+	case irAnd, irOr, irXor, irNot, irShift:
+		if b := c.intArg(k, in.a, AX); b != AX {
 			a.Mov(AX, b)
 		}
-		switch op {
-		case bytecode.ArithBAnd:
-			a.And(AX, c.intOperand(k, i.C(), DX))
-		case bytecode.ArithBOr:
-			a.Or(AX, c.intOperand(k, i.C(), DX))
-		case bytecode.ArithBXor:
-			a.Xor(AX, c.intOperand(k, i.C(), DX))
-		case bytecode.ArithBNot:
+		switch in.op {
+		case irAnd:
+			a.And(AX, c.intArg(k, in.b, DX))
+		case irOr:
+			a.Or(AX, c.intArg(k, in.b, DX))
+		case irXor:
+			a.Xor(AX, c.intArg(k, in.b, DX))
+		case irNot:
 			a.Not(AX)
-		case bytecode.ArithShl, bytecode.ArithShr:
-			n := p.Constants[bytecode.ConstantIndex(i.C())].i()
-			switch count, zero := constantShift(n, op == bytecode.ArithShr); {
-			case zero:
+		case irShift:
+			switch count := in.imm; {
+			case in.flag:
 				a.MovImm(AX, 0)
 			case count >= 0:
 				a.Shl(AX, uint8(count))
@@ -656,30 +657,27 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 				a.Shr(AX, uint8(-count))
 			}
 		}
-		a.Mov(k.ireg(i.A()), AX)
-		return 1 // the operator's word
-	case bytecode.OpIDiv, bytecode.OpMod:
-		if op == bytecode.OpIDiv && !isInt { // floats: floor(b / c)
-			b, cc := c.floatOperand(k, ip, i.B(), 0), c.floatOperand(k, ip, i.C(), 1)
-			c.arith(bytecode.OpDiv, 4, b, cc)
-			a.RoundSD(4, 4, 1)
-			a.MovSD(k.reg(i.A()), 4)
-			break
+		a.Mov(k.ireg(in.dst), AX)
+	case irFloorDiv: // floor(b / c)
+		b, cc := c.floatArg(k, in.a, 0), c.floatArg(k, in.b, 1)
+		c.arith(bytecode.OpDiv, 4, b, cc)
+		a.RoundSD(4, 4, 1)
+		a.MovSD(k.reg(in.dst), 4)
+	case irFloatMod: // by a floatModDivisor
+		if b := c.floatArg(k, in.a, 0); b != 0 {
+			a.MovSD(0, b)
 		}
-		if !isInt { // floats, by a floatModDivisor
-			if b := c.floatOperand(k, ip, i.B(), 0); b != 0 {
-				a.MovSD(0, b)
-			}
-			d, _ := floatModDivisor(p.Constants[bytecode.ConstantIndex(i.C())])
-			c.floatMod(d)
-			a.MovSD(k.reg(i.A()), 3)
-			break
-		}
+		c.floatMod(math.Float64frombits(uint64(in.imm)))
+		a.MovSD(k.reg(in.dst), 3)
+	case irIntDiv, irIntMod:
 		// By a nonzero constant: floor the quotient toward minus infinity,
 		// and give the modulo the divisor's sign.
-		kk := bytecode.ConstantIndex(i.C())
-		divisor := p.Constants[kk].i()
-		b, d := k.ireg(i.B()), k.ireg(i.A())
+		op := bytecode.OpIDiv
+		if in.op == irIntMod {
+			op = bytecode.OpMod
+		}
+		divisor := in.imm
+		b, d := k.ireg(in.a.v), k.ireg(in.dst)
 		if divisor == -1 { // IDIV would trap on minint / -1
 			if op == bytecode.OpMod {
 				a.MovImm(d, 0)
@@ -693,7 +691,7 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 			a.Mov(d, c.divideByConstant(op, plan, b))
 			break
 		}
-		o, _ := c.constant(kk)
+		o, _ := c.constant(in.b.k)
 		a.Mov(AX, b)
 		a.Cqo()
 		a.IdivMem(o.base, o.off+offN) // AX: toward zero; DX: b's sign
@@ -716,51 +714,45 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, ip int, latch Label) int {
 		} else {
 			a.Mov(d, AX)
 		}
-	case bytecode.OpUnaryMinus:
+	case irNeg:
 		if isInt {
-			a.Mov(k.ireg(i.A()), k.ireg(i.B()))
-			a.Neg(k.ireg(i.A()))
+			a.Mov(k.ireg(in.dst), k.ireg(in.a.v))
+			a.Neg(k.ireg(in.dst))
 			break
 		}
-		a.MovSD(4, k.reg(i.B()))
+		a.MovSD(4, k.reg(in.a.v))
 		c.signMask(3)
 		a.XorPD(4, 3)
-		a.MovSD(k.reg(i.A()), 4)
-	case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual:
-		t, _ := kernelJump(p.Code, ip, k.latch)
-		yes, no := k.target(t, latch), k.target(ip+2, latch)
-		if k.kind(p, ip, i.B()) == kindInt && k.kind(p, ip, i.C()) == kindInt {
-			a.Cmp(c.intOperand(k, i.B(), AX), c.intOperand(k, i.C(), DX))
-			when := map[bytecode.OpCode]Cond{bytecode.OpEqual: E, bytecode.OpLessThan: L, bytecode.OpLessOrEqual: LE}[op]
-			if i.A() == 0 {
+		a.MovSD(k.reg(in.dst), 4)
+	case irBranch:
+		yes, no := label(in.target), label(in.pc+2)
+		if in.a.t == kindInt && in.b.t == kindInt {
+			a.Cmp(c.intArg(k, in.a, AX), c.intArg(k, in.b, DX))
+			when := map[bytecode.OpCode]Cond{bytecode.OpEqual: E, bytecode.OpLessThan: L, bytecode.OpLessOrEqual: LE}[in.cmp]
+			if !in.flag {
 				when ^= 1
 			}
 			a.J(when, yes)
 			a.Jmp(no)
-			return 1
+			return
 		}
-		b, cc := c.floatOperand(k, ip, i.B(), 0), c.floatOperand(k, ip, i.C(), 1)
-		c.compare(op, i.A() != 0, b, cc, yes, no)
-		return 1
-	case bytecode.OpJump:
-		t, _ := kernelJump(p.Code, ip, k.latch)
-		a.Jmp(k.target(t, latch))
-	case bytecode.OpGetUpValue:
-		// The function an intrinsic call checked on entry, or a buffer the
-		// context holds: nothing. A number, from the context.
-		if s, ok := k.upLoads[ip]; ok && isNumKind(k.results[ip]) {
-			if isInt {
-				a.Load(k.ireg(i.A()), rCtx, offHoist+uint32(s)*8)
-			} else {
-				a.LoadSD(k.reg(i.A()), rCtx, offHoist+uint32(s)*8)
-			}
+		b, cc := c.floatArg(k, in.a, 0), c.floatArg(k, in.b, 1)
+		c.compare(in.cmp, in.flag, b, cc, yes, no)
+	case irJump:
+		a.Jmp(label(in.target))
+	case irHoist: // a number, from the context
+		if isInt {
+			a.Load(k.ireg(in.dst), rCtx, offHoist+uint32(in.imm)*8)
+		} else {
+			a.LoadSD(k.reg(in.dst), rCtx, offHoist+uint32(in.imm)*8)
 		}
-	case bytecode.OpCall:
-		c.kernelCall(k, ip, i)
-	case bytecode.OpGetTable, bytecode.OpGetTableUp: // GETTABUP's B, the upvalue, is hoisted
-		c.kernelGetBuffer(k, ip, i)
-	case bytecode.OpSetTable, bytecode.OpSetTableUp:
-		c.kernelSetBuffer(k, ip, i)
+	case irIntrinsic:
+		c.kernelCall(k, in)
+	case irMath:
+		c.kernelMath(k, in)
+	case irBufGet:
+		c.kernelGetBuffer(k, in)
+	case irBufSet:
+		c.kernelSetBuffer(k, in)
 	}
-	return 0
 }

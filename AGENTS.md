@@ -399,7 +399,8 @@ nothing compiles.
   - `jit_arm64*.go` and `jit_amd64*.go` are separate, with the same
     structure.
   - Shared pieces: struct offsets (jit_layout.go), the numeric-loop
-    analysis (jit_kernel.go) and the trig constants (jit_trig.go).
+    analysis (jit_kernel.go), the kernels' IR (jit_ir.go) and the trig
+    constants (jit_trig.go).
   - The encoders in internal/jit/arm64 and internal/jit/amd64 are checked
     against clang's output.
   - arm64's TBZ and TBNZ reach ±32 KB, which a function of a hundred
@@ -490,12 +491,17 @@ nothing compiles.
   entries by kind, for `TestJITKernels`.
   - **Types per pc.** `planKernel` types each register before each body
     pc (`at`), because Lua reuses a temporary for an integer and then a
-    float; a register gets a machine register for each type it takes
-    (`slots`, `allocate`). The loop's registers, live-in ones and locals
-    below the loop keep theirs throughout; the body's temporaries share by
+    float.
+  - **IR.** `buildIR` turns the typed body into operations on virtual
+    registers, one per Lua register and type it takes (`irFunc.vregs`);
+    an operation that can leave names a snapshot (`irSnap`) of what to
+    write back. `allocate` gives each virtual register a machine register
+    (`loc`), and `kernelInstruction` lowers each operation per
+    architecture. The loop's registers, live-in ones and locals below the
+    loop keep theirs throughout; the body's temporaries share by
     liveness, so a result may take the register of an operand it reads
-    last, which every kernel emitter must allow by reading its operands
-    before writing its result. amd64 has 7 integer registers, and an
+    last, which every lowering must allow by reading its operands before
+    writing its result. `irFunc.String` prints the IR. amd64 has 7 integer registers, and an
     integer loop takes 3 of them: the loop variable shares the index's,
     as the body cannot write it. A live-in register the body writes starts with the type it
     ends with; one nothing decides takes `guess`'s type, a float only
@@ -520,8 +526,8 @@ nothing compiles.
     is typed as an alias of it and written back only on the way out.
   - **Side exits.** A key out of range, a float for an integer buffer or
     an argument trig leaves to Go leaves the kernel mid-body
-    (`kernelSideExit`): it writes back the registers defined at that pc
-    and jumps to the ordinary code for the instruction. Locals of the
+    (`kernelSideExit`, one per snapshot): it writes back the registers
+    defined at that pc and jumps to the ordinary code for the instruction. Locals of the
     enclosing function the body writes are live-in when a kernel can side
     exit, so they hold the last iteration's values there: an error may
     close upvalues over them.

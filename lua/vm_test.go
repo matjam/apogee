@@ -145,6 +145,17 @@ func TestVarArgMeta(t *testing.T) {
 	testString(t, s)
 }
 
+// A metatable caches which of its tag methods are absent, one bit each:
+// finding no __index must not hide __len or __eq.
+func TestTagMethodCache(t *testing.T) {
+	testString(t, `
+		local mt = {__len = function() return 42 end, __eq = function() return true end}
+		local t, u = setmetatable({}, mt), setmetatable({}, mt)
+		local _ = t.x, u.x -- no __index: cached as absent
+		assert(#t == 42)
+		assert(t == u)`)
+}
+
 func TestCanRemoveNilObjectFromStack(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {

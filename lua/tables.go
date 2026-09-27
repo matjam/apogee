@@ -190,7 +190,7 @@ func (t *table) compact() {
 }
 
 func (l *State) fastTagMethod(table *table, event tm) value {
-	if table == nil || table.flags&1<<event != 0 {
+	if table == nil || table.flags&(1<<event) != 0 {
 		return nilValue
 	}
 	return table.tagMethod(event, l.global.tagMethodNames[event])

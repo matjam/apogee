@@ -109,6 +109,9 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure) (code []byte, offs
 	c.stubs()
 	code, err := c.a.Code()
 	if err != nil {
+		if jitStrict {
+			panic(err)
+		}
 		return nil, nil, nil, 0
 	}
 	offsets = make([]int32, len(c.code))
@@ -156,8 +159,8 @@ func (c *amd64Compiler) stubs() {
 			a.Jmp(c.pcs[ip+1])
 		}
 	}
-	for _, emit := range c.outOfLine {
-		emit()
+	for k := 0; k < len(c.outOfLine); k++ { // an emit may add more
+		c.outOfLine[k]()
 	}
 	for ip, l := range c.exits {
 		if l >= 0 {

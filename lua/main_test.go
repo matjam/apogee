@@ -10,6 +10,7 @@ import (
 // Without it states compile hot functions, as they do by default, and
 // APOGEE_JIT=off runs the suite interpreted.
 func TestMain(m *testing.M) {
+	jitStrict = true
 	if os.Getenv("APOGEE_JIT_TEST") == "1" {
 		jitThreshold, jitMinRun = 0, 0
 	}

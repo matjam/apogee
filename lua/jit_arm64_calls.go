@@ -338,11 +338,22 @@ func (c *arm64Compiler) returnLua(ip int, i bytecode.Instruction) {
 		a.Sub(rSlot, rSlot, rFrame)
 		a.SubImm(rSlot, rSlot, uint32(ra)*valueSize)
 		a.Lsr(rSlot, rSlot, 4)
-	} else {
-		a.MovImm(rSlot, uint64(b-1))
 	}
 	all, copied, resume := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	a.Tbnz(rLen, 63, all)
+	// All of them, with l.top after them: out of line, as callers of
+	// fixed results are the most.
+	c.outOfLine = append(c.outOfLine, func() {
+		a.Bind(all)
+		if b != 0 {
+			a.MovImm(rSlot, uint64(b-1))
+		}
+		c.copyResults(ra)
+		a.Ldr(rTmp2, rCI, offCIFunction)
+		a.Add(rTmp2, rTmp2, rSlot)
+		a.Str(rTmp2, rState, offLTop)
+		a.B(resume)
+	})
 	// A wanted number: min(rSlot, wanted) results, then nil up to wanted.
 	if b != 0 {
 		for k := range b - 1 {
@@ -370,13 +381,6 @@ func (c *arm64Compiler) returnLua(ip int, i bytecode.Instruction) {
 	a.B(loop)
 	a.Bind(cleared)
 	a.Ldr(rTmp2, rNext, offCITop) // l.top = ci.previous.top
-	a.Str(rTmp2, rState, offLTop)
-	a.B(resume)
-	// All of them, with l.top after them.
-	a.Bind(all)
-	c.copyResults(ra)
-	a.Ldr(rTmp2, rCI, offCIFunction)
-	a.Add(rTmp2, rTmp2, rSlot)
 	a.Str(rTmp2, rState, offLTop)
 
 	// l.callInfo = ci.previous; resume the caller.

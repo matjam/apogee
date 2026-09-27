@@ -412,12 +412,23 @@ func (c *amd64Compiler) returnLua(ip int, i bytecode.Instruction) {
 		a.Sub(R13, rFrame)
 		a.SubImm(R13, int32(uint32(ra)*valueSize))
 		a.Shr(R13, 4)
-	} else {
-		a.MovImm(R13, uint64(b-1))
 	}
 	all, copied, resume := a.NewLabel(), a.NewLabel(), a.NewLabel()
 	a.Bt(CX, 63)
 	a.J(B, all)
+	// All of them, with l.top after them: out of line, as callers of
+	// fixed results are the most.
+	c.outOfLine = append(c.outOfLine, func() {
+		a.Bind(all)
+		if b != 0 {
+			a.MovImm(R13, uint64(b-1))
+		}
+		c.copyResults(ra)
+		a.Load(AX, R8, offCIFunction)
+		a.Add(AX, R13)
+		a.Store(R12, offLTop, AX)
+		a.Jmp(resume)
+	})
 	// A wanted number: min(R13, wanted) results, then nil up to wanted.
 	if b != 0 {
 		for k := range b - 1 {
@@ -453,13 +464,6 @@ func (c *amd64Compiler) returnLua(ip int, i bytecode.Instruction) {
 	a.Jmp(loop)
 	a.Bind(cleared)
 	a.Load(AX, R9, offCITop) // l.top = ci.previous.top
-	a.Store(R12, offLTop, AX)
-	a.Jmp(resume)
-	// All of them, with l.top after them.
-	a.Bind(all)
-	c.copyResults(ra)
-	a.Load(AX, R8, offCIFunction)
-	a.Add(AX, R13)
 	a.Store(R12, offLTop, AX)
 
 	// l.callInfo = ci.previous; resume the caller.

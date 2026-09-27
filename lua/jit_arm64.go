@@ -85,6 +85,9 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure) (code []byte, offs
 		code, offsets, entries, kernels, err = compileARM64(p, g, cl, true)
 	}
 	if err != nil {
+		if jitStrict && !errors.Is(err, ErrRange) { // too long is no bug
+			panic(err)
+		}
 		return nil, nil, nil, 0
 	}
 	return code, offsets, entries, kernels
@@ -182,8 +185,8 @@ func (c *arm64Compiler) stubs() {
 			a.B(c.pcs[ip+1])
 		}
 	}
-	for _, emit := range c.outOfLine {
-		emit()
+	for k := 0; k < len(c.outOfLine); k++ { // an emit may add more
+		c.outOfLine[k]()
 	}
 	for ip, l := range c.exits {
 		if l >= 0 {

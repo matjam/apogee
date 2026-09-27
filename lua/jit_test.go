@@ -1024,6 +1024,8 @@ func TestJITKernelRegisters(t *testing.T) {
 		"local k = floor(a[i]); iout[i] = min(255, k)",
 		"local k = floor(a[i]); if k < 0 then k = 0 elseif k > 255 then k = 255 end; iout[i] = k",
 		"local x = floor(a[i]) // 7; s = s + min(x, 100)",
+		// Eight integers, but the loop variable shares the index's register.
+		"local x = floor(a[i]); local y = min(x, 100); s = s + max(y, -100) + x // 7",
 	} {
 		t.Run(body, func(t *testing.T) {
 			runtime.GC()

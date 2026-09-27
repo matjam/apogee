@@ -484,8 +484,9 @@ nothing compiles.
     below the loop keep theirs throughout; the body's temporaries share by
     liveness, so a result may take the register of an operand it reads
     last, which every kernel emitter must allow by reading its operands
-    before writing its result. amd64 has 7 integer registers, and the
-    loop takes 4 of them. A live-in register the body writes starts with the type it
+    before writing its result. amd64 has 7 integer registers, and an
+    integer loop takes 3 of them: the loop variable shares the index's,
+    as the body cannot write it. A live-in register the body writes starts with the type it
     ends with; one nothing decides takes `guess`'s type, a float only
     when it meets floats more than integers (a time parameter), since a
     wrong guess costs the kernel.
@@ -616,7 +617,7 @@ remains follows from running on Go.
   Elsewhere, Windows included, states interpret.
 - **Speed.** With the JIT, apogee takes 0.70 times C Lua 5.5's time on
   the standard benchmarks on the 9900X3D; without it, 1.8 times. It is
-  faster on all 17, least on CD (0.83 times) and Json (0.90). The M1's results are
+  faster on all 17, least on CD (0.85 times) and Json (0.90). The M1's results are
   still against 5.4; re-measure there with `-tags clua55`
   (bench/README.md, "Reproducing").
 
@@ -733,7 +734,7 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
   vararg functions, GETTABLE and SETTABLE with keys that are not constant
   strings or array indices, CONCAT, and the sort comparator's return to
   Go.
-- CD, the standard benchmark closest to C Lua 5.5 (0.83 times), spent
+- CD, the standard benchmark closest to C Lua 5.5 (0.85 times), spent
   about a fifth of its time in `jitStep` before constructors' setmetatable
   compiled, most of that creating tables
   (`newTableAt`) and storing into their hash parts (`setTableAt`): the

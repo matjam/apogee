@@ -1099,6 +1099,45 @@ func TestJITOpenCalls(t *testing.T) {
 	}
 }
 
+// math.min and max of a float and an integer run in compiled code when the
+// integer converts to a float exactly, returning the argument chosen with
+// its type; Go compares larger integers.
+func TestJITMixedMinMax(t *testing.T) {
+	skipWithoutJIT(t)
+	exits, stop := exitsAt("CALL (Go function)")
+	defer stop()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBoth(t, `
+		local min, max = math.min, math.max
+		local exact = {0, -0.0, 0.0, 1, 1.0, -3, 2.5, 1 << 53, 2^53, -(1 << 53), -2^53, 2^53 + 2, 0/0, 1/0, -1/0}
+		local big = {(1 << 53) + 1, math.maxinteger, math.mininteger, 2^63, -2^63, 1.5}
+		local out, k = {}, 0
+		local function all(xs)
+		  for i = 1, #xs do
+		    for j = 1, #xs do
+		      local x, y = xs[i], xs[j]
+		      local lo, hi = min(x, y), max(x, y)
+		      out[k + 1], out[k + 2], out[k + 3] = lo, hi, 1 / lo -- the sign of zero
+		      k = k + 3
+		    end
+		  end
+		end
+		function run()
+		  all(exact)
+		  all(big)
+		  return table.unpack(out)
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q, interpreter %q", jit, interp)
+	}
+	// big's 18 pairs of an integer beyond 2^53 and a float call Go for
+	// min and max. (table.unpack is a TAILCALL.)
+	if want := 18 * 2; *exits != want {
+		t.Fatalf("%d Go calls, want %d", *exits, want)
+	}
+}
+
 // # of strings, buffers and tables without __len runs in compiled code:
 // a table's array length, or a border by binary search when its last
 // element is nil. A hash part, __len or other userdata exit, and agree.

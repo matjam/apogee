@@ -713,7 +713,7 @@ func (c *amd64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
 		args = 2
 	}
 	c.checkArgs(i, args, goCall)
-	isFloat := a.NewLabel()
+	isFloat, mixed := a.NewLabel(), a.NewLabel()
 	// rTmp: 0 for a float argument, 1 for an integer; anything else calls
 	// Go, which raises the error.
 	a.Load(rTmp, arg.base, arg.off+offP)
@@ -722,7 +722,7 @@ func (c *amd64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
 		a.Load(rTmp2, arg2.base, arg2.off+offP)
 		a.Sub(rTmp2, rNumber)
 		a.Cmp(rTmp, rTmp2)
-		a.J(NE, goCall)
+		a.J(NE, mixed)
 	}
 	a.Test(rTmp, rTmp)
 	a.J(E, isFloat)
@@ -804,6 +804,57 @@ func (c *amd64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
 	}
 	c.storeNumber(fn, 0)
 	a.Jmp(next)
+	if m.unary() {
+		return
+	}
+	// A float and an integer: the one chosen, keeping its type. They
+	// compare as floats when the integer converts exactly, as Lua's
+	// LTintfloat does; Go compares the rest.
+	a.Bind(mixed)
+	a.CmpImm(rTmp, 1)
+	a.J(A, goCall) // not a number
+	a.CmpImm(rTmp2, 1)
+	a.J(A, goCall)
+	intFirst, compare := a.NewLabel(), a.NewLabel()
+	a.Test(rTmp, rTmp)
+	a.J(NE, intFirst)
+	a.LoadSD(0, arg.base, arg.off+offN)
+	c.exactFloat(1, arg2, goCall)
+	a.Jmp(compare)
+	a.Bind(intFirst)
+	c.exactFloat(0, arg, goCall)
+	a.LoadSD(1, arg2.base, arg2.off+offN)
+	a.Bind(compare)
+	c.guardStore(fn, noReg, ip)
+	first := a.NewLabel()
+	if m == mathMin {
+		a.Ucomisd(1, 0)
+	} else {
+		a.Ucomisd(0, 1)
+	}
+	a.J(P, first)
+	a.J(AE, first)
+	c.load(arg2)
+	c.store(fn)
+	a.Jmp(next)
+	a.Bind(first)
+	c.load(arg)
+	c.store(fn)
+	a.Jmp(next)
+}
+
+// exactFloat loads the integer at o into x as a float, jumping to fail
+// unless it converts exactly: -2^53 <= i <= 2^53. It uses rN, rTmp and
+// rTmp2.
+func (c *amd64Compiler) exactFloat(x XReg, o operand, fail Label) {
+	a := &c.a
+	a.Load(rN, o.base, o.off+offN)
+	a.MovImm(rTmp, 1<<53)
+	a.Add(rTmp, rN)
+	a.MovImm(rTmp2, 1<<54)
+	a.Cmp(rTmp, rTmp2)
+	a.J(A, fail) // unsigned: outside
+	c.toFloat(x, rN)
 }
 
 // intrinsic compiles a unary intrinsic call, jumping to notGo when the

@@ -647,7 +647,7 @@ func (c *arm64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
 		args = 2
 	}
 	c.checkArgs(i, args, goCall)
-	isFloat := a.NewLabel()
+	isFloat, mixed := a.NewLabel(), a.NewLabel()
 	// rTmp: 0 for a float argument, 1 for an integer; anything else calls
 	// Go, which raises the error.
 	a.Ldr(rTmp, arg.base, arg.off+offP)
@@ -656,7 +656,7 @@ func (c *arm64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
 		a.Ldr(rTmp2, arg2.base, arg2.off+offP)
 		a.Sub(rTmp2, rTmp2, rNumber)
 		a.Cmp(rTmp, rTmp2)
-		a.BCond(NE, goCall)
+		a.BCond(NE, mixed)
 	}
 	a.Cbz(rTmp, isFloat)
 	a.CmpImm(rTmp, 1)
@@ -725,6 +725,55 @@ func (c *arm64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
 	}
 	c.storeNumber(fn, 0)
 	a.B(next)
+	if m.unary() {
+		return
+	}
+	// A float and an integer: the one chosen, keeping its type. They
+	// compare as floats when the integer converts exactly, as Lua's
+	// LTintfloat does; Go compares the rest.
+	a.Bind(mixed)
+	a.CmpImm(rTmp, 1)
+	a.BCond(HI, goCall) // not a number
+	a.CmpImm(rTmp2, 1)
+	a.BCond(HI, goCall)
+	intFirst, compare := a.NewLabel(), a.NewLabel()
+	a.Cbnz(rTmp, intFirst)
+	a.LdrD(0, arg.base, arg.off+offN)
+	c.exactFloat(1, arg2, goCall)
+	a.B(compare)
+	a.Bind(intFirst)
+	c.exactFloat(0, arg, goCall)
+	a.LdrD(1, arg2.base, arg2.off+offN)
+	a.Bind(compare)
+	c.guardStore(fn, noReg, ip)
+	first := a.NewLabel()
+	if m == mathMin {
+		a.Fcmp(1, 0)
+	} else {
+		a.Fcmp(0, 1)
+	}
+	a.BCond(PL, first) // not less, or unordered
+	c.load(arg2)
+	c.store(fn)
+	a.B(next)
+	a.Bind(first)
+	c.load(arg)
+	c.store(fn)
+	a.B(next)
+}
+
+// exactFloat loads the integer at o into d as a float, branching to fail
+// unless it converts exactly: -2^53 <= i <= 2^53. It uses rN, rTmp and
+// rTmp2.
+func (c *arm64Compiler) exactFloat(d FReg, o operand, fail Label) {
+	a := &c.a
+	a.Ldr(rN, o.base, o.off+offN)
+	a.MovImm(rTmp, 1<<53)
+	a.Add(rTmp, rTmp, rN)
+	a.MovImm(rTmp2, 1<<54)
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(HI, fail) // unsigned: outside
+	a.Scvtf(d, rN)
 }
 
 // setList compiles SETLIST of a fixed count of values, as a constructor

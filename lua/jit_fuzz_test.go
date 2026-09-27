@@ -64,8 +64,9 @@ func TestJITFuzz(t *testing.T) {
 
 // jitMustNotExit lists the exits, by the start of exitKind's description,
 // no fuzz program may take on every iteration: Lua calls and returns of
-// any number of values, # of a table, and == of numbers.
-var jitMustNotExit = []string{"CALL B=", "RETURN B=", "LEN", "EQ"}
+// any number of values, # of a table, == of numbers, and the math
+// functions compiled code runs, which are the only Go functions called.
+var jitMustNotExit = []string{"CALL B=", "RETURN B=", "LEN", "EQ", "CALL (Go function)"}
 
 // exitKind describes an exit for the report: the instruction's name and
 // what distinguishes its exits.

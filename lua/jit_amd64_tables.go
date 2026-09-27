@@ -478,10 +478,10 @@ func (c *amd64Compiler) getIndex(ip int, i bytecode.Instruction, up bool) {
 }
 
 // setIndex compiles SETTABLE, or SETTABUP when up is set, for an array
-// element or a buffer's element; other keys exit.
+// element, nil included, or a buffer's element; other keys exit.
 func (c *amd64Compiler) setIndex(ip int, i bytecode.Instruction, up bool) {
 	a := &c.a
-	if !c.loadRK(i.C(), ip, false) {
+	if !c.loadRK(i.C(), ip, true) {
 		c.exitAlways(ip)
 		return
 	}

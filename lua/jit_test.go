@@ -1213,6 +1213,50 @@ func TestJITTailCallFromVarArgs(t *testing.T) {
 	}
 }
 
+// nil stored into an array element, through a register or an upvalue,
+// runs in compiled code; into an absent element of a table with
+// __newindex, or a buffer, it exits, and agrees.
+func TestJITNilArrayStores(t *testing.T) {
+	skipWithoutJIT(t)
+	exits := map[string]int{}
+	jitExitHook = func(p *prototype, ip int, reason uint64) {
+		if p.LineDefined == 2 {
+			exits[exitKind(p, ip, reason)]++
+		}
+	}
+	defer func() { jitExitHook = nil }()
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // stores exit while the barrier is on
+	jit, interp, _ := runBothWith(t, `local up = {1, 2, 3, 4}
+		local function clear(t) -- line 2: no exits
+		  for i = 1, 200 do
+		    local k = i % 4 + 1
+		    t[k] = nil; up[k] = nil
+		    t[k] = i; up[k] = i * 2
+		  end
+		  t[2], up[3] = nil, nil
+		end
+		function run()
+		  local t = {1, 2, 3, 4}
+		  clear(t)
+		  local log = {}
+		  local m = setmetatable({1, nil, 3}, {__newindex = function(_, k, v) log[#log + 1] = k .. "=" .. tostring(v) end})
+		  for i = 1, 3 do m[i] = nil end
+		  m[2] = nil
+		  local ok, e = pcall(function() f64[1] = nil end)
+		  return t[1], t[2], t[3], up[2], up[3], #t, m[1], m[3], table.concat(log, ","), ok, e
+		end`, func(l *State) {
+		l.PushBuffer(make([]float64, 4))
+		l.SetGlobal("f64")
+	})
+	if jit != interp {
+		t.Fatalf("JIT %q\ninterpreter %q", jit, interp)
+	}
+	if len(exits) != 0 {
+		t.Fatalf("exits: %v", exits)
+	}
+}
+
 // % of floats by any divisor runs in compiled code, bit for bit as
 // math.Mod and Lua's correction give it, NaN included; random normal
 // floats never exit, and edge cases, subnormal divisors left to Go,

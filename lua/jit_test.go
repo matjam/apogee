@@ -1195,6 +1195,24 @@ func TestJITGenericFor(t *testing.T) {
 	}
 }
 
+// A tail call from a vararg function puts the callee at the caller's
+// function slot, below the extra arguments, as the interpreter does, so
+// Go sees the callee's frame where it is when the callee calls Go.
+func TestJITTailCallFromVarArgs(t *testing.T) {
+	skipWithoutJIT(t)
+	jit, interp, _ := runBoth(t, `
+		local function g(x, y) return tostring(x) .. ":" .. tostring(y) .. ":" .. select("#", x, y) end
+		local function f(a, ...) local b = ... return g(a, b) end
+		function run()
+		  local out = {}
+		  for i = 1, 300 do out[#out + 1] = f(i, i * 2, 3, 4, 5, 6, 7, 8) end
+		  return table.concat(out, " ", 290)
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q\ninterpreter %q", jit, interp)
+	}
+}
+
 // % of floats by any divisor runs in compiled code, bit for bit as
 // math.Mod and Lua's correction give it, NaN included; random normal
 // floats never exit, and edge cases, subnormal divisors left to Go,

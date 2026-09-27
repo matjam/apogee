@@ -39,7 +39,8 @@ var trigTable = struct {
 	limit, fourOverPi, one, half float64
 	pi4                          [3]float64
 	sin, cos                     [6]float64
-}{1 << 29, 4 / math.Pi, 1, 0.5, [3]float64{trigPI4A, trigPI4B, trigPI4C}, trigSin, trigCos}
+	inf, nan                     float64 // math.Sin and Cos give math.NaN() for infinities
+}{1 << 29, 4 / math.Pi, 1, 0.5, [3]float64{trigPI4A, trigPI4B, trigPI4C}, trigSin, trigCos, math.Inf(1), math.NaN()}
 
 // Offsets into trigTable.
 var (
@@ -50,6 +51,8 @@ var (
 	offTrigPI4   = uint32(unsafe.Offsetof(trigTable.pi4))
 	offTrigSin   = uint32(unsafe.Offsetof(trigTable.sin))
 	offTrigCos   = uint32(unsafe.Offsetof(trigTable.cos))
+	offTrigInf   = uint32(unsafe.Offsetof(trigTable.inf))
+	offTrigNaN   = uint32(unsafe.Offsetof(trigTable.nan))
 )
 
 // trigTableAddr is the address generated code loads trigTable from. A

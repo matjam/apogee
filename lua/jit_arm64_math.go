@@ -38,17 +38,23 @@ func (c *arm64Compiler) tconst(f FReg, off uint32) { c.a.LdrD(f, rTrig, off) }
 // trig computes math.Sin, or math.Cos, of d0 into d0. It follows the code
 // Go compiles for math/sin.go on arm64, including which multiply-adds it
 // fuses, so results match bit for bit; TestJITTrigMatchesGo checks that.
-// Arguments of 2^29 and more, which Go reduces with trigReduce, and
-// infinities exit at ip. It uses D0 to D6, which kernels leave free, and
-// rTrig, rIdx and rLen, which a kernel saves around it.
+// Arguments of 2^29 and more, which Go reduces with trigReduce, exit at
+// ip; infinities, and NaN for cos, give Go's NaN, as math.Sin and Cos
+// return. It uses D0 to D6, which kernels leave free, and rTrig, rIdx and
+// rLen, which a kernel saves around it.
 func (c *arm64Compiler) trig(ip int, cos bool) {
 	a := &c.a
 	exit := c.intrinsicExit(ip)
-	done := a.NewLabel()
+	done, nan := a.NewLabel(), a.NewLabel()
+	c.outOfLine = append(c.outOfLine, func() {
+		a.Bind(nan)
+		c.tconst(0, offTrigNaN)
+		a.B(done)
+	})
 	a.MovImm(rTrig, trigTableAddr())
 	a.Fcmp(0, 0)
 	if cos {
-		a.BCond(VS, exit) // NaN
+		a.BCond(VS, nan) // NaN
 	} else {
 		a.BCond(VS, done) // sin(NaN) is its argument
 		a.FmovToF(6, ZR)
@@ -57,6 +63,9 @@ func (c *arm64Compiler) trig(ip int, cos bool) {
 		a.FmovFromF(rLen, 0)
 	}
 	a.Fabs(1, 0)
+	c.tconst(2, offTrigInf)
+	a.Fcmp(1, 2)
+	a.BCond(EQ, nan)
 	c.tconst(2, offTrigLimit) // reduceThreshold
 	a.Fcmp(1, 2)
 	a.BCond(GE, exit)

@@ -28,18 +28,24 @@ const rTrig = rT2
 
 // trig computes math.Sin, or math.Cos, of x0 into x0, exiting at the
 // current instruction for arguments of 2^29 and more, which Go reduces
-// with trigReduce, infinities and, for cos, NaN. Each operation is Go's,
+// with trigReduce. Infinities, and NaN for cos, give Go's NaN, as math.Sin
+// and Cos return. Each operation is Go's,
 // in Go's order; multiplying by a constant from memory rather than from
 // a register rounds the same. It uses X0 to X5, which kernels leave free,
 // and rTmp, rN, rTrig and rIdx, which a kernel saves around it.
 func (c *amd64Compiler) trig(cos bool) {
 	a := &c.a
 	exit := c.intrinsicExit()
-	done := a.NewLabel()
+	done, nan := a.NewLabel(), a.NewLabel()
+	c.outOfLine = append(c.outOfLine, func() { // Go's NaN, as math.Sin and Cos return
+		a.Bind(nan)
+		a.LoadSD(0, rTrig, offTrigNaN)
+		a.Jmp(done)
+	})
 	a.MovImm(rTrig, trigTableAddr())
 	a.Ucomisd(0, 0)
 	if cos {
-		a.J(P, exit)
+		a.J(P, nan)
 	} else {
 		a.J(P, done) // sin(NaN) is its argument
 		a.XorPD(1, 1)
@@ -51,6 +57,8 @@ func (c *amd64Compiler) trig(cos bool) {
 	a.MovImm(rTmp, 1<<63-1)
 	a.MovqToX(2, rTmp)
 	a.AndPD(1, 2) // x = |x|
+	a.UcomisdMem(1, rTrig, offTrigInf)
+	a.J(E, nan)
 	a.UcomisdMem(1, rTrig, offTrigLimit)
 	a.J(AE, exit)
 	// j = uint64(x * (4/Pi)); y = float64(j); if j is odd, j++ and y++.

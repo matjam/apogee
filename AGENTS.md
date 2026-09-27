@@ -614,16 +614,16 @@ remains follows from running on Go.
     last bit.
 - **The JIT compiles only on linux and darwin, arm64 and amd64.**
   Elsewhere, Windows included, states interpret.
-- **Speed.** With the JIT, apogee takes 0.73 times C Lua 5.5's time on
+- **Speed.** With the JIT, apogee takes 0.70 times C Lua 5.5's time on
   the standard benchmarks on the 9900X3D; without it, 1.8 times. It is
-  slower only on CD (1.1 times), and level on Json. The M1's results are
+  faster on all 17, least on CD (0.83 times) and Json (0.90). The M1's results are
   still against 5.4; re-measure there with `-tags clua55`
   (bench/README.md, "Reproducing").
 
 ### LuaJIT
 
 **Speed is the main gap.** On the standard benchmarks on the 9900X3D,
-LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.73: roughly
+LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.70: roughly
 four times faster.
 - Numeric loops: 5–16 times faster (spectral-norm, Permute, NBody,
   Towers).
@@ -679,8 +679,8 @@ Windows. apogee's JIT covers linux and darwin on arm64 and amd64.
 bench/README.md has the current tables and charts, generated from the raw
 results: AMD Ryzen 9 9900X3D (linux/amd64) and Apple M1 Pro (arm64). On
 the standard benchmarks (Are We Fast Yet and three from the Benchmarks
-Game) apogee with the JIT takes 0.73 times as long as C Lua 5.5 on amd64
-(v1.0.0, pinned to one CCD), and 1.8 times without it. The M1's results
+Game) apogee with the JIT takes 0.70 times as long as C Lua 5.5 on amd64
+(pinned to one CCD), and 1.8 times without it. The M1's results
 (0.75 and 1.5 times) are still against C Lua 5.4, from before the port to
 5.5, and before the arm64 fix that compiles functions past 32 KB of code.
 
@@ -733,8 +733,9 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
   vararg functions, GETTABLE and SETTABLE with keys that are not constant
   strings or array indices, CONCAT, and the sort comparator's return to
   Go.
-- CD, the one standard benchmark slower than C Lua 5.5, spends about a
-  fifth of its time in `jitStep`, most of that creating tables
+- CD, the standard benchmark closest to C Lua 5.5 (0.83 times), spent
+  about a fifth of its time in `jitStep` before constructors' setmetatable
+  compiled, most of that creating tables
   (`newTableAt`) and storing into their hash parts (`setTableAt`): the
   exit itself is the smaller part.
   binary-trees and Havlak are likewise allocation-bound.

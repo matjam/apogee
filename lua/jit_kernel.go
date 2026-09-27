@@ -54,7 +54,9 @@ import (
 // kernelPlan is a loop that qualifies as a kernel.
 type kernelPlan struct {
 	start, latch int             // the body's first pc, and the FORLOOP's
+	base         int             // the FORLOOP's A
 	intLoop      bool            // an integer loop, or a float one
+	shareVar     bool            // the body does not write the loop variable
 	types        map[int]numKind // the loop's and live-in registers' types on entry
 	liveIn       []int           // registers read before written, checked on entry
 	written      []int           // registers written back when the loop ends
@@ -78,12 +80,10 @@ type kernelPlan struct {
 
 	// A register may hold an integer at one pc and a float at another, as
 	// Lua reuses registers for temporaries: at gives each register's type
-	// before each body pc and at the latch, results the type each body
-	// instruction writes, and slots each register's machine register for
-	// each type it takes.
+	// before each body pc and at the latch, and results the type each body
+	// instruction writes.
 	at      []map[int]numKind
 	results map[int]numKind
-	slots   map[kslot]int
 }
 
 // kernelCall is an intrinsic call in a kernel, by the CALL's pc: of fn,
@@ -156,22 +156,21 @@ func kernelDivisor(v value) bool {
 }
 
 // planKernel returns the kernel for the FORLOOP at latch in p, as an
-// integer or a float loop, with at most maxFloats float and maxInts
-// integer registers, or nil when its loop does not qualify. constOK
+// integer or a float loop, or nil when its loop does not qualify. constOK
 // reports whether generated code can reach constant k; intrinsic returns
 // the intrinsic upvalue n holds, if it holds one compiled code computes: a
 // number function's code, or a math function (mathFn) and its code;
 // upValue returns the kind of number, or kindBuffer, upvalue n holds, if
 // it holds one; floor reports whether the machine rounds a float down in
 // one instruction, for // of floats.
-func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool) *kernelPlan {
+func planKernel(p *prototype, latch int, intLoop bool, constOK func(k int) bool, intrinsic func(n int) (uint64, mathFn, bool), upValue func(n int) (numKind, bool), floor bool) *kernelPlan {
 	code := p.Code
 	fl := code[latch]
 	start := latch + 1 + fl.SBx()
 	if start > latch {
 		return nil
 	}
-	k := &kernelPlan{start: start, latch: latch, intLoop: intLoop, types: map[int]numKind{},
+	k := &kernelPlan{start: start, latch: latch, base: fl.A(), intLoop: intLoop, types: map[int]numKind{},
 		calls: map[int]kernelCall{}, virtual: map[int]bool{}, buffers: map[int]bool{},
 		upLoads: map[int]int{}, bufFrom: map[int]int{}, floor: floor}
 	wrote := map[int]bool{} // registers the body writes, which cannot hold buffers
@@ -206,13 +205,11 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 		return false
 	}
 	number := func(kk int) bool { return constOK(kk) && constKind(p.Constants[kk]) != kindAny }
-	reads, pc := map[int][]int{}, 0 // the registers each pc reads, for allocate
 	read := func(field int) bool {
 		if bytecode.IsConstant(field) {
 			return number(bytecode.ConstantIndex(field))
 		}
 		use(field)
-		reads[pc] = append(reads[pc], field)
 		if !seen[field] {
 			seen[field] = true
 			if !defined[field] {
@@ -237,7 +234,6 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 	}
 	for ip := start; ip < latch; ip++ {
 		i := code[ip]
-		pc = ip
 		switch i.OpCode() {
 		case bytecode.OpMove:
 			if !read(i.B()) || !write(i.A(), ip) {
@@ -402,149 +398,8 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			}
 		}
 	}
-	if !k.allocate(p, base, !wrote[base+3], reads, maxFloats, maxInts) {
-		return nil
-	}
+	k.shareVar = !wrote[base+3]
 	return k
-}
-
-// allocate gives each type each register takes a machine register, in
-// slots. The loop's registers, those live into the body and those below
-// the loop, which outlive it, each keep their own; the body's
-// temporaries, dead at the latch, share by liveness: two share one unless
-// some pc needs both. With share, the loop variable, which the body does
-// not write, takes the index's register. reads holds the registers each
-// body pc reads. It reports false when the kernel needs more than
-// maxFloats float or maxInts integer registers.
-//
-// A side exit writes back every register the body writes, and so may
-// store a dead temporary's register, holding another's number, into it.
-// The ordinary code writes a dead register before reading it, as the
-// kernel does.
-func (k *kernelPlan) allocate(p *prototype, base int, share bool, reads map[int][]int, maxFloats, maxInts int) bool {
-	code := p.Code
-	var nodes []kslot // in order of first appearance
-	index := map[kslot]int{}
-	add := func(r int, t numKind) {
-		s := kslot{r, t}
-		if _, ok := index[s]; !ok && isNumKind(t) {
-			index[s] = len(nodes)
-			nodes = append(nodes, s)
-		}
-	}
-	for r := base; r <= base+3; r++ {
-		add(r, k.types[base])
-	}
-	for _, r := range k.liveIn {
-		add(r, k.types[r])
-	}
-	for ip := k.start; ip < k.latch; ip++ {
-		add(code[ip].A(), k.results[ip])
-	}
-	if k.floatKeys {
-		add(keyScratch, kindInt)
-	}
-	pinned := func(s kslot) bool { return s.r < base+4 || slices.Contains(k.liveIn, s.r) } // keyScratch is -1
-
-	// Liveness of the temporaries, backwards: jumps only go forward.
-	starts := map[int]bool{}
-	for ip := k.start; ip < k.latch; ip++ {
-		starts[ip] = true
-		switch code[ip].OpCode() {
-		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual, bytecode.OpBitwise:
-			ip++ // the JMP, or the operator's word
-		}
-	}
-	n := len(nodes)
-	conflict := make([][]bool, n)
-	for x := range conflict {
-		conflict[x] = make([]bool, n)
-	}
-	live := make([]map[int]bool, k.latch-k.start+1)
-	live[k.latch-k.start] = map[int]bool{}
-	liveAt := func(ip int) map[int]bool { return live[ip-k.start] }
-	for ip := k.latch - 1; ip >= k.start; ip-- {
-		i := code[ip]
-		var succ []int
-		switch {
-		case !starts[ip] && code[ip-1].OpCode() == bytecode.OpBitwise:
-			live[ip-k.start] = liveAt(ip + 1)
-			continue
-		case !starts[ip]: // a test's JMP
-			t, _ := kernelJump(code, ip-1, k.latch)
-			live[ip-k.start] = liveAt(t)
-			continue
-		case i.OpCode() == bytecode.OpJump:
-			t, _ := kernelJump(code, ip, k.latch)
-			succ = []int{t}
-		case i.OpCode() == bytecode.OpEqual, i.OpCode() == bytecode.OpLessThan, i.OpCode() == bytecode.OpLessOrEqual:
-			t, _ := kernelJump(code, ip, k.latch)
-			succ = []int{ip + 2, t}
-		case i.OpCode() == bytecode.OpBitwise:
-			succ = []int{ip + 2}
-		default:
-			succ = []int{ip + 1}
-		}
-		out := map[int]bool{}
-		for _, s := range succ {
-			maps.Copy(out, liveAt(s))
-		}
-		in := maps.Clone(out)
-		var needed []int
-		if d, ok := index[kslot{i.A(), k.results[ip]}]; ok && !pinned(nodes[d]) {
-			delete(in, d)
-			needed = append(needed, d)
-		}
-		for _, r := range reads[ip] {
-			if x, ok := index[kslot{r, k.typeAt(ip, r)}]; ok && !pinned(nodes[x]) {
-				in[x] = true
-			}
-		}
-		live[ip-k.start] = in
-		// What ip reads needs a register of its own, as does what it
-		// writes and what lives past it. Each kernel instruction reads its
-		// operands before it writes its result, and leaves the kernel
-		// before either, so the result may take an operand's register when
-		// ip reads it last.
-		for x := range out {
-			needed = append(needed, x)
-		}
-		for _, set := range [][]int{needed, slices.Collect(maps.Keys(in))} {
-			for _, x := range set {
-				for _, y := range set {
-					conflict[x][y] = true
-				}
-			}
-		}
-	}
-
-	k.slots = map[kslot]int{}
-	floats, ints := 0, 0
-	for x, s := range nodes {
-		// The loop variable is the index, which FORLOOP copies to it,
-		// unless the body writes it, which Lua 5.5 forbids.
-		if index := (kslot{base, k.types[base]}); share && s == (kslot{base + 3, index.t}) {
-			k.slots[s] = k.slots[index]
-			continue
-		}
-		taken := map[int]bool{}
-		for y := range x {
-			if nodes[y].t == s.t && (pinned(s) || pinned(nodes[y]) || conflict[x][y]) {
-				taken[k.slots[nodes[y]]] = true
-			}
-		}
-		m := 0
-		for taken[m] {
-			m++
-		}
-		k.slots[s] = m
-		if s.t == kindInt {
-			ints = max(ints, m+1)
-		} else {
-			floats = max(floats, m+1)
-		}
-	}
-	return floats <= maxFloats && ints <= maxInts
 }
 
 // promoteConstants marks the body's LOADKs of integer constants that
@@ -673,12 +528,6 @@ func (k *kernelPlan) hoist(n int, kind numKind) int {
 	}
 	k.hoisted = append(k.hoisted, hoistedUpValue{n: n, kind: kind})
 	return len(k.hoisted) - 1
-}
-
-// kslot is a register holding a type, which has a machine register.
-type kslot struct {
-	r int
-	t numKind
 }
 
 // upValueIntrinsic returns the Go function of the intrinsic cl's upvalue n
@@ -1205,22 +1054,12 @@ func (k *kernelPlan) bufferKey(p *prototype, ip, field int) bool {
 	return false
 }
 
-// keyScratch is the slots key of the integer register a float key
-// converts into.
+// keyScratch is the Lua register of the integer virtual register a float
+// key converts into.
 const keyScratch = -1
 
 // typeAt returns register r's type before the body pc ip.
 func (k *kernelPlan) typeAt(ip, r int) numKind { return k.at[ip-k.start][r] }
-
-// slot returns the index of register r's machine register for type t, in
-// its class.
-func (k *kernelPlan) slot(r int, t numKind) int {
-	n, ok := k.slots[kslot{r, t}]
-	if !ok {
-		panic("kernel: register without a machine register for its type")
-	}
-	return n
-}
 
 // exactConstant reports whether RK field is an integer constant that
 // converts to a float exactly.

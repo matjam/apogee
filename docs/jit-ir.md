@@ -3,7 +3,7 @@
 A design for the optimizing tier #140 asked for: instead of adding a case
 to the kernel planner for each shape of loop, compile hot loops through a
 typed intermediate representation, with one lowering per architecture.
-This is a plan, not yet code; each phase below is a PR, measured.
+Each phase below is a PR, measured; **Progress** says what each did.
 
 ## Where the JIT is
 
@@ -95,6 +95,23 @@ the idioms it makes fast to `jitMustNotExit`.
 
 Each phase ships with a full benchmark run and no regression on the
 geometric mean; a phase that loses somewhere says where and why.
+
+## Progress
+
+1. **Phase 1** (jit_ir.go, jit_*_kernel.go). Kernels compile through the
+   IR: `buildIR` makes typed operations on virtual registers from the
+   planner's typed body, with a snapshot for each pc an operation can
+   leave at; `allocate` colours the virtual registers by liveness over
+   the operations; `kernelInstruction` lowers each operation on each
+   architecture. The per-bytecode emitters and the planner's own
+   allocation are gone. Two things differ from the design above, for
+   now: the virtual registers are one per Lua register and type, not
+   SSA values, which is what the allocation over a loop body needs and
+   keeps a snapshot's registers one-to-one with virtual ones; and types
+   still come from the planner's inference (`planKernel`), which later
+   phases replace with guards where they add instructions it cannot type.
+   Every kernel compiles to the same size of code as before on both
+   architectures, over the JIT tests and the benchmark suites.
 
 ## What this does not change
 

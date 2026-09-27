@@ -557,6 +557,30 @@ nothing compiles.
     into them again. A test that leaves, or a table access, makes the
     locals below the loop the body writes live-in, like the other exits:
     a value from the iteration before must be written back.
+  - **Loops inside.** A kernel runs the loops in its body: integer for
+    loops (`irForPrep`, which follows `forPrep`: a step of 0 leaves for
+    Go's error, and the count divides unsigned; `irForLoop`) and while
+    loops, whose back edges spend budget and, when it runs out, write back
+    the snapshot at their target and leave there (`kernelBackEdge`,
+    `kernelBudgetExit`). `flow` and the IR's liveness pass again until
+    they settle, as back edges carry types and values round. An inner
+    loop's variable, which its body cannot write, shares its index's
+    virtual register within the loop (`irShare`). An integer loop's count
+    and step may live in their stack slots, as only its latch uses them,
+    before anything else spills: amd64 has too few registers for most
+    nests otherwise. `#` of a table (`irLen`) is the array's length when
+    it holds the border, and leaves otherwise. `planKernels` makes the
+    plans: of the kind of loop the registers show, when observed, and one
+    of each kind for a long body (`longBody`), whose exits' code is long;
+    on arm64 a function too long for its branches compiles again without
+    kernels.
+  - **Liveness.** `kernelPlan.liveness` finds the registers live before
+    each pc, conservatively where the kernel does not follow (anything it
+    leaves at reads all, and the locals below the loop are always live:
+    an error may show them); a register dead where paths meet has no type
+    to agree on, so a temporary Lua reuses for a table and a number does
+    not stop a nest. Loads are typed in rounds (`guessLoad` says whether
+    their uses decided), not one flow each, which was quadratic.
   - **Booleans.** `kindBool` holds true or false as 1 or 0 in a
     general-purpose register: LOADBOOL (without its skip), NOT, TEST
     (`irBranch` with `cmp` TEST; on a number or a table, which is true,

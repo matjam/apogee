@@ -65,11 +65,14 @@ const (
 	irCopyUp                // register obj = upvalue imm, on the stack
 	irCopy                  // register obj = register imm, on the stack
 	irBoolNot               // dst = not a, of a boolean
+	irForPrep               // an integer loop inside starts, on regs; to target when it runs no times
+	irForLoop               // and goes on: back to target, or on
+	irLen                   // dst = #a, of a table
 )
 
 var irOpNames = [...]string{"label", "move", "const", "hoist", "add", "sub", "mul", "div", "floordiv",
 	"fmod", "idiv", "imod", "and", "or", "xor", "not", "shift", "neg", "branch", "jump", "intrinsic",
-	"math", "bufget", "bufset", "exit", "aget", "aset", "fget", "fset", "copyup", "copy", "not"}
+	"math", "bufget", "bufset", "exit", "aget", "aset", "fget", "fset", "copyup", "copy", "not", "forprep", "forloop", "len"}
 
 func (o irOp) String() string { return irOpNames[o] }
 
@@ -105,7 +108,8 @@ type irInst struct {
 	pc     int
 	dst    vreg
 	a, b   irArg
-	c      irArg // a store's value
+	c      irArg   // a store's value
+	regs   [4]vreg // a loop inside's index, count, step and variable
 	imm    int64
 	flag   bool
 	cmp    bytecode.OpCode // a branch's comparison: EQ, LT or LE
@@ -154,6 +158,8 @@ type irFunc struct {
 	loc     []int                 // each vreg's machine register, in its class, or -1: see allocate
 	reload  [2]int                // the first of the float and integer registers holding spilled values, or -1
 	cur     map[vreg]int          // spilled vregs the operation being lowered uses, and their reload registers
+	fixed   map[vreg]bool         // loops inside's registers, which never spill
+	shares  []irShare             // loops inside whose variable shares the index's register
 }
 
 // A kernel that can leave (irFunc.leaves) counts its short runs: those
@@ -206,7 +212,23 @@ func (f *irFunc) arg(p *prototype, ip, field int) irArg {
 		return irArg{v: noVreg, k: kk, t: constKind(p.Constants[kk])}
 	}
 	t := f.typeAt(ip, field)
-	return irArg{v: f.value(field, t), t: t}
+	return irArg{v: f.valueAt(ip, field, t), t: t}
+}
+
+// irShare is a loop inside whose variable, register r, its body does not
+// write, so that it shares the index's, a's, virtual register from the
+// FORPREP at from to the FORLOOP at to.
+type irShare struct{ r, a, from, to int }
+
+// valueAt is value for register r before ip, where r may be a loop
+// inside's variable, which shares its index's virtual register.
+func (f *irFunc) valueAt(ip, r int, t numKind) vreg {
+	for _, s := range f.shares {
+		if t == kindInt && r == s.r && s.from < ip && ip <= s.to {
+			return f.value(s.a, t)
+		}
+	}
+	return f.value(r, t)
 }
 
 // snapshot returns the index of the snapshot for leaving at ip, where
@@ -223,7 +245,7 @@ func (f *irFunc) snapshot(p *prototype, ip int) int {
 	for _, r := range f.writtenOnce() {
 		switch t := types[r]; {
 		case isRegKind(t):
-			s.regs = append(s.regs, irSnapReg{r: r, v: f.value(r, t), t: t, alias: -1})
+			s.regs = append(s.regs, irSnapReg{r: r, v: f.valueAt(ip, r, t), t: t, alias: -1})
 		default:
 			if slot, ok := bufferSlot(t); ok {
 				s.regs = append(s.regs, irSnapReg{r: r, v: noVreg, t: t, alias: slot})
@@ -235,6 +257,14 @@ func (f *irFunc) snapshot(p *prototype, ip int) int {
 	if kc, ok := f.calls[ip]; ok && p.Code[ip].B() == 0 { // its arguments run to l.top
 		s.top = kc.a + 1 + kc.args
 	}
+	// An instruction the ordinary code runs whose values run to l.top,
+	// after a call of all results the kernel computed, which has one.
+	switch i := p.Code[ip]; i.OpCode() {
+	case bytecode.OpCall, bytecode.OpTailCall, bytecode.OpReturn:
+		if _, ok := f.calls[ip-1]; ok && i.B() == 0 && ip > f.start && p.Code[ip-1].C() == 0 {
+			s.top = p.Code[ip-1].A() + 1
+		}
+	}
 	f.snaps = append(f.snaps, s)
 	f.snapAt[ip] = len(f.snaps) - 1
 	return len(f.snaps) - 1
@@ -244,7 +274,7 @@ func (f *irFunc) snapshot(p *prototype, ip int) int {
 func buildIR(p *prototype, k *kernelPlan) *irFunc {
 	code := p.Code
 	f := &irFunc{kernelPlan: k, index: map[kslot]vreg{}, snapAt: map[int]int{}, share: k.shareVar, cur: map[vreg]int{},
-		liveAt: map[int]map[vreg]bool{}}
+		liveAt: map[int]map[vreg]bool{}, fixed: map[vreg]bool{}}
 	base := k.base
 	// Virtual registers in the order allocate colours them: the loop's,
 	// the live-in ones, then as the body writes them.
@@ -262,12 +292,30 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			f.value(code[ip].A(), t)
 		}
 	}
+	// A loop inside whose body does not write its variable, which Lua 5.5
+	// forbids, keeps it in the index's register, as the loop's own does.
+	for ip := k.start; ip < k.latch; ip++ {
+		if i := code[ip]; i.OpCode() == bytecode.OpForPrep && !k.exits[ip] {
+			a, end := i.A(), ip+1+i.SBx()
+			written := false
+			for j := ip + 1; j < end; j++ {
+				if _, ok := k.results[j]; ok && code[j].A() == a+3 {
+					written = true
+				}
+			}
+			if !written {
+				f.shares = append(f.shares, irShare{r: a + 3, a: a, from: ip, to: end})
+			}
+		}
+	}
 	scratch := noVreg
 	if k.floatKeys {
 		scratch = f.value(keyScratch, kindInt)
 	}
 	emit := func(in irInst) {
-		if in.op != irBranch && in.op != irJump && in.op != irLabel {
+		switch in.op {
+		case irBranch, irJump, irLabel, irForPrep, irForLoop:
+		default:
 			in.target = -1
 		}
 		f.insts = append(f.insts, in)
@@ -350,6 +398,8 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			in.op, in.cmp, in.flag, in.target, in.a = irBranch, bytecode.OpTest, i.C() != 0, t, f.arg(p, ip, i.A())
 			if !ok { // it leaves the loop: the ordinary code tests again
 				in.target, in.snap, f.leaves = -1, f.snapshot(p, ip), true
+			} else if t <= ip { // back: it spends budget
+				in.snap = f.snapshot(p, t)
 			}
 			if in.a.t != kindBool { // a number or a table, which is true
 				switch {
@@ -371,6 +421,8 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 			in.a, in.b = f.arg(p, ip, i.B()), f.arg(p, ip, i.C())
 			if !ok { // it leaves the loop: the ordinary code tests again
 				in.target, in.snap, f.leaves = -1, f.snapshot(p, ip), true
+			} else if t <= ip { // back: it spends budget
+				in.snap = f.snapshot(p, t)
 			}
 			emit(in)
 			ip++ // the JMP
@@ -378,6 +430,23 @@ func buildIR(p *prototype, k *kernelPlan) *irFunc {
 		case bytecode.OpJump:
 			t, _ := k.jump(code, ip)
 			in.op, in.target = irJump, t
+			if t <= ip { // back: it spends budget, and leaves when it runs out
+				in.snap = f.snapshot(p, t)
+			}
+		case bytecode.OpForPrep, bytecode.OpForLoop: // an integer loop inside
+			for j := range in.regs {
+				in.regs[j] = f.valueAt(ip+1, i.A()+j, kindInt)
+				f.fixed[in.regs[j]] = true
+			}
+			if op == bytecode.OpForPrep {
+				in.op, in.target, in.snap = irForPrep, ip+2+i.SBx(), f.snapshot(p, ip) // step 0: Go raises the error
+				in.a, in.b, in.c = irArg{v: in.regs[0], t: kindInt}, irArg{v: in.regs[1], t: kindInt}, irArg{v: in.regs[2], t: kindInt}
+				break
+			}
+			in.op, in.target = irForLoop, ip+1+i.SBx()
+			in.snap = f.snapshot(p, in.target)
+		case bytecode.OpLength:
+			in.op, in.dst, in.a, in.snap = irLen, dst(), f.arg(p, ip, i.B()), f.snapshot(p, ip)
 		case bytecode.OpGetUpValue:
 			// The function an intrinsic call checked on entry, or a buffer the
 			// context holds: nothing. A number, from the context.
@@ -469,7 +538,9 @@ func (f *irFunc) inline(p *prototype, ip int, kc kernelCall, dst vreg, emit func
 	q, a := kc.closure.prototype, p.Code[ip].A()
 	regs := map[int]irArg{}
 	for j := range kc.args {
-		regs[j] = f.arg(p, ip, copied(p.Code, kc.get, ip, a+1+j))
+		// The argument's type, which its source, dead once copied, has.
+		t := f.typeAt(ip, a+1+j)
+		regs[j] = irArg{v: f.valueAt(ip, copied(p.Code, kc.get, ip, a+1+j), t), t: t}
 	}
 	rk := func(field int) irArg {
 		if bytecode.IsConstant(field) {
@@ -548,6 +619,18 @@ func (f *irFunc) temp(t numKind) vreg {
 	return f.value(inlineReg-f.temps, t)
 }
 
+// defs returns the virtual registers in writes.
+func (f *irFunc) defs(in *irInst) []vreg {
+	switch in.op {
+	case irForPrep, irForLoop:
+		return []vreg{in.regs[0], in.regs[1], in.regs[3]}
+	}
+	if in.dst != noVreg {
+		return []vreg{in.dst}
+	}
+	return nil
+}
+
 // uses returns the virtual registers in reads. An exit reads what it
 // writes back: the ordinary code may read any of it.
 func (f *irFunc) uses(in *irInst) []vreg {
@@ -563,6 +646,9 @@ func (f *irFunc) uses(in *irInst) []vreg {
 		if a.v != noVreg {
 			vs = append(vs, a.v)
 		}
+	}
+	if in.op == irForLoop {
+		vs = append(vs, in.regs[0], in.regs[1], in.regs[2])
 	}
 	return vs
 }
@@ -589,51 +675,71 @@ func (f *irFunc) allocate(maxFloats, maxInts int) bool {
 			labels[in.target] = x
 		}
 	}
-	// Liveness of the temporaries, backwards: jumps only go forward.
-	live := make([]map[vreg]bool, len(f.insts)+1)
-	live[len(f.insts)] = map[vreg]bool{}
-	for x := len(f.insts) - 1; x >= 0; x-- {
-		in := &f.insts[x]
-		succ := []int{x + 1}
-		switch in.op {
-		case irLabel:
-			live[x] = live[x+1]
-			f.liveAt[in.target] = live[x]
-			continue
+	succ := func(x int) []int {
+		switch in := &f.insts[x]; in.op {
 		case irJump:
-			succ = []int{labels[in.target]}
-		case irBranch:
+			return []int{labels[in.target]}
+		case irBranch, irForPrep, irForLoop:
 			if in.target >= 0 {
-				succ = append(succ, labels[in.target])
+				return []int{x + 1, labels[in.target]}
 			}
 		case irExit:
-			succ = nil
+			return nil
 		}
-		out := map[vreg]bool{}
-		for _, s := range succ {
-			maps.Copy(out, live[s])
-		}
-		in2 := maps.Clone(out)
-		var needed []vreg
-		if in.dst != noVreg && !f.pinned(in.dst) {
-			delete(in2, in.dst)
-			needed = append(needed, in.dst)
-		}
-		for _, v := range f.uses(in) {
-			if !f.pinned(v) {
-				in2[v] = true
+		return []int{x + 1}
+	}
+	// Liveness of the temporaries, backwards, again until it settles, as
+	// loops inside jump back.
+	live := make([]map[vreg]bool, len(f.insts)+1)
+	for x := range live {
+		live[x] = map[vreg]bool{}
+	}
+	for changed := true; changed; {
+		changed = false
+		for x := len(f.insts) - 1; x >= 0; x-- {
+			in := &f.insts[x]
+			next := map[vreg]bool{}
+			for _, s := range succ(x) {
+				maps.Copy(next, live[s])
+			}
+			if in.op != irLabel {
+				for _, d := range f.defs(in) {
+					delete(next, d)
+				}
+				for _, v := range f.uses(in) {
+					if !f.pinned(v) {
+						next[v] = true
+					}
+				}
+			}
+			if !maps.Equal(next, live[x]) {
+				live[x], changed = next, true
 			}
 		}
-		live[x] = in2
+	}
+	for x := range f.insts {
+		in := &f.insts[x]
+		if in.op == irLabel {
+			f.liveAt[in.target] = live[x]
+			continue
+		}
 		// What an operation reads needs a register of its own, as does
 		// what it writes and what lives past it. Each operation reads its
 		// operands before it writes its result, and leaves the kernel
 		// before either, so the result may take an operand's register when
 		// it reads it last.
-		for v := range out {
-			needed = append(needed, v)
+		var needed []vreg
+		for _, d := range f.defs(in) {
+			if !f.pinned(d) {
+				needed = append(needed, d)
+			}
 		}
-		for _, set := range [][]vreg{needed, slices.Collect(maps.Keys(in2))} {
+		for _, s := range succ(x) {
+			for v := range live[s] {
+				needed = append(needed, v)
+			}
+		}
+		for _, set := range [][]vreg{needed, slices.Collect(maps.Keys(live[x]))} {
 			for _, x := range set {
 				for _, y := range set {
 					conflict[x][y] = true
@@ -643,9 +749,17 @@ func (f *irFunc) allocate(maxFloats, maxInts int) bool {
 	}
 
 	f.reload = [2]int{-1, -1}
-	floats, ints := f.colour(conflict, maxFloats, maxInts, false)
+	floats, ints := f.colour(conflict, maxFloats, maxInts, false, false)
 	if floats <= maxFloats && ints <= maxInts {
 		return true
+	}
+	// An integer loop's count and step may live in their stack slots,
+	// which needs no registers for loading them: only its latch uses them.
+	loopSpill := f.intLoop && !f.while
+	if loopSpill {
+		if floats, ints = f.colour(conflict, maxFloats, maxInts, false, true); floats <= maxFloats && ints <= maxInts {
+			return true
+		}
 	}
 	// Too few: keep the last two of each class that runs out for loading
 	// spilled values, which live in their Lua registers' stack slots, and
@@ -659,7 +773,7 @@ func (f *irFunc) allocate(maxFloats, maxInts int) bool {
 		limitI -= spillRegs
 		f.reload[1] = limitI
 	}
-	floats, ints = f.colour(conflict, limitF, limitI, true)
+	floats, ints = f.colour(conflict, limitF, limitI, true, loopSpill)
 	return floats <= limitF && ints <= limitI
 }
 
@@ -672,15 +786,30 @@ const spillRegs = 2
 // class no earlier one it conflicts with has, in loc, and returns how
 // many of each class it used. With spill, one that would take register
 // limitF or limitI or above spills, loc -1, unless it is one of the
-// loop's, or the scratch key, which then take it.
-func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill bool) (floats, ints int) {
+// loop's, a loop inside's, or the scratch key, which then take it. With
+// loopSpill, the loop's count and step, which only its latch uses, come
+// last and spill rather than take such a register.
+func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill, loopSpill bool) (floats, ints int) {
 	f.loc = make([]int, len(f.vregs))
+	late := func(v vreg) bool { return loopSpill && (v == f.loop[1] || v == f.loop[2]) }
+	order := make([]int, 0, len(f.vregs))
 	for x := range f.vregs {
+		if !late(vreg(x)) {
+			order = append(order, x)
+		}
+	}
+	for x := range f.vregs {
+		if late(vreg(x)) {
+			order = append(order, x)
+		}
+	}
+	done := make([]bool, len(f.vregs))
+	for _, x := range order {
 		v := vreg(x)
 		taken := map[int]bool{}
-		for y := range x {
+		for y := range f.vregs {
 			w := vreg(y)
-			if f.class(w) == f.class(v) && f.loc[y] >= 0 && (f.pinned(v) || f.pinned(w) || conflict[x][y]) {
+			if done[y] && f.class(w) == f.class(v) && f.loc[y] >= 0 && (f.pinned(v) || f.pinned(w) || conflict[x][y]) {
 				taken[f.loc[y]] = true
 			}
 		}
@@ -692,7 +821,8 @@ func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill bool) (floa
 		if f.class(v) == 1 {
 			limit = limitI
 		}
-		if spill && m >= limit && f.vregs[x].r >= 0 && !slices.Contains(f.loop[:], v) {
+		done[x] = true
+		if m >= limit && (late(v) || spill && f.vregs[x].r >= 0 && !slices.Contains(f.loop[:], v) && !f.fixed[v]) {
 			f.loc[x] = -1
 			continue
 		}

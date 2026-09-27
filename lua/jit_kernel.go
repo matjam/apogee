@@ -79,6 +79,7 @@ type kernelPlan struct {
 	// constant string key and false for an array element (tabUses), and
 	// the type each GETTABLE's value is guarded to have, kindAny until
 	// inferTypes decides (loads).
+	live     []regSet // the registers live before each body pc and the latch: see liveness
 	tables   map[int]bool
 	tabUses  map[int]bool
 	loads    map[int]numKind
@@ -184,6 +185,45 @@ func kernelDivisor(v value) bool {
 	i, ok := v.integer()
 	return ok && v.isInteger() && i != 0 && -(1<<31) <= i && i < 1<<31
 }
+
+// planKernels returns the plans of the kernels for the loop at latch: an
+// integer and a float loop's for a for loop, unless the registers when the
+// function compiled, observed, show which it is; and with nothing observed,
+// also plans guessing floats where nothing decides, when their types
+// differ. A long body gets no more than one plan of each kind, as its
+// code, of an exit for each access, is long too.
+func planKernels(p *prototype, latch int, env *kernelEnv, observed bool) []*kernelPlan {
+	kinds := []bool{true, false}
+	switch i := p.Code[latch]; {
+	case i.OpCode() == bytecode.OpJump: // a while loop has no loop registers to be floats
+		kinds = kinds[:1]
+	case observed && env.observed(i.A()) == kindInt && env.observed(i.A()+2) == kindInt:
+		kinds = kinds[:1]
+	case observed && env.observed(i.A()) == kindFloat:
+		kinds = kinds[1:]
+	}
+	long := latch-(latch+1+p.Code[latch].SBx()) > longBody
+	var plans []*kernelPlan
+	for _, intLoop := range kinds {
+		plan := planKernel(p, latch, intLoop, env)
+		if plan != nil {
+			plans = append(plans, plan)
+		}
+		if observed || long && plan != nil {
+			continue
+		}
+		env.floats = true
+		if alt := planKernel(p, latch, intLoop, env); alt != nil && !alt.sameTypes(plan) {
+			plans = append(plans, alt)
+		}
+		env.floats = false
+	}
+	return plans
+}
+
+// longBody is how many instructions make a loop's body long: see
+// planKernels.
+const longBody = 100
 
 // kernelEnv is what planKernel knows of the closure it plans for and the
 // machine. constOK reports whether generated code can reach constant k;
@@ -326,6 +366,9 @@ func planKernelWith(p *prototype, latch int, intLoop bool, env *kernelEnv, exits
 			if t, ok := k.jump(code, j); ok && t > ip {
 				return true
 			}
+			if i := code[j]; i.OpCode() == bytecode.OpForPrep && j+2+i.SBx() > ip { // a loop inside may run no times
+				return true
+			}
 		}
 		return false
 	}
@@ -461,6 +504,31 @@ func planKernelWith(p *prototype, latch int, intLoop bool, env *kernelEnv, exits
 				return nil, ip
 			}
 			targets[t] = true
+		case bytecode.OpForPrep: // an integer loop inside: see forKind
+			a, end := i.A(), ip+1+i.SBx()
+			if end >= latch || code[end].OpCode() != bytecode.OpForLoop || code[end].A() != a || end+1+code[end].SBx() != ip+1 {
+				return nil, ip
+			}
+			for r := a; r <= a+2; r++ {
+				if !read(r) {
+					return nil, ip
+				}
+			}
+			for r := a; r <= a+3; r++ {
+				if !write(r, ip) {
+					return nil, ip
+				}
+			}
+			targets[end+1] = true // where it goes when the loop runs no times
+		case bytecode.OpForLoop: // the end of a loop inside
+			a := i.A()
+			if !read(a) || !read(a+1) || !read(a+2) || !write(a, ip) || !write(a+1, ip) || !write(a+3, ip) {
+				return nil, ip
+			}
+		case bytecode.OpLength: // of a table
+			if !read(i.B()) || !write(i.A(), ip) {
+				return nil, ip
+			}
 		case bytecode.OpLoadBool: // not one that skips the next instruction
 			if i.C() != 0 || !write(i.A(), ip) {
 				return nil, ip
@@ -728,6 +796,10 @@ func (k *kernelPlan) floatUses(p *prototype, ip, r int) ([][2]int, bool) {
 			if reads(i.B()) || op != bytecode.OpMove && op != bytecode.OpUnaryMinus && reads(i.C()) {
 				return nil, false
 			}
+		case bytecode.OpForPrep, bytecode.OpForLoop, bytecode.OpLength:
+			if reads(i.A()) || reads(i.A()+1) || reads(i.A()+2) || reads(i.B()) {
+				return nil, false
+			}
 		case bytecode.OpCall: // any argument: min(x, 1) returns the integer
 			if r > i.A() && (i.B() == 0 || r < i.A()+i.B()) {
 				return nil, false
@@ -753,6 +825,16 @@ func (k *kernelPlan) floatUses(p *prototype, ip, r int) ([][2]int, bool) {
 		case bytecode.OpJump:
 			t, _ := k.jump(code, j)
 			work = append(work, t)
+			continue
+		case bytecode.OpForPrep: // on, or past the loop
+			if r < i.A() || r > i.A()+3 {
+				work = append(work, j+1, j+2+i.SBx())
+			}
+			continue
+		case bytecode.OpForLoop: // back, or on
+			if r < i.A() || r > i.A()+3 {
+				work = append(work, j+1, j+1+i.SBx())
+			}
 			continue
 		case bytecode.OpSetTable, bytecode.OpSetTableUp:
 		default:
@@ -1112,6 +1194,9 @@ func bitwiseResult(p *prototype, i bytecode.Instruction, op bytecode.ArithOp, st
 // reach a pc with a register of different types, or an instruction cannot
 // run on them.
 func (k *kernelPlan) inferTypes(p *prototype) bool {
+	if k.live == nil {
+		k.live = k.liveness(p)
+	}
 	for {
 		at, results, ok := k.flow(p)
 		if !ok {
@@ -1143,8 +1228,21 @@ func (k *kernelPlan) inferTypes(p *prototype) bool {
 			}
 			continue
 		}
-		if ip := k.undecidedLoad(); ip >= 0 {
-			k.loads[ip] = k.guessLoad(p, at, ip)
+		if k.undecidedLoad() >= 0 {
+			// Those whose uses decide, all at once, as a flow for each is
+			// quadratic; when none do, the rest, as floats, which they then
+			// would all be decided as one by one.
+			decided := false
+			for ip, t := range k.loads {
+				if g, sure := k.guessLoad(p, at, ip); t == kindAny && sure {
+					k.loads[ip], decided = g, true
+				}
+			}
+			for ip, t := range k.loads {
+				if t == kindAny && !decided {
+					k.loads[ip], _ = k.guessLoad(p, at, ip)
+				}
+			}
 			continue
 		}
 		k.at, k.results = at, results
@@ -1216,8 +1314,9 @@ func (k *kernelPlan) undecidedLoad() int {
 // held when the function compiled, or that of what arithmetic and
 // comparisons meet it with, or a float. It returns kindBoxed when nothing
 // in the kernel reads it as a number or a table: calls, moves and stores
-// take it from the stack.
-func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) numKind {
+// take it from the stack. It reports whether the uses decided, rather
+// than the float that stands in when they meet only what is undecided.
+func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) (numKind, bool) {
 	code := p.Code
 	r := code[ip].A()
 	used, meets := false, kindAny
@@ -1246,9 +1345,9 @@ func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) numKi
 			}
 			switch {
 			case reads(obj):
-				return kindTable
+				return kindTable, true
 			case reads(key):
-				return kindInt
+				return kindInt, true
 			case op == bytecode.OpSetTable && reads(i.C()):
 				used = true
 			}
@@ -1266,11 +1365,15 @@ func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) numKi
 			used = used || reads(i.B()) || reads(i.C()) || op == bytecode.OpCall && r > i.A()
 		case bytecode.OpBitwise:
 			if reads(i.B()) || reads(i.C()) {
-				return kindInt
+				return kindInt, true
 			}
 		case bytecode.OpTest:
 			if reads(i.A()) {
-				return kindBool
+				return kindBool, true
+			}
+		case bytecode.OpLength:
+			if reads(i.B()) {
+				return kindTable, true
 			}
 		}
 		// The next pcs, unless this one writes r.
@@ -1291,6 +1394,16 @@ func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) numKi
 				work = append(work, t)
 			}
 			continue
+		case bytecode.OpForPrep: // on, or past the loop
+			if r < i.A() || r > i.A()+3 {
+				work = append(work, j+1, j+2+i.SBx())
+			}
+			continue
+		case bytecode.OpForLoop: // back, or on
+			if r < i.A() || r > i.A()+3 {
+				work = append(work, j+1, j+1+i.SBx())
+			}
+			continue
 		case bytecode.OpSetTable, bytecode.OpSetTableUp:
 		default:
 			if i.A() == r {
@@ -1301,14 +1414,14 @@ func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) numKi
 	}
 	switch t := k.observed(r); {
 	case !used:
-		return kindBoxed
+		return kindBoxed, true
 	case isNumKind(t):
-		return t
+		return t, true
 	case meets == kindInt && k.floats:
 	case meets != kindAny:
-		return meets
+		return meets, true
 	}
-	return kindFloat
+	return kindFloat, false
 }
 
 // guess returns the likelier type of live-in register r, which nothing in
@@ -1368,9 +1481,44 @@ func (k *kernelPlan) guess(p *prototype, at []map[int]numKind, r int) numKind {
 // Jumps in a body only go forward, so one pass finds them. It reports
 // false where two paths reach a pc with a register of different types.
 func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, bool) {
+	// Loops inside jump back, which one pass cannot see: pass again with
+	// the types they jump back with, until the types stop changing.
+	back := make([][]map[int]numKind, k.latch-k.start+1)
+	var last []map[int]numKind
+	for range maxFlowPasses {
+		at, results, next, ok := k.flowPass(p, back)
+		if !ok {
+			return nil, nil, false
+		}
+		if last != nil && slices.EqualFunc(at, last, maps.Equal) {
+			return at, results, true
+		}
+		last, back = at, next
+	}
+	return nil, nil, false
+}
+
+// maxFlowPasses bounds flow's passes over a body with loops inside.
+const maxFlowPasses = 8
+
+// flowPass is one of flow's passes, with the states that jump back to
+// each pc from the pass before, and returns those this pass jumps back
+// with.
+func (k *kernelPlan) flowPass(p *prototype, back [][]map[int]numKind) ([]map[int]numKind, map[int]numKind, [][]map[int]numKind, bool) {
 	code := p.Code
 	at := make([]map[int]numKind, k.latch-k.start+1)
 	incoming := make([][]map[int]numKind, len(at))
+	next := make([][]map[int]numKind, len(at))
+	for x := range back {
+		incoming[x] = slices.Clone(back[x])
+	}
+	jumpTo := func(from, t int, state map[int]numKind) {
+		if t <= from { // back, to a loop inside
+			next[t-k.start] = append(next[t-k.start], state)
+		} else {
+			incoming[t-k.start] = append(incoming[t-k.start], state)
+		}
+	}
 	results := map[int]numKind{}
 	cur := maps.Clone(k.types) // nil where no path falls through
 	for ip := k.start; ip <= k.latch; ip++ {
@@ -1378,9 +1526,14 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 		if cur != nil {
 			states = append(states, cur)
 		}
+		live := k.live[ip-k.start]
+		for x, st := range states { // a dead register has no type to agree on
+			states[x] = maps.Clone(st)
+			maps.DeleteFunc(states[x], func(r int, _ numKind) bool { return !live.has(r) })
+		}
 		merged, ok := mergeTypes(states)
 		if !ok {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
 		at[ip-k.start] = merged
 		if ip == k.latch {
@@ -1395,18 +1548,32 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 		switch i.OpCode() {
 		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual, bytecode.OpTest:
 			if t, ok := k.jump(code, ip); ok { // or it leaves
-				incoming[t-k.start] = append(incoming[t-k.start], cur)
+				jumpTo(ip+1, t, cur)
 			}
 			at[ip+1-k.start] = cur // the JMP, which the test consumes
 			ip++
 		case bytecode.OpJump:
 			t, _ := k.jump(code, ip)
-			incoming[t-k.start] = append(incoming[t-k.start], cur)
+			jumpTo(ip, t, cur)
 			cur = nil
+		case bytecode.OpForPrep:
+			a := i.A()
+			t := forKind(cur[a], cur[a+1], cur[a+2])
+			for r := a; r <= a+3; r++ {
+				cur[r] = t
+			}
+			results[ip] = t
+			jumpTo(ip, ip+2+i.SBx(), maps.Clone(cur)) // past the FORLOOP, when it runs no times
+		case bytecode.OpForLoop: // a loop's inside: back to its start, or on
+			cur[i.A()+3] = cur[i.A()] // the variable, which it sets
+			jumpTo(ip, ip+1+i.SBx(), maps.Clone(cur))
+		case bytecode.OpLength:
+			results[ip] = kindInt
+			cur[i.A()] = kindInt
 		case bytecode.OpBitwise:
 			t, ok := bitwiseResult(p, i, bytecode.ArithOp(code[ip+1].Ax()), cur)
 			if !ok {
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 			results[ip] = t
 			cur[i.A()] = t
@@ -1427,7 +1594,7 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 			}
 			t, ok := callResult(k.calls[ip], i, cur)
 			if !ok {
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 			results[ip] = t
 			cur[i.A()] = t
@@ -1462,13 +1629,169 @@ func (k *kernelPlan) flow(p *prototype) ([]map[int]numKind, map[int]numKind, boo
 				t = kindFloat
 			}
 			if !ok {
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 			results[ip] = t
 			cur[i.A()] = t
 		}
 	}
-	return at, results, true
+	return at, results, next, true
+}
+
+// regSet is a set of registers, which a prototype has at most 256 of.
+type regSet [4]uint64
+
+func (s *regSet) add(r int)      { s[r>>6] |= 1 << (r & 63) }
+func (s *regSet) del(r int)      { s[r>>6] &^= 1 << (r & 63) }
+func (s regSet) has(r int) bool  { return r >= 0 && r < 256 && s[r>>6]&(1<<(r&63)) != 0 }
+func (s *regSet) union(o regSet) { s[0], s[1], s[2], s[3] = s[0]|o[0], s[1]|o[1], s[2]|o[2], s[3]|o[3] }
+func (s *regSet) addRange(a, b int) { // a to b, inclusive
+	for r := a; r <= b && r < 256; r++ {
+		s.add(r)
+	}
+}
+
+// liveness returns the registers live before each body pc and the latch:
+// read on some path before being written. It is conservative where the
+// kernel does not follow: an instruction it leaves at, or one whose
+// registers it does not model, reads all of them, and a path that leaves
+// the loop, or goes round it at the latch, keeps live what the loop's
+// start does and the registers below the loop, which outlive it.
+func (k *kernelPlan) liveness(p *prototype) []regSet {
+	code := p.Code
+	var all regSet
+	all.addRange(0, p.MaxStackSize)
+	var below regSet
+	below.addRange(0, k.pinBelow()-1)
+	live := make([]regSet, k.latch-k.start+1)
+	rk := func(s *regSet, f int) {
+		if !bytecode.IsConstant(f) {
+			s.add(f)
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		at := func(pc int) regSet { // live before pc, or out of the loop
+			if pc < k.start || pc > k.latch {
+				return all
+			}
+			return live[pc-k.start]
+		}
+		// The latch: round again, or on after the loop.
+		// The latch's snapshot writes back what leaving there needs, at the
+		// end of the loop or, after the step, when the budget runs out and
+		// the body goes on: its registers, the index and variable too.
+		latch := live[0]
+		latch.union(below)
+		if !k.while {
+			latch.addRange(k.base, k.base+3)
+		}
+		if latch != live[k.latch-k.start] {
+			live[k.latch-k.start], changed = latch, true
+		}
+		for ip := k.latch - 1; ip >= k.start; ip-- {
+			if isExtraArg(code, ip) {
+				live[ip-k.start] = at(ip + 1)
+				continue
+			}
+			i := code[ip]
+			var out, uses, defs regSet
+			succ := []int{ip + 1}
+			switch op := i.OpCode(); {
+			case k.exits[ip] || k.unreached[ip]: // the ordinary code runs it
+				uses = all
+			case op == bytecode.OpMove || op == bytecode.OpUnaryMinus || op == bytecode.OpNot || op == bytecode.OpLength:
+				uses.add(i.B())
+				defs.add(i.A())
+			case op == bytecode.OpLoadConstant || op == bytecode.OpLoadBool || op == bytecode.OpGetUpValue:
+				defs.add(i.A())
+			case op == bytecode.OpAdd || op == bytecode.OpSub || op == bytecode.OpMul || op == bytecode.OpDiv ||
+				op == bytecode.OpMod || op == bytecode.OpIDiv || op == bytecode.OpBitwise:
+				rk(&uses, i.B())
+				rk(&uses, i.C())
+				defs.add(i.A())
+				if op == bytecode.OpBitwise {
+					succ = []int{ip + 2}
+				}
+			case op == bytecode.OpGetTable:
+				uses.add(i.B())
+				rk(&uses, i.C())
+				defs.add(i.A())
+			case op == bytecode.OpGetTableUp:
+				rk(&uses, i.C())
+				defs.add(i.A())
+			case op == bytecode.OpSetTable:
+				uses.add(i.A())
+				rk(&uses, i.B())
+				rk(&uses, i.C())
+			case op == bytecode.OpSetTableUp:
+				rk(&uses, i.B())
+				rk(&uses, i.C())
+			case op == bytecode.OpEqual || op == bytecode.OpLessThan || op == bytecode.OpLessOrEqual || op == bytecode.OpTest:
+				if op == bytecode.OpTest {
+					uses.add(i.A())
+				} else {
+					rk(&uses, i.B())
+					rk(&uses, i.C())
+				}
+				succ = []int{ip + 2}
+				if t, ok := k.jump(code, ip); ok {
+					succ = append(succ, t)
+				} else {
+					succ = append(succ, -1) // out
+				}
+			case op == bytecode.OpJump:
+				if t, ok := k.jump(code, ip); ok {
+					succ = []int{t}
+				} else {
+					succ = []int{-1}
+				}
+			case op == bytecode.OpForPrep:
+				uses.addRange(i.A(), i.A()+2)
+				defs.addRange(i.A(), i.A()+3)
+				succ = append(succ, ip+2+i.SBx())
+			case op == bytecode.OpForLoop:
+				uses.addRange(i.A(), i.A()+2)
+				defs.add(i.A())
+				defs.add(i.A() + 1)
+				defs.add(i.A() + 3)
+				succ = append(succ, ip+1+i.SBx())
+			case op == bytecode.OpCall && i.B() != 0 && i.C() != 0:
+				uses.addRange(i.A(), i.A()+i.B()-1)
+				defs.addRange(i.A(), i.A()+i.C()-2)
+			default:
+				uses = all
+			}
+			for _, t := range succ {
+				out.union(at(t))
+			}
+			for x := range out {
+				out[x] &^= defs[x]
+			}
+			out.union(uses)
+			out.union(below) // an error at any exit may show them, closing upvalues over them
+			if out != live[ip-k.start] {
+				live[ip-k.start], changed = out, true
+			}
+		}
+	}
+	return live
+}
+
+// forKind returns the type of the loop FORPREP starts with an index, limit
+// and step of these types: an integer one of integers, which is all a
+// kernel runs inside another loop, kindAny while one is undecided, and
+// kindFloat otherwise, which checkTypes turns down.
+func forKind(ts ...numKind) numKind {
+	for _, t := range ts {
+		if t == kindAny {
+			return kindAny
+		}
+		if t != kindInt {
+			return kindFloat
+		}
+	}
+	return kindInt
 }
 
 // mergeTypes merges the registers' types where paths meet: a register
@@ -1505,8 +1828,8 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 	code := p.Code
 	k.floatKeys, k.badPC = false, -1
 	end := k.at[k.latch-k.start]
-	for _, r := range k.writtenOnce() {
-		if t, ok := k.types[r]; ok && end[r] != t {
+	for _, r := range k.writtenOnce() { // what goes round the loop keeps its type
+		if t, ok := k.types[r]; ok && k.live[k.latch-k.start].has(r) && end[r] != t {
 			return false
 		}
 	}
@@ -1538,6 +1861,15 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 			continue
 		case bytecode.OpJump, bytecode.OpGetUpValue, bytecode.OpLoadBool:
 			continue
+		case bytecode.OpForPrep, bytecode.OpForLoop: // of integers
+			if k.typeAt(ip, i.A()) != kindInt || k.typeAt(ip, i.A()+1) != kindInt || k.typeAt(ip, i.A()+2) != kindInt {
+				return k.fail(ip)
+			}
+			continue
+		case bytecode.OpLength:
+			if k.typeAt(ip, i.B()) != kindTable {
+				return k.fail(ip)
+			}
 		case bytecode.OpTest: // a bool, or a number or table, which is true
 			if !isRegKind(k.typeAt(ip, i.A())) {
 				return k.fail(ip)
@@ -1758,19 +2090,26 @@ func activeLocals(p *prototype, pc int) int {
 }
 
 // jump returns where the jump at ip, or the JMP after the test at ip,
-// goes in k, as kernelJump does; in a while loop, one back to its start
-// goes to the latch, which starts the next iteration.
+// goes in k, and false unless it closes no upvalues and stays in the
+// loop: forward in the body or to the latch, or back, to the start of a
+// loop inside it. In a while loop, one back to its start goes to the
+// latch, which starts the next iteration.
 func (k *kernelPlan) jump(code []bytecode.Instruction, ip int) (int, bool) {
-	t, ok := kernelJump(code, ip, k.latch)
-	if ok || !k.while {
-		return t, ok
-	}
 	j := ip
 	if code[ip].OpCode() != bytecode.OpJump {
 		j++
 	}
-	if i := code[j]; i.OpCode() == bytecode.OpJump && i.A() == 0 && j+1+i.SBx() == k.start {
+	i := code[j]
+	if i.OpCode() != bytecode.OpJump || i.A() != 0 {
+		return 0, false
+	}
+	switch t := j + 1 + i.SBx(); {
+	case t > j && t <= k.latch:
+		return t, true
+	case k.while && t == k.start:
 		return k.latch, true
+	case t >= k.start && t <= j:
+		return t, true
 	}
 	return 0, false
 }
@@ -1778,7 +2117,7 @@ func (k *kernelPlan) jump(code []bytecode.Instruction, ip int) (int, bool) {
 // kernelOp reports whether a kernel may run op; it leaves at any other.
 func kernelOp(op bytecode.OpCode) bool {
 	switch op {
-	case bytecode.OpLoadBool, bytecode.OpTest, bytecode.OpNot:
+	case bytecode.OpLoadBool, bytecode.OpTest, bytecode.OpNot, bytecode.OpForPrep, bytecode.OpForLoop, bytecode.OpLength:
 		return true
 	case bytecode.OpMove, bytecode.OpLoadConstant, bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul,
 		bytecode.OpDiv, bytecode.OpMod, bytecode.OpIDiv, bytecode.OpBitwise, bytecode.OpUnaryMinus,

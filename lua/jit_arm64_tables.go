@@ -808,13 +808,17 @@ func (c *arm64Compiler) checkArgs(i bytecode.Instruction, n int, fail Label) {
 // after the one result it has stored in register A. It uses rTmp, rTmp2
 // and rAddr.
 func (c *arm64Compiler) resultTop(i bytecode.Instruction) {
-	if i.C() != 0 {
-		return
+	if i.C() == 0 {
+		c.setTop(i.A() + 1)
 	}
+}
+
+// setTop sets l.top to register r, using rTmp, rTmp2 and rAddr.
+func (c *arm64Compiler) setTop(r int) {
 	a := &c.a
 	a.Ldr(rTmp, rCtx, offCtxS)
 	a.Ldr(rAddr, rTmp, offStack)
-	a.AddImm(rTmp2, rFrame, uint32(i.A()+1)*valueSize)
+	a.AddImm(rTmp2, rFrame, uint32(r)*valueSize)
 	a.Sub(rTmp2, rTmp2, rAddr)
 	a.Lsr(rTmp2, rTmp2, 4)
 	a.Str(rTmp2, rTmp, offLTop)

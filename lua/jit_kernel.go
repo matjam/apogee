@@ -14,10 +14,11 @@ import (
 //
 // An innermost numeric for loop whose body only moves numbers, loads
 // number constants, does arithmetic and compares numbers is also compiled
-// as a kernel: each Lua register the loop uses lives in a machine register
-// for the whole loop, a general-purpose one for an integer and a
-// floating-point one for a float, so iterations run without loads, stores
-// or type checks. Each register has one type throughout, which planKernel
+// as a kernel: each Lua register the loop uses lives in a machine register,
+// a general-purpose one for an integer and a floating-point one for a
+// float, so iterations run without loads, stores or type checks. The
+// body's temporaries share machine registers where their lives do not
+// overlap (allocate). Each register has one type throughout, which planKernel
 // infers from the loop's kind (an integer or a float loop) and the body;
 // a register nothing decides, such as an accumulator that only adds to
 // itself or integer constants, is an integer. A loop may get two kernels, one for each
@@ -29,9 +30,9 @@ import (
 
 // A kernel may also call an intrinsic, and read and write buffers:
 //
-//   - GETUPVAL A, n followed, with only arithmetic between, by CALL A 2 2
-//     of an intrinsic (sqrt, sin, cos) the upvalue holds when the function
-//     compiles. The kernel checks on entry that the upvalue still holds it;
+//   - GETUPVAL A, n followed, with only arithmetic, buffer reads and other
+//     intrinsic calls between, by CALL A of an intrinsic (sqrt, sin, cos,
+//     or a math function) the upvalue holds when the function compiles. The kernel checks on entry that the upvalue still holds it;
 //     the GETUPVAL emits nothing, and the CALL computes the intrinsic on
 //     registers.
 //   - GETTABLE and SETTABLE of a buffer in a register the loop only reads,
@@ -91,6 +92,7 @@ type kernelCall struct {
 	upValue int
 	fn      uint64
 	get, a  int    // the GETUPVAL's pc, and the register it and the CALL name
+	args    int    // one or two, whether B gives them or, when 0, l.top
 	math    mathFn // a math function, or mathNone for a number function
 }
 
@@ -204,11 +206,13 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 		return false
 	}
 	number := func(kk int) bool { return constOK(kk) && constKind(p.Constants[kk]) != kindAny }
+	reads, pc := map[int][]int{}, 0 // the registers each pc reads, for allocate
 	read := func(field int) bool {
 		if bytecode.IsConstant(field) {
 			return number(bytecode.ConstantIndex(field))
 		}
 		use(field)
+		reads[pc] = append(reads[pc], field)
 		if !seen[field] {
 			seen[field] = true
 			if !defined[field] {
@@ -233,6 +237,7 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 	}
 	for ip := start; ip < latch; ip++ {
 		i := code[ip]
+		pc = ip
 		switch i.OpCode() {
 		case bytecode.OpMove:
 			if !read(i.B()) || !write(i.A(), ip) {
@@ -297,7 +302,7 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			if call, args, ok := intrinsicCall(code, ip, start, latch); ok {
 				fn, m, isIntrinsic := intrinsic(i.B())
 				if isIntrinsic && args == 1 == (m == mathNone || m.unary()) {
-					k.calls[call] = kernelCall{upValue: i.B(), fn: fn, get: ip, a: i.A(), math: m}
+					k.calls[call] = kernelCall{upValue: i.B(), fn: fn, get: ip, a: i.A(), args: args, math: m}
 					k.virtual[ip] = true
 					break
 				}
@@ -312,7 +317,7 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			}
 			k.upLoads[ip] = s
 		case bytecode.OpCall:
-			if _, ok := k.calls[ip]; !ok || !read(i.A()+1) || i.B() == 3 && !read(i.A()+2) || !write(i.A(), ip) {
+			if kc, ok := k.calls[ip]; !ok || !read(i.A()+1) || kc.args == 2 && !read(i.A()+2) || !write(i.A(), ip) {
 				return nil
 			}
 		case bytecode.OpGetTable: // a buffer's element, at a key checked below
@@ -397,39 +402,142 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			}
 		}
 	}
-	// A machine register for each type each register takes, in order of
-	// first appearance.
-	k.slots = map[kslot]int{}
-	floats, ints := 0, 0
-	assign := func(r int, t numKind) {
-		s := kslot{r, t}
-		if _, ok := k.slots[s]; ok || !isNumKind(t) {
-			return
-		}
-		if t == kindInt {
-			k.slots[s], ints = ints, ints+1
-		} else {
-			k.slots[s], floats = floats, floats+1
-		}
-	}
-	for r := base; r <= base+3; r++ {
-		assign(r, loopKind)
-	}
-	for _, r := range k.liveIn {
-		assign(r, k.types[r])
-	}
-	for ip := start; ip < latch; ip++ {
-		if t, ok := k.results[ip]; ok {
-			assign(code[ip].A(), t)
-		}
-	}
-	if k.floatKeys {
-		assign(keyScratch, kindInt)
-	}
-	if floats > maxFloats || ints > maxInts {
+	if !k.allocate(p, base, reads, maxFloats, maxInts) {
 		return nil
 	}
 	return k
+}
+
+// allocate gives each type each register takes a machine register, in
+// slots. The loop's registers, those live into the body and those below
+// the loop, which outlive it, each keep their own; the body's
+// temporaries, dead at the latch, share by liveness: two share one unless
+// some pc needs both. reads holds the registers each body pc reads. It
+// reports false when the kernel needs more than maxFloats float or
+// maxInts integer registers.
+//
+// A side exit writes back every register the body writes, and so may
+// store a dead temporary's register, holding another's number, into it.
+// The ordinary code writes a dead register before reading it, as the
+// kernel does.
+func (k *kernelPlan) allocate(p *prototype, base int, reads map[int][]int, maxFloats, maxInts int) bool {
+	code := p.Code
+	var nodes []kslot // in order of first appearance
+	index := map[kslot]int{}
+	add := func(r int, t numKind) {
+		s := kslot{r, t}
+		if _, ok := index[s]; !ok && isNumKind(t) {
+			index[s] = len(nodes)
+			nodes = append(nodes, s)
+		}
+	}
+	for r := base; r <= base+3; r++ {
+		add(r, k.types[base])
+	}
+	for _, r := range k.liveIn {
+		add(r, k.types[r])
+	}
+	for ip := k.start; ip < k.latch; ip++ {
+		add(code[ip].A(), k.results[ip])
+	}
+	if k.floatKeys {
+		add(keyScratch, kindInt)
+	}
+	pinned := func(s kslot) bool { return s.r < base+4 || slices.Contains(k.liveIn, s.r) } // keyScratch is -1
+
+	// Liveness of the temporaries, backwards: jumps only go forward.
+	starts := map[int]bool{}
+	for ip := k.start; ip < k.latch; ip++ {
+		starts[ip] = true
+		switch code[ip].OpCode() {
+		case bytecode.OpEqual, bytecode.OpLessThan, bytecode.OpLessOrEqual, bytecode.OpBitwise:
+			ip++ // the JMP, or the operator's word
+		}
+	}
+	n := len(nodes)
+	conflict := make([][]bool, n)
+	for x := range conflict {
+		conflict[x] = make([]bool, n)
+	}
+	live := make([]map[int]bool, k.latch-k.start+1)
+	live[k.latch-k.start] = map[int]bool{}
+	liveAt := func(ip int) map[int]bool { return live[ip-k.start] }
+	for ip := k.latch - 1; ip >= k.start; ip-- {
+		i := code[ip]
+		var succ []int
+		switch {
+		case !starts[ip] && code[ip-1].OpCode() == bytecode.OpBitwise:
+			live[ip-k.start] = liveAt(ip + 1)
+			continue
+		case !starts[ip]: // a test's JMP
+			t, _ := kernelJump(code, ip-1, k.latch)
+			live[ip-k.start] = liveAt(t)
+			continue
+		case i.OpCode() == bytecode.OpJump:
+			t, _ := kernelJump(code, ip, k.latch)
+			succ = []int{t}
+		case i.OpCode() == bytecode.OpEqual, i.OpCode() == bytecode.OpLessThan, i.OpCode() == bytecode.OpLessOrEqual:
+			t, _ := kernelJump(code, ip, k.latch)
+			succ = []int{ip + 2, t}
+		case i.OpCode() == bytecode.OpBitwise:
+			succ = []int{ip + 2}
+		default:
+			succ = []int{ip + 1}
+		}
+		out := map[int]bool{}
+		for _, s := range succ {
+			maps.Copy(out, liveAt(s))
+		}
+		in := maps.Clone(out)
+		var needed []int
+		if d, ok := index[kslot{i.A(), k.results[ip]}]; ok && !pinned(nodes[d]) {
+			delete(in, d)
+			needed = append(needed, d)
+		}
+		for _, r := range reads[ip] {
+			if x, ok := index[kslot{r, k.typeAt(ip, r)}]; ok && !pinned(nodes[x]) {
+				in[x] = true
+			}
+		}
+		live[ip-k.start] = in
+		// What ip reads needs a register of its own, as does what it
+		// writes and what lives past it. Each kernel instruction reads its
+		// operands before it writes its result, and leaves the kernel
+		// before either, so the result may take an operand's register when
+		// ip reads it last.
+		for x := range out {
+			needed = append(needed, x)
+		}
+		for _, set := range [][]int{needed, slices.Collect(maps.Keys(in))} {
+			for _, x := range set {
+				for _, y := range set {
+					conflict[x][y] = true
+				}
+			}
+		}
+	}
+
+	k.slots = map[kslot]int{}
+	floats, ints := 0, 0
+	for x, s := range nodes {
+		taken := map[int]bool{}
+		for y := range x {
+			if nodes[y].t == s.t && (pinned(s) || pinned(nodes[y]) || conflict[x][y]) {
+				taken[k.slots[nodes[y]]] = true
+			}
+		}
+		m := 0
+		for taken[m] {
+			m++
+		}
+		k.slots[s] = m
+		if s.t == kindInt {
+			ints = max(ints, m+1)
+		} else {
+			floats = max(floats, m+1)
+		}
+	}
+	return floats <= maxFloats && ints <= maxInts
 }
 
 // promoteConstants marks the body's LOADKs of integer constants that
@@ -597,12 +705,13 @@ func upValueKind(cl *luaClosure, n int) (numKind, bool) {
 	return kindAny, false
 }
 
-// intrinsicCall returns the pc of the CALL A B 2 that the GETUPVAL A at ip
+// intrinsicCall returns the pc of the CALL A B C that the GETUPVAL A at ip
 // feeds, and its argument count, one or two, when only arithmetic,
-// upvalue loads and buffer reads that leave A alone lie between them, and
-// no jump in the body lands there. A buffer read may leave the kernel; its
-// side exit stores the function in A (calleesAt), as the GETUPVAL would
-// have.
+// upvalue loads, buffer reads and calls above A lie between them, and no
+// jump in the body lands there. A buffer read or a call may leave the
+// kernel; its side exit stores the function in A (calleesAt), as the
+// GETUPVAL would have. An intrinsic has one result, so a call of one
+// that ends another's arguments, C 0 then B 0, passes a fixed count.
 func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, int, bool) {
 	a := code[ip].A()
 	for j := ip + 1; j < latch; j++ {
@@ -615,7 +724,17 @@ func intrinsicCall(code []bytecode.Instruction, ip, start, latch int) (int, int,
 		clobbers := false
 		switch i.OpCode() {
 		case bytecode.OpCall:
-			return j, i.B() - 1, i.A() == a && (i.B() == 2 || i.B() == 3) && i.C() == 2
+			if i.A() > a {
+				clobbers = i.C() == 0 && (j+1 >= latch || code[j+1].OpCode() != bytecode.OpCall || code[j+1].B() != 0)
+				break
+			}
+			args := i.B() - 1
+			if i.B() == 0 { // up to the call before's result
+				args = code[j-1].A() - a
+			}
+			ok := i.A() == a && (args == 1 || args == 2) && (i.C() == 2 || i.C() == 0 && j+1 < latch &&
+				code[j+1].OpCode() == bytecode.OpCall && code[j+1].B() == 0)
+			return j, args, ok
 		case bytecode.OpMove, bytecode.OpUnaryMinus:
 			clobbers = i.A() == a || i.B() == a
 		case bytecode.OpLoadConstant, bytecode.OpGetUpValue:
@@ -1010,7 +1129,7 @@ func (k *kernelPlan) checkTypes(p *prototype) bool {
 				return false
 			}
 		case bytecode.OpCall:
-			if !known(i.A()+1) || i.B() == 3 && !known(i.A()+2) {
+			if !known(i.A()+1) || k.calls[ip].args == 2 && !known(i.A()+2) {
 				return false
 			}
 			m := k.calls[ip].math

@@ -124,6 +124,9 @@ the environment variable `APOGEE_JIT=off` does that for every state.
   (on amd64, `floor` and `ceil` need SSE4.1, and `sin` and `cos` a
   GOAMD64 level below v3).
   Numeric loops run with their variables in registers.
+- A numeric loop runs fastest when each variable keeps one type. As Lua
+  says, `math.min(x, 1)` returns the integer `1` when it is less than a
+  float `x`; write `math.min(x, 1.0)` to keep the result a float.
 - Compiled code shares the interpreter's stack frames. An instruction it
   cannot run, or a Go call, returns to Go and continues in compiled code
   after it, so every script runs correctly.

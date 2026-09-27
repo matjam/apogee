@@ -1250,6 +1250,57 @@ func TestJITKernelWhile(t *testing.T) {
 	}
 }
 
+// A kernel runs the loops inside its loop too: integer for loops and
+// while loops, with their back edges spending budget.
+func TestJITKernelNests(t *testing.T) {
+	skipWithoutJIT(t)
+	tests := []struct{ name, src string }{
+		{"for in for", `function run() local s = 0 for i = 1, 30 do for j = 1, 20 do s = s + i * j end end return s end`},
+		{"inner loop from the outer index", `function run() local s = 0 for i = 1, 40 do for j = i, 40 do s = s + j - i end end return s end`},
+		{"inner loop that runs no times", `function run() local s = 0 for i = 1, 20 do for j = i, 10 do s = s + 1 end end return s end`},
+		{"negative and large steps", `function run() local s = 0 for i = 1, 10 do for j = 50, 1, -7 do s = s + j end for j = 1, 100, 13 do s = s + j end end return s end`},
+		{"step 0 raises", `local function g(z) local s = 0 for i = 1, 3 do for j = 1, 2, z do s = s + 1 end end return s end
+			function run() local s = g(1) return s, pcall(g, 0) end`},
+		{"while in for", `function run() local s = 0 for i = 1, 50 do local j = i while j > 1 do if j % 2 == 0 then j = j // 2 else j = 3 * j + 1 end s = s + 1 end end return s end`},
+		{"for in while", `function run() local s, i = 0, 0 while i < 30 do for j = 1, i do s = s + j end i = i + 1 end return s end`},
+		{"length", `function run() local t, s = {}, 0 for i = 1, 20 do t[i] = i end for i = 1, #t do for j = i + 1, #t do s = s + t[i] * t[j] end end return s end`},
+		{"length with holes and hash", `function run() local t = {1, 2, 3, nil, 5, x = 1} local s = 0 for i = 1, 5 do s = s + #t + i end return s end`},
+		{"long inner loop spends budget", `function run() local s = 0 for i = 1, 3 do for j = 1, 100000 do s = s + 1 end end return s end`},
+		{"nbody-like nest", `
+			function run()
+			  local bodies = {}
+			  for i = 1, 5 do bodies[i] = {x = i * 1.0, vx = 0.0, mass = 1.0 + i} end
+			  for step = 1, 50 do
+			    for i = 1, #bodies do
+			      local bi = bodies[i]
+			      for j = i + 1, #bodies do
+			        local bj = bodies[j]
+			        local dx = bi.x - bj.x
+			        bi.vx = bi.vx - dx * bj.mass * 0.001
+			        bj.vx = bj.vx + dx * bi.mass * 0.001
+			      end
+			    end
+			    for i = 1, #bodies do local b = bodies[i]; b.x = b.x + b.vx end
+			  end
+			  return bodies[1].x, bodies[5].vx
+			end`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime.GC()
+			defer debug.SetGCPercent(debug.SetGCPercent(-1)) // kernels run while the barrier is off
+			jit, interp, lj := runBoth(t, tt.src)
+			if jit != interp {
+				t.Fatalf("JIT %q, interpreter %q", jit, interp)
+			}
+			// # of a table with a hash part is Go's: the loop leaves each time.
+			if lj.jitCtx.kernels[0]+lj.jitCtx.kernels[1] == 0 && !strings.Contains(tt.name, "hash") {
+				t.Error("no kernel ran")
+			}
+		})
+	}
+}
+
 // Kernels needing more registers than the machine has spill the rest to
 // their stack slots, and agree with the interpreter.
 func TestJITKernelSpills(t *testing.T) {
@@ -1398,9 +1449,9 @@ func TestJITMixedMinMax(t *testing.T) {
 func TestJITGenericFor(t *testing.T) {
 	skipWithoutJIT(t)
 	exits := map[string]int{}
-	jitExitHook = func(p *prototype, ip int, reason uint64) {
+	jitExitHook = func(p *prototype, ip int, reason uint64, frame []value) {
 		if p.LineDefined == 2 {
-			exits[exitKind(p, ip, reason)]++
+			exits[exitKind(p, ip, reason, frame)]++
 		}
 	}
 	defer func() { jitExitHook = nil }()
@@ -1454,9 +1505,9 @@ func TestJITGenericFor(t *testing.T) {
 func TestJITVarArgTailCalls(t *testing.T) {
 	skipWithoutJIT(t)
 	exits := map[string]int{}
-	jitExitHook = func(p *prototype, ip int, reason uint64) {
+	jitExitHook = func(p *prototype, ip int, reason uint64, frame []value) {
 		if p.LineDefined > 0 { // not the chunk, which makes the functions
-			exits[exitKind(p, ip, reason)]++
+			exits[exitKind(p, ip, reason, frame)]++
 		}
 	}
 	defer func() { jitExitHook = nil }()
@@ -1511,10 +1562,10 @@ func TestJITTailCallFromVarArgs(t *testing.T) {
 func TestJITVarArgs(t *testing.T) {
 	skipWithoutJIT(t)
 	exits := map[string]int{}
-	jitExitHook = func(p *prototype, ip int, reason uint64) {
+	jitExitHook = func(p *prototype, ip int, reason uint64, frame []value) {
 		// view, at line 7, indexes a vararg view, which Go does.
 		if p.LineDefined >= 2 && p.LineDefined <= 8 && p.LineDefined != 7 {
-			if k := exitKind(p, ip, reason); !strings.HasPrefix(k, "CALL (Go") {
+			if k := exitKind(p, ip, reason, frame); !strings.HasPrefix(k, "CALL (Go") {
 				exits[k]++
 			}
 		}
@@ -1560,9 +1611,9 @@ func TestJITVarArgs(t *testing.T) {
 func TestJITNilArrayStores(t *testing.T) {
 	skipWithoutJIT(t)
 	exits := map[string]int{}
-	jitExitHook = func(p *prototype, ip int, reason uint64) {
+	jitExitHook = func(p *prototype, ip int, reason uint64, frame []value) {
 		if p.LineDefined == 2 {
-			exits[exitKind(p, ip, reason)]++
+			exits[exitKind(p, ip, reason, frame)]++
 		}
 	}
 	defer func() { jitExitHook = nil }()
@@ -1604,9 +1655,9 @@ func TestJITNilArrayStores(t *testing.T) {
 func TestJITSetMetatable(t *testing.T) {
 	skipWithoutJIT(t)
 	exits := map[string]int{}
-	jitExitHook = func(p *prototype, ip int, reason uint64) {
+	jitExitHook = func(p *prototype, ip int, reason uint64, frame []value) {
 		if p.LineDefined >= 3 && p.LineDefined <= 5 {
-			exits[exitKind(p, ip, reason)]++
+			exits[exitKind(p, ip, reason, frame)]++
 		}
 	}
 	defer func() { jitExitHook = nil }()
@@ -1654,8 +1705,8 @@ func TestJITSetMetatable(t *testing.T) {
 func TestJITFloatMod(t *testing.T) {
 	skipWithoutJIT(t)
 	exits := 0
-	jitExitHook = func(p *prototype, ip int, reason uint64) {
-		if p.LineDefined == 2 && exitKind(p, ip, reason) == "MOD" {
+	jitExitHook = func(p *prototype, ip int, reason uint64, frame []value) {
+		if p.LineDefined == 2 && exitKind(p, ip, reason, frame) == "MOD" {
 			exits++
 		}
 	}
@@ -1741,8 +1792,8 @@ func TestJITLength(t *testing.T) {
 // starts with kind, until stop.
 func exitsAt(kind string) (count *int, stop func()) {
 	n := 0
-	jitExitHook = func(p *prototype, ip int, reason uint64) {
-		if strings.HasPrefix(exitKind(p, ip, reason), kind) {
+	jitExitHook = func(p *prototype, ip int, reason uint64, frame []value) {
+		if strings.HasPrefix(exitKind(p, ip, reason, frame), kind) {
 			n++
 		}
 	}
@@ -1836,7 +1887,7 @@ func TestJITBudget(t *testing.T) {
 	if jit != interp {
 		t.Fatalf("JIT %q, interpreter %q", jit, interp)
 	}
-	if runs := lj.jitRuns; runs < 1000000/jitBudget {
+	if runs := lj.jitRuns; runs < uint64(1000000/jitBudget) {
 		t.Fatalf("compiled code ran %d times, want at least %d budget exits", runs, 1000000/jitBudget)
 	}
 }

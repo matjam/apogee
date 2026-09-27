@@ -44,21 +44,7 @@ func (c *amd64Compiler) findKernels(latch int) []*kernel {
 	constOK := func(k int) bool { _, ok := c.constant(k); return ok }
 	env := newKernelEnv(c.cl, c.frame, constOK, fns, c.sse41)
 	var ks []*kernel
-	var plans []*kernelPlan
-	for _, intLoop := range []bool{true, false} {
-		if !intLoop && c.p.Code[latch].OpCode() == bytecode.OpJump {
-			break // a while loop has no loop registers to be floats
-		}
-		plans = append(plans, planKernel(c.p, latch, intLoop, env))
-		if c.frame == nil { // guesses with nothing to go on: floats too
-			env.floats = true
-			if alt := planKernel(c.p, latch, intLoop, env); alt != nil && !alt.sameTypes(plans[len(plans)-1]) {
-				plans = append(plans, alt)
-			}
-			env.floats = false
-		}
-	}
-	for _, plan := range plans {
+	for _, plan := range planKernels(c.p, latch, env, c.frame != nil) {
 		if plan == nil {
 			continue
 		}
@@ -563,8 +549,8 @@ func (c *amd64Compiler) kernelSetBuffer(k *kernel, in *irInst) {
 // usesInt reports whether k keeps a virtual register in machine register
 // r.
 func (k *kernel) usesInt(r Reg) bool {
-	for v, s := range k.vregs {
-		if s.t == kindInt && k.loc[v] >= 0 && kernelInts[k.loc[v]] == r {
+	for v := range k.vregs {
+		if k.isInt(vreg(v)) && k.loc[v] >= 0 && kernelInts[k.loc[v]] == r { // integers, booleans and tables
 			return true
 		}
 	}
@@ -574,12 +560,24 @@ func (k *kernel) usesInt(r Reg) bool {
 // kernelStep is FORLOOP on registers.
 func (c *amd64Compiler) kernelStep(k *kernel, take, end Label) {
 	a := &c.a
-	if k.intLoop {
-		idx, count, step, ext := k.ireg(k.loop[0]), k.ireg(k.loop[1]), k.ireg(k.loop[2]), k.ireg(k.loop[3])
-		a.Test(count, count)
-		a.J(E, end)
-		a.SubImm(count, 1)
-		a.Add(idx, step)
+	if k.intLoop { // the count and step may be in their stack slots: see allocate
+		idx, ext := k.ireg(k.loop[0]), k.ireg(k.loop[3])
+		if cs := reg(k.base + 1); k.spilled(k.loop[1]) {
+			a.CmpMem(cs.base, cs.off+offN, 0)
+			a.J(E, end)
+			a.SubMem(cs.base, cs.off+offN, 1)
+		} else {
+			count := k.ireg(k.loop[1])
+			a.Test(count, count)
+			a.J(E, end)
+			a.SubImm(count, 1)
+		}
+		if ss := reg(k.base + 2); k.spilled(k.loop[2]) {
+			a.Load(AX, ss.base, ss.off+offN)
+			a.Add(idx, AX)
+		} else {
+			a.Add(idx, k.ireg(k.loop[2]))
+		}
 		if ext != idx {
 			a.Mov(ext, idx)
 		}
@@ -803,12 +801,7 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		a.MovSD(k.reg(in.dst), 4)
 	case irBranch:
 		if in.cmp == bytecode.OpTest { // of a boolean: to target when it is flag
-			var yes Label
-			if in.target >= 0 {
-				yes = label(in.target)
-			} else {
-				yes = c.kernelSideExit(k, in.snap, false)
-			}
+			yes := c.branchTarget(k, in, label)
 			r := k.ireg(in.a.v)
 			a.Test(r, r)
 			if in.flag {
@@ -819,12 +812,7 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 			a.Jmp(label(in.pc + 2))
 			break
 		}
-		var yes Label
-		if in.target >= 0 {
-			yes = label(in.target)
-		} else {
-			yes = c.kernelSideExit(k, in.snap, false) // it ends the loop: no short run
-		}
+		yes := c.branchTarget(k, in, label)
 		no := label(in.pc + 2)
 		if in.a.t == kindInt && in.b.t == kindInt {
 			a.Cmp(c.intArg(k, in.a, AX), c.intArg(k, in.b, DX))
@@ -839,7 +827,27 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 		b, cc := c.floatArg(k, in.a, 0), c.floatArg(k, in.b, 1)
 		c.compare(in.cmp, in.flag, b, cc, yes, no)
 	case irJump:
+		if in.target <= in.pc { // back, to a loop inside
+			c.kernelBackEdge(k, in, label(in.target))
+			break
+		}
 		a.Jmp(label(in.target))
+	case irForPrep:
+		c.kernelForPrep(k, in, label(in.target))
+	case irForLoop:
+		idx, count, step, ext := k.ireg(in.regs[0]), k.ireg(in.regs[1]), k.ireg(in.regs[2]), k.ireg(in.regs[3])
+		done := a.NewLabel()
+		a.Test(count, count)
+		a.J(E, done)
+		a.SubImm(count, 1)
+		a.Add(idx, step)
+		if ext != idx {
+			a.Mov(ext, idx)
+		}
+		c.kernelBackEdge(k, in, label(in.target))
+		a.Bind(done)
+	case irLen:
+		c.kernelLen(k, in)
 	case irExit: // a call's is not a short run: the kernel resumes after it
 		a.Jmp(c.kernelSideExit(k, in.snap, !in.flag))
 	case irHoist: // a number, from the context
@@ -1200,4 +1208,120 @@ func (c *amd64Compiler) ordinaryAt(pc int) Label {
 		return l
 	}
 	return c.pcs[pc]
+}
+
+// branchTarget returns where the branch in goes when taken: its target,
+// through a check of the budget when that is back, to a loop inside; or
+// when it leaves the loop, out, which is no short run.
+func (c *amd64Compiler) branchTarget(k *kernel, in *irInst, label func(int) Label) Label {
+	switch {
+	case in.target < 0:
+		return c.kernelSideExit(k, in.snap, false)
+	case in.target <= in.pc:
+		l := c.a.NewLabel()
+		c.outOfLine = append(c.outOfLine, func() {
+			c.a.Bind(l)
+			c.kernelBackEdge(k, in, label(in.target))
+		})
+		return l
+	}
+	return label(in.target)
+}
+
+// kernelBackEdge spends budget and jumps to target, a loop inside's
+// start; when the budget runs out it writes back in's snapshot, at the
+// target, and leaves for Go to yield, as a loop's back edge does.
+func (c *amd64Compiler) kernelBackEdge(k *kernel, in *irInst, target Label) {
+	a := &c.a
+	a.SubMem(rCtx, offBudget, 1)
+	a.J(E, c.kernelBudgetExit(k, in.snap))
+	a.Jmp(target)
+}
+
+// kernelBudgetExit returns a label that writes back snapshot n and exits
+// at its pc for the budget.
+func (c *amd64Compiler) kernelBudgetExit(k *kernel, n int) Label {
+	a := &c.a
+	l := a.NewLabel()
+	c.outOfLine = append(c.outOfLine, func() {
+		s := &k.snaps[n]
+		a.Bind(l)
+		c.flush(k, s)
+		if c.budget[s.pc] < 0 {
+			c.budget[s.pc] = a.NewLabel()
+		}
+		a.Jmp(c.budget[s.pc])
+	})
+	return l
+}
+
+// kernelForPrep starts an integer loop inside, as forPrep does: it leaves
+// for a step of 0, which is an error, goes to skip when the loop runs no
+// times, and otherwise leaves in its count register how many times it
+// runs after this one, and sets its variable.
+func (c *amd64Compiler) kernelForPrep(k *kernel, in *irInst, skip Label) {
+	a := &c.a
+	idx, count, step, ext := k.ireg(in.regs[0]), k.ireg(in.regs[1]), k.ireg(in.regs[2]), k.ireg(in.regs[3])
+	down, one, done := a.NewLabel(), a.NewLabel(), a.NewLabel()
+	a.Test(step, step)
+	a.J(E, c.kernelSideExit(k, in.snap, true))
+	a.J(S, down)
+	a.Cmp(idx, count) // count holds the limit
+	a.J(G, skip)
+	a.Mov(AX, count)
+	a.Sub(AX, idx) // unsigned
+	a.CmpImm(step, 1)
+	a.J(E, one)
+	a.MovImm(DX, 0)
+	a.Div(step)
+	a.Bind(one)
+	a.Jmp(done)
+	a.Bind(down)
+	a.Cmp(idx, count)
+	a.J(L, skip)
+	a.Mov(AX, idx)
+	a.Sub(AX, count)
+	a.Mov(count, step) // -(step+1)+1, which does not negate minint
+	a.AddImm(count, 1)
+	a.Neg(count)
+	a.AddImm(count, 1)
+	a.MovImm(DX, 0)
+	a.Div(count)
+	a.Bind(done)
+	a.Mov(count, AX)
+	if ext != idx {
+		a.Mov(ext, idx)
+	}
+}
+
+// kernelLen computes #a, of a table, as table.length does when the array
+// part holds the border: its length, when its last element is not nil
+// and there is no hash part or __len. Otherwise it leaves, for Go.
+func (c *amd64Compiler) kernelLen(k *kernel, in *irInst) {
+	a := &c.a
+	exit, t := c.kernelSideExit(k, in.snap, true), k.ireg(in.a.v)
+	noMeta, done := a.NewLabel(), a.NewLabel()
+	a.Load(AX, t, offTMeta)
+	a.Test(AX, AX)
+	a.J(E, noMeta)
+	a.Load8(AX, AX, offTFlags)
+	a.Bt(AX, uint8(tmLen))
+	a.J(AE, exit) // the metatable may have __len
+	a.Bind(noMeta)
+	a.Load(AX, t, offTHash)
+	a.Test(AX, AX)
+	a.J(NE, exit)
+	a.Load(AX, t, offTArray+offSliceLen)
+	a.Test(AX, AX)
+	a.J(E, done)
+	a.SubImm(AX, 1)
+	a.Shl(AX, 4)
+	a.Load(DX, t, offTArray)
+	a.Add(DX, AX)
+	a.Load(DX, DX, offP)
+	a.Test(DX, DX)
+	a.J(E, exit) // the last element is nil: Go searches for the border
+	a.Load(AX, t, offTArray+offSliceLen)
+	a.Bind(done)
+	a.Mov(k.ireg(in.dst), AX)
 }

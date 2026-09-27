@@ -41,11 +41,12 @@ var jitStrict bool
 // jitExitHook, when tests set it, sees every exit from compiled code: the
 // prototype, the pc and the reason. It finds instructions that leave
 // compiled code in hot paths.
-var jitExitHook func(p *prototype, ip int, reason uint64)
+var jitExitHook func(p *prototype, ip int, reason uint64, frame []value)
 
 // jitBudget is how many loop back-edges compiled code runs before it
-// returns to Go, so the goroutine can be preempted.
-const jitBudget = 1 << 16
+// returns to Go, so the goroutine can be preempted. The fuzzer lowers it,
+// so that loops run out of it in their middles.
+var jitBudget int64 = 1 << 16
 
 // jitContext is shared with generated code, which reads and writes it at
 // fixed offsets. Keep the field order in sync with the compilers.
@@ -412,7 +413,7 @@ func (l *State) runJIT(ci *callInfo, ip pc, bottom *callInfo) bool {
 		}
 		ip = pc(l.jitCtx.exitPC)
 		if jitExitHook != nil {
-			jitExitHook(p, int(ip), l.jitCtx.reason)
+			jitExitHook(p, int(ip), l.jitCtx.reason, ci.frame)
 		}
 		switch l.jitCtx.reason {
 		case jitExitBudget:

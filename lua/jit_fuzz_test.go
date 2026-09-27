@@ -33,9 +33,9 @@ func TestJITFuzz(t *testing.T) {
 		const iterations = 200
 		exits := map[string]int{}
 		lines := strings.Count(src, "\n") // fuzzReport's functions start after
-		jitExitHook = func(p *prototype, ip int, reason uint64) {
+		jitExitHook = func(p *prototype, ip int, reason uint64, frame []value) {
 			if p.LineDefined <= lines {
-				exits[exitKind(p, ip, reason)]++
+				exits[exitKind(p, ip, reason, frame)]++
 			}
 		}
 		jit, interp := runFuzz(t, src, iterations)
@@ -73,9 +73,14 @@ var jitMustNotExit = []string{"CALL B=", "TAILCALL B=", "RETURN B=", "LEN", "EQ"
 
 // exitKind describes an exit for the report: the instruction's name and
 // what distinguishes its exits.
-func exitKind(p *prototype, ip int, reason uint64) string {
+func exitKind(p *prototype, ip int, reason uint64, frame []value) string {
 	i := p.Code[ip] // the original instruction: jitOrig's may be specialised
 	name := strings.Fields(i.String())[0]
+	if name == "CALL" && reason == jitExitInstruction && i.A() < len(frame) && frame[i.A()].goFunction() != nil {
+		// sin and cos compiled inline leave for Go with arguments they
+		// cannot reduce, as a program's growing values reach.
+		return "CALL, an intrinsic's argument"
+	}
 	switch reason {
 	case jitExitBudget:
 		return "budget"
@@ -97,9 +102,11 @@ func exitKind(p *prototype, ip int, reason uint64) string {
 // everything at once, and returns what each returned, formatted exactly.
 func runFuzz(t *testing.T, src string, iterations int) (jit, interp string) {
 	t.Helper()
-	saved, savedRun, savedWork := jitThreshold, jitMinRun, minCallWork
-	jitThreshold, jitMinRun, minCallWork = 0, 0, 0 // kernels resume after calls however little else they do
-	defer func() { jitThreshold, jitMinRun, minCallWork = saved, savedRun, savedWork }()
+	saved, savedRun, savedWork, savedBudget := jitThreshold, jitMinRun, minCallWork, jitBudget
+	// Kernels resume after calls however little else they do, and loops run
+	// out of budget often, and in their kernels' middles.
+	jitThreshold, jitMinRun, minCallWork, jitBudget = 0, 0, 0, 7
+	defer func() { jitThreshold, jitMinRun, minCallWork, jitBudget = saved, savedRun, savedWork, savedBudget }()
 	// Compiled calls and stores of pointers exit while Go's write barrier
 	// is on, as they must: finish any collection and hold off the next, so
 	// the exits counted are the program's.
@@ -224,7 +231,11 @@ func (g *fuzzGen) stmt(depth int) string {
 			g.stmt(depth+1),
 		) + " end"
 	case n == 11 && depth < 1:
-		// A while loop with a flag, which is the kernel then.
+		// A loop inside: a while loop with a flag, or a numeric for loop.
+		if g.r.IntN(2) == 0 {
+			return fmt.Sprintf("for j = %s, %s, %s do %s end", g.pick("1", "i % 5", "-2"), g.pick("3", "i % 7", "0"),
+				g.pick("1", "2", "-1", "i % 3 + 1"), g.stmt(depth+1))
+		}
 		return fmt.Sprintf("do local j, go = 0, true while go and j < %d do %s; j = j + 1; if %s then go = false end end end",
 			1+g.r.IntN(6), g.stmt(depth+1), g.pick("j == i % 4", "f1 > 1e10", "i1 > 1000", "j > 2"))
 	default:

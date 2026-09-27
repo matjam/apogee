@@ -142,7 +142,14 @@ geometric mean; a phase that loses somewhere says where and why.
 5. **Phase 5,** while loops first: a loop a JMP closes, entered at its
    start and left by its tests, with booleans in registers for the flags
    such loops test. mandelbrot, whose innermost loop is one, is 76%
-   faster, and sieve, whose flags are booleans, 23%.
+   faster, and sieve, whose flags are booleans, 23%. Then loop nests: a
+   kernel runs the integer for loops and while loops inside it, with type
+   flow and liveness passed to a fixpoint over their back edges, and a
+   register liveness in the planner so that a temporary Lua reuses does
+   not stop a nest. sieve is another 18% faster, mandelbrot 8%, nbody
+   3%. On amd64 most nests with tables do not fit the seven integer
+   registers (tables take them too), so nbody's outer loop stays out;
+   arm64's thirteen fit them.
 
 ## What this does not change
 

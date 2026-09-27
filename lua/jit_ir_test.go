@@ -60,8 +60,14 @@ func TestIRTemporariesShare(t *testing.T) {
 	if _, ok := irOf(t, src, 0, 6); !ok {
 		t.Error("temporaries did not share registers")
 	}
-	if _, ok := irOf(t, src, 0, 4); ok {
-		t.Error("allocated the accumulator and a temporary into the loop's registers")
+	// With four, the loop's count or step goes to its stack slot, as only
+	// its latch uses them; with two, nothing fits.
+	f, ok := irOf(t, src, 0, 4)
+	if !ok || !f.spilled(f.loop[1]) && !f.spilled(f.loop[2]) || f.spilled(f.loop[0]) {
+		t.Errorf("four registers: allocated %v", ok)
+	}
+	if _, ok := irOf(t, src, 0, 2); ok {
+		t.Error("allocated the index, the accumulator and a temporary into two registers")
 	}
 }
 

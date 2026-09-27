@@ -622,7 +622,8 @@ func TestJITStackGrowsInGoCall(t *testing.T) {
 func TestJITTrigMatchesGo(t *testing.T) {
 	skipWithoutJIT(t)
 	r := rand.New(rand.NewPCG(3, 4))
-	xs := []float64{0, math.Copysign(0, -1), 1, -1, math.Pi, math.Pi / 2, math.Pi / 4, 1<<29 - 1, -(1<<29 - 1), 1e-300, 5e-324, 1e-8}
+	xs := []float64{0, math.Copysign(0, -1), 1, -1, math.Pi, math.Pi / 2, math.Pi / 4, 1<<29 - 1, -(1<<29 - 1), 1e-300, 5e-324, 1e-8,
+		math.Inf(1), math.Inf(-1), math.NaN()}
 	for range 200000 {
 		switch r.IntN(3) {
 		case 0:
@@ -997,6 +998,39 @@ func TestJITKernelIntrinsicChanged(t *testing.T) {
 		end`)
 	if jit != interp {
 		t.Fatalf("JIT %q, interpreter %q", jit, interp)
+	}
+}
+
+// A call whose last argument is a call, and a RETURN of a call, pass any
+// number of values through l.top: Lua functions, Go functions and inline
+// math functions, returning none, one or several, in compiled code
+// without leaving it each iteration.
+func TestJITOpenCalls(t *testing.T) {
+	skipWithoutJIT(t)
+	jit, interp, lj := runBoth(t, `
+		local floor, min, byte, select = math.floor, math.min, string.byte, select
+		local function none() end
+		local function two(a) return a, a * 2 end
+		local function count(...) return select("#", ...) end
+		local function first(a) return a end
+		local function sum3(a, b, c) return (a or 0) + (b or 0) + (c or 0) end
+		local function pass(...) return two(...) end -- RETURN of a call, B 0
+		function run()
+		  local s = 0
+		  for i = 1, 2000 do -- no vararg functions or Go functions: no exits
+		    s = s + sum3(two(i)) + first(two(i)) + (first(none()) or 0)
+		    s = s + floor(min(i * 0.5, 255.0)) + min(255, floor(i * 0.25)) + sum3(1, two(i))
+		  end
+		  for i = 1, 20 do
+		    s = s + count(two(i)) + count(none()) + sum3(byte("abc", 1, 3)) + count(pass(i))
+		  end
+		  return s, count(), count(two(1)), sum3(pass(3))
+		end`)
+	if jit != interp {
+		t.Fatalf("JIT %q, interpreter %q", jit, interp)
+	}
+	if lj.jitRuns > 500 { // the 20 iterations with vararg and Go functions exit about 9 times each
+		t.Fatalf("compiled code entered %d times for 2,000 iterations", lj.jitRuns)
 	}
 }
 

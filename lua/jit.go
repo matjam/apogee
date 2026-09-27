@@ -477,15 +477,17 @@ func (l *State) callJIT() bool {
 }
 
 // jitReturnToGo runs the RETURN i that compiled code exited at in ci, a
-// frame Go called running p, as the interpreter's general RETURN does. It
-// reports false, having changed nothing, when the results run up to
-// l.top, which compiled code does not track.
+// frame Go called running p, as the interpreter's general RETURN does.
+// Results up to l.top (B 0) end where the call before left it. It reports
+// false, having changed nothing, with to-be-closed variables pending.
 func (l *State) jitReturnToGo(ci *callInfo, p *prototype, i bytecode.Instruction) bool {
 	a, b := i.A(), i.B()
-	if b == 0 || l.hasTBC(ci.base()) {
+	if l.hasTBC(ci.base()) {
 		return false
 	}
-	l.top = ci.stackIndex(a + b - 1)
+	if b != 0 {
+		l.top = ci.stackIndex(a + b - 1)
+	}
 	if len(p.Prototypes) > 0 {
 		l.close(ci.base())
 	}
@@ -633,14 +635,12 @@ func (l *State) enterJIT(ci *callInfo, c *luaClosure, p *prototype, jc *jitCode,
 // nothing, when the interpreter must make the call.
 func (l *State) jitCall(ci *callInfo, i bytecode.Instruction, ip pc) (*callInfo, bool) {
 	a, b, c := i.A(), i.B(), i.C()
-	if b == 0 { // arguments up to l.top, which compiled code does not track
-		return nil, false
+	args := b - 1
+	if b == 0 { // arguments up to l.top, where the call before left it
+		args = l.top - ci.stackIndex(a+1)
 	}
 	switch fv := ci.frame[a]; fv.kind() {
 	case vkGoFunction, vkGoClosure:
-		if c == 0 {
-			return nil, false
-		}
 		l.jitCallGo(ci, i, ip)
 		return ci, true
 	case vkLuaClosure:
@@ -649,36 +649,47 @@ func (l *State) jitCall(ci *callInfo, i bytecode.Instruction, ip pc) (*callInfo,
 			return nil, false
 		}
 		ci.savedPC = ip + 1
-		return l.callLua(ci, f, a, b-1, c-1), true
+		return l.callLua(ci, f, a, args, c-1), true
 	}
 	return nil, false
 }
 
-// jitCallGo runs the CALL i at ip, which has fixed arguments and results
-// and calls the Go function or Go closure in its register A.
+// jitCallGo runs the CALL i at ip, which calls the Go function or Go
+// closure in its register A. Arguments up to l.top (B 0) end where the
+// call before left it; all results (C 0) end where this one leaves l.top.
 func (l *State) jitCallGo(ci *callInfo, i bytecode.Instruction, ip pc) {
 	a, b, c := i.A(), i.B(), i.C()
 	frame := ci.frame
 	fv := frame[a]
 	ci.savedPC = ip + 1
-	if f := fv.goFunction(); f != nil && f.number != nil && b > 1 {
-		if r, ok := f.number.tryCall(frame[a+1 : a+b]); ok {
-			l.numberResult(ci, a, c-1, f.number.results, r)
+	if b != 0 {
+		l.top = ci.stackIndex(a + b)
+	}
+	if f := fv.goFunction(); f != nil && f.number != nil && l.top > ci.stackIndex(a+1) {
+		if r, ok := f.number.tryCall(l.stack[ci.stackIndex(a+1):l.top]); ok {
+			l.numberResult(ci, a, c-1, f.number.results, r) // sets l.top for all results
+			if c != 0 {
+				l.top = ci.top
+			}
 			return
 		}
 	}
-	l.top = ci.stackIndex(a + b)
 	l.callGo(fv, ci.stackIndex(a), c-1, 0)
-	l.top = ci.top
+	if c != 0 {
+		l.top = ci.top
+	}
 }
 
 // jitCallGoFunction runs the CALL i at ip that compiled code exited at
-// with jitExitCallGo: fixed arguments and results, to the Go function or
-// Go closure whose object compiled code left in l.jitCtx.callee, with the
-// frame's address in l.jitCtx.frame. It does what callGo does, without
-// reloading the callee from the frame, and copies the results itself
-// unless a hook is set. No hook is set on entry, as compiled code runs
-// only without one.
+// with jitExitCallGo, to the Go function or Go closure whose object
+// compiled code left in l.jitCtx.callee, with the frame's address in
+// l.jitCtx.frame. It does what callGo does, without reloading the callee
+// from the frame, and copies the results itself unless a hook is set. No
+// hook is set on entry, as compiled code runs only without one.
+//
+// Arguments up to l.top (B 0) end where the call before left l.top; all
+// results (C 0) end where this call leaves l.top, for the instruction
+// after, as the interpreter's CALL does.
 func (l *State) jitCallGoFunction(ci *callInfo, i bytecode.Instruction, ip pc) {
 	ctx := &l.jitCtx
 	f := *(*Function)(ctx.callee)
@@ -687,23 +698,35 @@ func (l *State) jitCallGoFunction(ci *callInfo, i bytecode.Instruction, ip pc) {
 	base := int((uintptr(ctx.frame) - uintptr(unsafe.Pointer(unsafe.SliceData(l.stack)))) / unsafe.Sizeof(value{}))
 	function := base + a
 	ci.savedPC = ip + 1
-	l.top = function + b
+	if b != 0 {
+		l.top = function + b
+	}
 	l.checkStack(MinStack)
 	l.pushGoFrame(function, wanted)
 	n := f(l)
 	apiCheckStackSpace(l, n)
 	if l.hookMask != 0 { // the function set one
 		l.postCall(l.top - n)
-	} else {
-		// A loop, not copy: copy of a few values is a runtime call.
-		l.callInfo = ci
-		first, k := l.top-n, 0
-		for ; k < wanted && k < n; k++ {
+		if wanted >= 0 {
+			l.top = ci.top
+		}
+		return
+	}
+	// A loop, not copy: copy of a few values is a runtime call.
+	l.callInfo = ci
+	first, k := l.top-n, 0
+	if wanted < 0 {
+		for ; k < n; k++ {
 			l.stack[function+k] = l.stack[first+k]
 		}
-		for ; k < wanted; k++ {
-			l.stack[function+k] = nilValue
-		}
+		l.top = function + n
+		return
+	}
+	for ; k < wanted && k < n; k++ {
+		l.stack[function+k] = l.stack[first+k]
+	}
+	for ; k < wanted; k++ {
+		l.stack[function+k] = nilValue
 	}
 	l.top = ci.top
 }
@@ -718,13 +741,24 @@ func (l *State) jitCallNumber(ci *callInfo, i bytecode.Instruction, ip pc) {
 	nf := (*goFunction)(ctx.callee).number
 	a, b, wanted := i.A(), i.B(), i.C()-1
 	function := int((uintptr(ctx.frame)-uintptr(unsafe.Pointer(unsafe.SliceData(l.stack))))/unsafe.Sizeof(value{})) + a
-	r, ok := nf.tryCall(l.stack[function+1 : function+b])
+	top := function + b
+	if b == 0 { // arguments up to l.top, where the call before left it
+		top = l.top
+	}
+	r, ok := nf.tryCall(l.stack[function+1 : top])
 	if !ok {
 		l.jitCallGoFunction(ci, i, ip)
 		return
 	}
 	ctx.callee = nil
 	ci.savedPC = ip + 1
+	if wanted < 0 { // all its results, ending at l.top
+		if nf.results == 1 {
+			l.stack[function] = numberValue(r)
+		}
+		l.top = function + nf.results
+		return
+	}
 	for k := range wanted { // a loop, not clear: see jitCallGoFunction
 		l.stack[function+k] = nilValue
 	}
@@ -734,19 +768,30 @@ func (l *State) jitCallNumber(ci *callInfo, i bytecode.Instruction, ip pc) {
 	l.top = ci.top
 }
 
-// jitReturn runs the RETURN i that compiled code exited at, when it returns
-// a fixed number of results to a Lua caller in the same interpreter loop
-// that wants a fixed number. It reports false, having changed nothing,
-// when the interpreter must return.
+// jitReturn runs the RETURN i that compiled code exited at, returning to a
+// Lua caller in the same interpreter loop. Results up to l.top (B 0) end
+// where the call before left it; a caller that wants all (-1) gets them
+// with l.top after them, as postCall leaves it. It reports false, having
+// changed nothing, when the interpreter must return.
 func (l *State) jitReturn(ci *callInfo, i bytecode.Instruction) bool {
 	a, b, wanted := i.A(), i.B(), ci.resultCount
-	if b == 0 || wanted < 0 || !ci.isCallStatus(callStatusReentry) || l.hasTBC(ci.base()) {
+	if !ci.isCallStatus(callStatusReentry) || l.hasTBC(ci.base()) {
 		return false
 	}
 	if len(ci.closure.prototype.Prototypes) > 0 {
 		l.close(ci.base())
 	}
-	res, results := l.stack[ci.function:ci.function+wanted], ci.frame[a:a+b-1]
+	end := ci.stackIndex(a + b - 1)
+	if b == 0 {
+		end = l.top
+	}
+	results := l.stack[ci.stackIndex(a):end]
+	if wanted < 0 {
+		n := copy(l.stack[ci.function:], results)
+		l.callInfo, l.top = ci.previous, ci.function+n
+		return true
+	}
+	res := l.stack[ci.function : ci.function+wanted]
 	n := copy(res, results)
 	clear(res[n:])
 	ci = ci.previous

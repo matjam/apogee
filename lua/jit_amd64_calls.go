@@ -11,9 +11,54 @@ import (
 // jit_arm64_calls.go. With fewer registers, values are reloaded from the
 // structures they live in rather than kept.
 
+// Lua compiles a call whose last argument is another call as that call
+// with all its results (C 0), which leaves l.top after them, then this
+// call with arguments up to l.top (B 0); a RETURN of a call's results
+// likewise (B 0). Compiled code keeps l.top only between the two, as
+// the interpreter does.
+
+// checkArgs branches to fail unless the CALL i has n arguments: up to
+// l.top when it has B 0. It uses rTmp and rTmp2.
+func (c *amd64Compiler) checkArgs(i bytecode.Instruction, n int, fail Label) {
+	a := &c.a
+	if i.B() != 0 {
+		if i.B()-1 != n {
+			a.Jmp(fail)
+		}
+		return
+	}
+	a.Load(rTmp, rCtx, offCtxS)
+	a.Load(rTmp2, rTmp, offStack)
+	a.Load(rTmp, rTmp, offLTop)
+	a.Shl(rTmp, 4)
+	a.Add(rTmp, rTmp2) // &stack[l.top]
+	a.Mov(rTmp2, rFrame)
+	a.AddImm(rTmp2, int32(uint32(i.A()+1+n)*valueSize))
+	a.Cmp(rTmp, rTmp2)
+	a.J(NE, fail)
+}
+
+// resultTop, for the CALL i when it wants all results (C 0), leaves l.top
+// after the one result it has stored in register A. It uses rTmp, rTmp2
+// and rAddr.
+func (c *amd64Compiler) resultTop(i bytecode.Instruction) {
+	if i.C() != 0 {
+		return
+	}
+	a := &c.a
+	a.Load(rTmp, rCtx, offCtxS)
+	a.Load(rAddr, rTmp, offStack)
+	a.Mov(rTmp2, rFrame)
+	a.AddImm(rTmp2, int32(uint32(i.A()+1)*valueSize))
+	a.Sub(rTmp2, rAddr)
+	a.Shr(rTmp2, 4)
+	a.Store(rTmp, offLTop, rTmp2)
+}
+
 // callLua compiles the CALL i at ip for a compiled, fixed-parameter Lua
 // closure. It jumps to notLua when the callee is not a Lua closure, and
-// exits for any other Lua closure.
+// exits for any other Lua closure. Arguments may run up to l.top (B 0),
+// and the callee may return all its results (C 0).
 func (c *amd64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	a := &c.a
 	ra, b, results := i.A(), i.B(), i.C()-1
@@ -41,8 +86,12 @@ func (c *amd64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 	a.Load(AX, R12, offStack)
 	a.Sub(R13, AX)
 	a.Shr(R13, 4) // function
-	a.Mov(DX, R13)
-	a.AddImm(DX, int32(b)) // l.top
+	if b == 0 {
+		a.Load(DX, R12, offLTop) // where the call before left it
+	} else {
+		a.Mov(DX, R13)
+		a.AddImm(DX, int32(b)) // l.top
+	}
 	// checkStack(p.maxStackSize) would grow the stack.
 	a.Load(CX, R12, offLStackLast)
 	a.Sub(CX, DX)
@@ -61,12 +110,19 @@ func (c *amd64Compiler) callLua(ip int, i bytecode.Instruction, notLua Label) {
 
 	// Clear the parameters the call does not pass.
 	loop, cleared := a.NewLabel(), a.NewLabel()
+	if b == 0 { // first missing: &stack[l.top]
+		a.Load(AX, R12, offLTop)
+		a.Shl(AX, 4)
+		a.Load(CX, R12, offStack)
+		a.Add(AX, CX)
+	} else {
+		a.Mov(AX, rFrame)
+		a.AddImm(AX, int32(uint32(ra+b)*valueSize))
+	}
 	a.Load(CX, R11, offPParams)
 	a.Shl(CX, 4)
 	a.Add(CX, rFrame)
 	a.AddImm(CX, int32(uint32(ra+1)*valueSize)) // end
-	a.Mov(AX, rFrame)
-	a.AddImm(AX, int32(uint32(ra+b)*valueSize)) // first missing
 	a.Bind(loop)
 	a.Cmp(AX, CX)
 	a.J(AE, cleared)
@@ -247,15 +303,37 @@ func (c *amd64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	a.JmpReg(AX)
 }
 
-// returnLua compiles RETURN i at ip returning a fixed number of results to
-// a compiled Lua caller that wants a fixed number; anything else exits.
+// copyResults copies R13 values from register ra to R10, the caller's
+// function slot below, counting in R11 from 0. It uses AX and DX.
+func (c *amd64Compiler) copyResults(ra int) {
+	a := &c.a
+	loop, done := a.NewLabel(), a.NewLabel()
+	a.MovImm(R11, 0)
+	a.Bind(loop)
+	a.Cmp(R11, R13)
+	a.J(GE, done)
+	for _, off := range []uint32{offP, offN} {
+		a.Mov(AX, R11)
+		a.Shl(AX, 4)
+		a.Add(AX, rFrame)
+		a.Load(DX, AX, uint32(ra)*valueSize+off)
+		a.Mov(AX, R11)
+		a.Shl(AX, 4)
+		a.Add(AX, R10)
+		a.Store(AX, off, DX)
+	}
+	a.AddImm(R11, 1)
+	a.Jmp(loop)
+	a.Bind(done)
+}
+
+// returnLua compiles RETURN i at ip to a compiled Lua caller: of a fixed
+// number of results or those up to l.top (B 0), to a caller that wants a
+// fixed number or all of them (-1), whom it leaves l.top after them.
+// Anything else exits.
 func (c *amd64Compiler) returnLua(ip int, i bytecode.Instruction) {
 	a := &c.a
 	ra, b := i.A(), i.B()
-	if b == 0 {
-		c.exitAlways(ip)
-		return
-	}
 	exit := c.exit(ip)
 	a.CmpMem(rCtx, offBarrier, 0)
 	a.J(NE, exit)
@@ -267,9 +345,7 @@ func (c *amd64Compiler) returnLua(ip int, i bytecode.Instruction) {
 	a.Load8(AX, R8, offCIStatus)
 	a.Bt(AX, uint8(bitOf(callStatusReentry)))
 	a.J(AE, exit)
-	a.Load(CX, R8, offCIResults) // wanted
-	a.Bt(CX, 63)
-	a.J(B, exit)
+	a.Load(CX, R8, offCIResults) // wanted, or -1 for all
 	// The caller must be compiled at the pc it resumes at.
 	a.Load(R9, R8, offCIPrev)
 	a.Load(DX, R9, offCILua)
@@ -291,25 +367,48 @@ func (c *amd64Compiler) returnLua(ip int, i bytecode.Instruction) {
 	a.Add(AX, R10)
 	a.Store(rCtx, offTarget, AX)
 
-	// Copy min(b-1, wanted) results to stack[ci.function:], then nil up
-	// to wanted.
+	// The results to stack[ci.function:] (R10): R13 of them, from register
+	// ra, up to l.top for B 0.
 	a.Load(R10, R8, offCIFunction)
 	a.Shl(R10, 4)
 	a.Load(R11, R12, offStack)
 	a.Add(R10, R11)
-	copied := a.NewLabel()
-	for k := range b - 1 {
-		a.CmpImm(CX, int32(k))
-		a.J(BE, copied)
-		src := reg(ra + k)
-		a.Load(AX, rFrame, src.off+offP)
-		a.Store(R10, uint32(k)*valueSize+offP, AX)
-		a.Load(AX, rFrame, src.off+offN)
-		a.Store(R10, uint32(k)*valueSize+offN, AX)
+	if b == 0 {
+		a.Load(R13, R12, offLTop)
+		a.Shl(R13, 4)
+		a.Add(R13, R11)
+		a.Sub(R13, rFrame)
+		a.SubImm(R13, int32(uint32(ra)*valueSize))
+		a.Shr(R13, 4)
+	} else {
+		a.MovImm(R13, uint64(b-1))
 	}
-	a.Bind(copied)
+	all, copied, resume := a.NewLabel(), a.NewLabel(), a.NewLabel()
+	a.Bt(CX, 63)
+	a.J(B, all)
+	// A wanted number: min(R13, wanted) results, then nil up to wanted.
+	if b != 0 {
+		for k := range b - 1 {
+			a.CmpImm(CX, int32(k))
+			a.J(BE, copied)
+			src := reg(ra + k)
+			a.Load(AX, rFrame, src.off+offP)
+			a.Store(R10, uint32(k)*valueSize+offP, AX)
+			a.Load(AX, rFrame, src.off+offN)
+			a.Store(R10, uint32(k)*valueSize+offN, AX)
+		}
+		a.Bind(copied)
+		a.MovImm(R11, uint64(b-1))
+	} else {
+		fewer := a.NewLabel()
+		a.Cmp(R13, CX)
+		a.J(LE, fewer)
+		a.Mov(R13, CX)
+		a.Bind(fewer)
+		c.copyResults(ra) // leaves R11 at R13
+		a.Bind(copied)
+	}
 	loop, cleared := a.NewLabel(), a.NewLabel()
-	a.MovImm(R11, uint64(b-1))
 	a.Bind(loop)
 	a.Cmp(R11, CX)
 	a.J(GE, cleared)
@@ -321,11 +420,19 @@ func (c *amd64Compiler) returnLua(ip int, i bytecode.Instruction) {
 	a.AddImm(R11, 1)
 	a.Jmp(loop)
 	a.Bind(cleared)
-
-	// l.callInfo, l.top = ci.previous, ci.previous.top; resume the caller.
-	a.Store(R12, offLCallInfo, R9)
-	a.Load(AX, R9, offCITop)
+	a.Load(AX, R9, offCITop) // l.top = ci.previous.top
 	a.Store(R12, offLTop, AX)
+	a.Jmp(resume)
+	// All of them, with l.top after them.
+	a.Bind(all)
+	c.copyResults(ra)
+	a.Load(AX, R8, offCIFunction)
+	a.Add(AX, R13)
+	a.Store(R12, offLTop, AX)
+
+	// l.callInfo = ci.previous; resume the caller.
+	a.Bind(resume)
+	a.Store(R12, offLCallInfo, R9)
 	a.Load(DX, R9, offCILua)
 	a.Load(rFrame, DX, offLFrame)
 	a.Load(R10, DX, offLClosure)

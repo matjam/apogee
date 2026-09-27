@@ -611,12 +611,8 @@ func funcValue(f func(float64) float64) uint64 { return uint64(*(*uintptr)(unsaf
 // other Go function exits with jitExitCallGo, and runJIT makes it; other
 // calls exit to the interpreter.
 func (c *amd64Compiler) call(ip int, i bytecode.Instruction) {
-	if i.B() == 0 || i.C() == 0 { // arguments or results up to l.top
-		c.exitAlways(ip)
-		return
-	}
 	notGoFunction := c.a.NewLabel()
-	if i.B() == 2 && i.C() == 2 {
+	if (i.B() == 2 || i.B() == 0) && (i.C() == 2 || i.C() == 0) { // one argument, one result
 		c.intrinsic(ip, i, notGoFunction)
 	}
 	c.a.Bind(notGoFunction)
@@ -670,7 +666,7 @@ func (c *amd64Compiler) plainGoCall(ip int) Label {
 // that it leaves to Go: mixed integers and floats for min and max, and
 // floats for floor and ceil without ROUNDSD.
 func (c *amd64Compiler) mathCall(ip int, i bytecode.Instruction) {
-	if i.C() != 2 || i.B() != 2 && i.B() != 3 {
+	if i.C() != 2 && i.C() != 0 || i.B() != 2 && i.B() != 3 && i.B() != 0 {
 		return
 	}
 	a := &c.a
@@ -679,7 +675,7 @@ func (c *amd64Compiler) mathCall(ip int, i bytecode.Instruction) {
 	a.Load(rTmp, rT, 0)              // its Function's code
 	var bodies []func()
 	for _, m := range mathFns {
-		if m.id.unary() != (i.B() == 2) {
+		if i.B() != 0 && m.id.unary() != (i.B() == 2) {
 			continue
 		}
 		l := a.NewLabel()
@@ -701,7 +697,22 @@ func (c *amd64Compiler) mathCall(ip int, i bytecode.Instruction) {
 func (c *amd64Compiler) mathBody(ip int, i bytecode.Instruction, m mathFn) {
 	a := &c.a
 	fn, arg, arg2 := reg(i.A()), reg(i.A()+1), reg(i.A()+2)
-	next, goCall := c.pcs[ip+1], c.goCallExit(ip)
+	goCall := c.goCallExit(ip)
+	next := c.pcs[ip+1] // after the result is stored
+	if i.C() == 0 {     // leaving l.top after it
+		open := a.NewLabel()
+		c.outOfLine = append(c.outOfLine, func() {
+			a.Bind(open)
+			c.resultTop(i)
+			a.Jmp(c.pcs[ip+1])
+		})
+		next = open
+	}
+	args := 1
+	if !m.unary() {
+		args = 2
+	}
+	c.checkArgs(i, args, goCall)
 	isFloat := a.NewLabel()
 	// rTmp: 0 for a float argument, 1 for an integer; anything else calls
 	// Go, which raises the error.
@@ -811,6 +822,7 @@ func (c *amd64Compiler) intrinsic(ip int, i bytecode.Instruction, notGo Label) {
 	a.Test(rT, rT)
 	a.J(E, c.plainGoCall(ip)) // perhaps a math function
 	a.Load(rT, rT, offNFUnary)
+	c.checkArgs(i, 1, c.numCallExit(ip))
 	c.loadFloat(0, arg, kindAny, false, ip) // an integer converts, as for a number function
 	done := a.NewLabel()
 	for _, in := range c.intrinsics() {
@@ -826,5 +838,6 @@ func (c *amd64Compiler) intrinsic(ip int, i bytecode.Instruction, notGo Label) {
 	a.Bind(done)
 	c.guardStore(fn, noReg, ip)
 	c.storeNumber(fn, 0)
+	c.resultTop(i)
 	a.Jmp(c.pcs[ip+1])
 }

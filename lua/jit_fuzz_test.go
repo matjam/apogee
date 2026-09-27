@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -44,7 +46,7 @@ func TestJITFuzz(t *testing.T) {
 		for kind, count := range exits {
 			if count >= iterations { // at least once an iteration
 				hot[kind]++
-				if slices.Contains(jitMustNotExit, strings.Fields(kind)[0]) {
+				if slices.ContainsFunc(jitMustNotExit, func(p string) bool { return strings.HasPrefix(kind, p) }) {
 					t.Errorf("seed %d: %s exits on every iteration (%d times)\n%s", s, kind, count, src)
 				}
 			}
@@ -60,9 +62,10 @@ func TestJITFuzz(t *testing.T) {
 	}
 }
 
-// jitMustNotExit lists the instructions no fuzz program may exit at on
-// every iteration.
-var jitMustNotExit = []string{}
+// jitMustNotExit lists the exits, by the start of exitKind's description,
+// no fuzz program may take on every iteration: Lua calls and returns of
+// any number of values.
+var jitMustNotExit = []string{"CALL B=", "RETURN B="}
 
 // exitKind describes an exit for the report: the instruction's name and
 // what distinguishes its exits.
@@ -93,6 +96,11 @@ func runFuzz(t *testing.T, src string, iterations int) (jit, interp string) {
 	saved, savedRun := jitThreshold, jitMinRun
 	jitThreshold, jitMinRun = 0, 0
 	defer func() { jitThreshold, jitMinRun = saved, savedRun }()
+	// Compiled calls and stores of pointers exit while Go's write barrier
+	// is on, as they must: finish any collection and hold off the next, so
+	// the exits counted are the program's.
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 	result := func(l *State) string {
 		l.PushBuffer(make([]float64, 64))
 		l.SetGlobal("f64")

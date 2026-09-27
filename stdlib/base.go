@@ -275,17 +275,7 @@ var baseLibrary = []lua.RegistryFunction{
 		l.ArgumentCheck(1 <= i, 1, "index out of range")
 		return int(n - i)
 	}},
-	{Name: "setmetatable", Function: func(l *lua.State) int {
-		t := l.TypeOf(2)
-		l.CheckType(1, lua.TypeTable)
-		l.ArgumentCheck(t == lua.TypeNil || t == lua.TypeTable, 2, "nil or table expected")
-		if l.MetaField(1, "__metatable") != lua.TypeNil {
-			l.Errorf("cannot change a protected metatable")
-		}
-		l.SetTop(2)
-		l.SetMetaTable(1)
-		return 1
-	}},
+	{Name: "setmetatable", Function: lua.BaseSetMetatable}, // which compiled code recognises
 	{Name: "tonumber", Function: func(l *lua.State) int {
 		if l.IsNoneOrNil(2) { // standard conversion
 			if l.TypeOf(1) == lua.TypeNumber {

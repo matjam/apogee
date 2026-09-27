@@ -179,6 +179,27 @@ func (c *arm64Compiler) closeJump(ip int, i bytecode.Instruction) {
 	c.jumpTo(ip, ip+1+i.SBx())
 }
 
+// tailSetMeta compiles the TAILCALL i at ip, with the callee's second
+// word in rTmp, when the callee is setmetatable, which a constructor's
+// return setmetatable(t, mt) calls: setMetaTable, then a return of t.
+// Anything else exits, and Go runs the TAILCALL; setting the same
+// metatable again is harmless.
+func (c *arm64Compiler) tailSetMeta(ip int, i bytecode.Instruction) {
+	a := &c.a
+	exit, fn := c.exit(ip), reg(i.A())
+	a.MovImm(rTmp2, tagOf(vkGoFunction))
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(NE, exit)
+	a.Ldr(rT, fn.base, fn.off+offP)
+	c.branchNumber(rT, exit)
+	a.Ldr(rTmp, rT, 0) // the Function's code
+	a.MovImm(rTmp2, callSetMeta)
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(NE, exit)
+	c.setMetaTable(i, exit)
+	c.returnLua(ip, bytecode.CreateABC(bytecode.OpReturn, i.A()+1, 2, 0))
+}
+
 // tailCallLua compiles the TAILCALL i at ip for a compiled, fixed-parameter
 // Lua closure as the interpreter's TAILCALL replaces the frame: the callee
 // and its arguments move down to the frame's function slot, and the frame,
@@ -197,7 +218,16 @@ func (c *arm64Compiler) tailCallLua(ip int, i bytecode.Instruction) {
 	a.Ldr(rTmp, fn.base, fn.off+offN)
 	a.MovImm(rTmp2, tagOf(vkLuaClosure))
 	a.Cmp(rTmp, rTmp2)
-	a.BCond(NE, exit)
+	if b == 3 { // perhaps return setmetatable(t, mt), out of line
+		notLua := a.NewLabel()
+		a.BCond(NE, notLua)
+		c.outOfLine = append(c.outOfLine, func() {
+			a.Bind(notLua)
+			c.tailSetMeta(ip, i)
+		})
+	} else {
+		a.BCond(NE, exit)
+	}
 	a.Ldr(rT, fn.base, fn.off+offP)
 	c.branchNumber(rT, exit) // a number whose bits match the tag
 	a.Cbnz(rBarrier, exit)

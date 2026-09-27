@@ -70,7 +70,12 @@ func mathFnOf(cl *luaClosure, n int) (mathFn, uint64) {
 // init sets them, as mathFns.
 var iterNext, iterIPairs, callPairs, callIPairs uint64
 
+// callSetMeta is BaseSetMetatable's first word, which compiled code runs
+// (setMetaTable).
+var callSetMeta uint64
+
 func init() {
 	iterNext, iterIPairs = functionValue(BaseNext), functionValue(BaseIPairsIterator)
 	callPairs, callIPairs = functionValue(BasePairs), functionValue(BaseIPairs)
+	callSetMeta = functionValue(BaseSetMetatable)
 }

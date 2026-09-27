@@ -175,7 +175,7 @@ func (t *table) putString(l *State, k value, key string, v value) {
 // slots that instructions cached for the old one.
 func (t *table) compact() {
 	live := len(t.slots) - t.extra.dead
-	d := &shape{slots: make(map[string]int32, live), keys: make([]value, 0, live), dict: true}
+	d := &shape{slots: make(map[string]int32, live), keys: make([]value, 0, live), dict: true, collects: t.shape.collects}
 	slots := make([]value, 0, live)
 	for i, v := range t.slots {
 		if !v.isNil() { // a live slot, so not buried

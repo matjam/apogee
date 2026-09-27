@@ -589,6 +589,7 @@ func (c *arm64Compiler) goCallee(ip int, i bytecode.Instruction) {
 	a.Cbnz(rTmp, c.numCallExit(ip)) // runJIT may call it frameless
 	a.Bind(c.plainGoCall(ip))
 	c.mathCall(ip, i)
+	c.setMetaCall(ip, i)
 	a.B(c.goCallExit(ip))
 	a.Bind(closure)
 	a.Ldr(rT, fn.base, fn.off+offP)
@@ -596,6 +597,68 @@ func (c *arm64Compiler) goCallee(ip int, i bytecode.Instruction) {
 	c.pairsCall(ip, i)
 	a.B(c.goCallExit(ip))
 	a.Bind(notGo)
+}
+
+// setMetaTable sets the metatable of the table in register A+1 of i to
+// the table in register A+2, as BaseSetMetatable does, when the first has
+// none, so no __metatable protects it, and the second's shape has never
+// held __gc or __mode, so the collector need not hear of it
+// (noteMetaTable). Otherwise it goes to fail, having changed nothing.
+func (c *arm64Compiler) setMetaTable(i bytecode.Instruction, fail Label) {
+	a := &c.a
+	t, mt := reg(i.A()+1), reg(i.A()+2)
+	a.Cbnz(rBarrier, fail) // it stores a pointer into the table
+	a.Ldr(rTmp, t.base, t.off+offN)
+	a.MovImm(rTmp2, tagOf(vkTable))
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(NE, fail)
+	a.Ldr(rT, t.base, t.off+offP)
+	c.branchNumber(rT, fail)
+	a.Ldr(rTmp, rT, offTMeta)
+	a.Cbnz(rTmp, fail)
+	a.Ldr(rTmp, mt.base, mt.off+offN)
+	a.MovImm(rTmp2, tagOf(vkTable))
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(NE, fail)
+	a.Ldr(rT2, mt.base, mt.off+offP)
+	c.branchNumber(rT2, fail)
+	noKeys := a.NewLabel()
+	a.Ldr(rTmp, rT2, offTShape)
+	a.Cbz(rTmp, noKeys) // no string keys at all
+	a.Ldrb(rTmp, rTmp, offShapeGC)
+	a.Cbnz(rTmp, fail)
+	a.Bind(noKeys)
+	a.Str(rT2, rT, offTMeta)
+}
+
+// setMetaCall computes the CALL i at ip of setmetatable with two
+// arguments inline, when setMetaTable can, and goes on at ip+1 with the
+// table as the one result; it falls through for other functions.
+func (c *arm64Compiler) setMetaCall(ip int, i bytecode.Instruction) {
+	if i.B() != 3 {
+		return
+	}
+	a := &c.a
+	set, fn := a.NewLabel(), reg(i.A())
+	a.Ldr(rT, fn.base, fn.off+offP) // the *goFunction
+	a.Ldr(rTmp, rT, 0)              // its Function's code
+	a.MovImm(rTmp2, callSetMeta)
+	a.Cmp(rTmp, rTmp2)
+	a.BCond(EQ, set)
+	c.outOfLine = append(c.outOfLine, func() { // out of the way of other Go calls
+		a.Bind(set)
+		c.setMetaTable(i, c.goCallExit(ip))
+		if i.C() != 1 {
+			c.load(reg(i.A() + 1))
+			c.store(reg(i.A()))
+		}
+		for r := i.A() + 1; r < i.A()+i.C()-1; r++ {
+			a.Str(ZR, rFrame, reg(r).off+offP)
+			a.Str(ZR, rFrame, reg(r).off+offN)
+		}
+		c.resultTop(i)
+		a.B(c.pcs[ip+1])
+	})
 }
 
 // pairsCall computes the CALL i at ip inline when its callee, the Go

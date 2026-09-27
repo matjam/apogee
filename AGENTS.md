@@ -460,6 +460,12 @@ nothing compiles.
     where string keys or a hash part follow, or for `__index`. The JMP
     that closes the loop jumps when nothing at or above it is open
     (`closeJump`).
+  - **`setmetatable`** too (`BaseSetMetatable`), called or tail called,
+    of a table that has no metatable yet, to one whose shape has never
+    held `__gc` or `__mode` (`shape.collects`, set as keys are added), so
+    the collector needs to hear of nothing (`setMetaTable`); that includes
+    the fresh `{__index = C}` many constructors make. A tail call then
+    returns the table (`tailSetMeta`).
 - **Kernels:** an innermost numeric for loop whose body is only moves,
   number constants, arithmetic (`%` and `//` by a nonzero integer
   constant), number comparisons, and the intrinsic calls and buffer
@@ -635,8 +641,8 @@ The gap is architectural:
   frames. Every value is a 16-byte stack slot. Kernels (simple numeric
   loops) are the only code that keeps values in registers.
 - apogee's compiled code exits to Go for:
-  - calls into Go, including a tail call of one, such as
-    `return setmetatable(obj, mt)`;
+  - calls into Go, including a tail call of one, other than the math
+    functions, `pairs`, `ipairs` and `setmetatable` of a new table;
   - NEWTABLE and CLOSURE;
   - CONCAT, and LEN of a table with a hash part or `__len`;
   - GETTABLE and SETTABLE with keys other than constant strings and
@@ -723,7 +729,7 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
   which about 4.5 ns is compiled code around it, and the rest is the
   API's Go frame and the round trip. The other exits left on every
   iteration are allocations (`NEWTABLE`, `CLOSURE`), tail calls of Go
-  functions (every `return setmetatable(obj, mt)` constructor), calls of
+  functions other than `setmetatable`, calls of
   vararg functions, GETTABLE and SETTABLE with keys that are not constant
   strings or array indices, CONCAT, and the sort comparator's return to
   Go.
@@ -798,9 +804,9 @@ Earlier:
 In order of expected payoff for real-time scripts such as visualisers:
 
 1. **Fewer, cheaper exits.** Tail calls between compiled Lua functions
-   no longer exit (#112). A CALL or TAILCALL of `setmetatable` as an
-   intrinsic would remove most of the remaining tail-call exits, and CALL
-   with a variable number of results (Havlak) could run natively.
+   no longer exit (#112), nor do constructors' `return
+   setmetatable(obj, mt)` (`tailSetMeta`) or CALL with a variable number
+   of results (#143).
    Allocation itself stays in Go, so NEWTABLE and CLOSURE exits can only
    get cheaper, and in CD most of their cost is the allocation.
 2. **More in kernels.** Kernels call intrinsics and index buffers; a Go

@@ -35,6 +35,7 @@ const (
 	offTMeta     = uint32(unsafe.Offsetof(table{}.metaTable))
 	offTFlags    = uint32(unsafe.Offsetof(table{}.flags))
 	offShapeDict = uint32(unsafe.Offsetof(shape{}.dict))
+	offShapeGC   = uint32(unsafe.Offsetof(shape{}.collects))
 	offCShape    = uint32(unsafe.Offsetof(fieldCache{}.shape))
 	offCSlot     = uint32(unsafe.Offsetof(fieldCache{}.slot))
 	offCMtShape  = uint32(unsafe.Offsetof(fieldCache{}.mtShape))

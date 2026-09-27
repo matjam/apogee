@@ -1072,6 +1072,8 @@ func TestJITKernelIntrinsicChanged(t *testing.T) {
 // without leaving it each iteration.
 func TestJITOpenCalls(t *testing.T) {
 	skipWithoutJIT(t)
+	runtime.GC()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // calls exit while the barrier is on
 	jit, interp, lj := runBoth(t, `
 		local floor, min, byte, select = math.floor, math.min, string.byte, select
 		local function none() end

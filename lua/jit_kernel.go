@@ -402,7 +402,7 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 			}
 		}
 	}
-	if !k.allocate(p, base, reads, maxFloats, maxInts) {
+	if !k.allocate(p, base, !wrote[base+3], reads, maxFloats, maxInts) {
 		return nil
 	}
 	return k
@@ -412,15 +412,16 @@ func planKernel(p *prototype, latch int, intLoop bool, maxFloats, maxInts int, c
 // slots. The loop's registers, those live into the body and those below
 // the loop, which outlive it, each keep their own; the body's
 // temporaries, dead at the latch, share by liveness: two share one unless
-// some pc needs both. reads holds the registers each body pc reads. It
-// reports false when the kernel needs more than maxFloats float or
-// maxInts integer registers.
+// some pc needs both. With share, the loop variable, which the body does
+// not write, takes the index's register. reads holds the registers each
+// body pc reads. It reports false when the kernel needs more than
+// maxFloats float or maxInts integer registers.
 //
 // A side exit writes back every register the body writes, and so may
 // store a dead temporary's register, holding another's number, into it.
 // The ordinary code writes a dead register before reading it, as the
 // kernel does.
-func (k *kernelPlan) allocate(p *prototype, base int, reads map[int][]int, maxFloats, maxInts int) bool {
+func (k *kernelPlan) allocate(p *prototype, base int, share bool, reads map[int][]int, maxFloats, maxInts int) bool {
 	code := p.Code
 	var nodes []kslot // in order of first appearance
 	index := map[kslot]int{}
@@ -520,6 +521,12 @@ func (k *kernelPlan) allocate(p *prototype, base int, reads map[int][]int, maxFl
 	k.slots = map[kslot]int{}
 	floats, ints := 0, 0
 	for x, s := range nodes {
+		// The loop variable is the index, which FORLOOP copies to it,
+		// unless the body writes it, which Lua 5.5 forbids.
+		if index := (kslot{base, k.types[base]}); share && s == (kslot{base + 3, index.t}) {
+			k.slots[s] = k.slots[index]
+			continue
+		}
 		taken := map[int]bool{}
 		for y := range x {
 			if nodes[y].t == s.t && (pinned(s) || pinned(nodes[y]) || conflict[x][y]) {

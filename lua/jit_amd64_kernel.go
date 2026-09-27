@@ -504,7 +504,9 @@ func (c *amd64Compiler) kernelStep(k *kernel, base int, take, end Label) {
 		a.J(E, end)
 		a.SubImm(count, 1)
 		a.Add(idx, step)
-		a.Mov(ext, idx)
+		if ext != idx {
+			a.Mov(ext, idx)
+		}
 		a.Jmp(take)
 		return
 	}
@@ -513,7 +515,9 @@ func (c *amd64Compiler) kernelStep(k *kernel, base int, take, end Label) {
 	c.forStep(idx, limit, step, yes, end)
 	a.Bind(yes)
 	a.MovSD(idx, 0)
-	a.MovSD(ext, 0)
+	if ext != idx {
+		a.MovSD(ext, 0)
+	}
 	a.Jmp(take)
 }
 

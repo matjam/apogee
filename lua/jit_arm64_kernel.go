@@ -483,7 +483,9 @@ func (c *arm64Compiler) kernelStep(k *kernel, base int, take, end Label) {
 		a.Cbz(count, end)
 		a.SubImm(count, count, 1)
 		a.Add(idx, idx, step)
-		a.Mov(ext, idx)
+		if ext != idx {
+			a.Mov(ext, idx)
+		}
 		a.B(take)
 		return
 	}
@@ -504,7 +506,9 @@ func (c *arm64Compiler) kernelStep(k *kernel, base int, take, end Label) {
 	a.B(end)
 	a.Bind(yes)
 	a.Fmov(idx, 0)
-	a.Fmov(ext, 0)
+	if ext != idx {
+		a.Fmov(ext, 0)
+	}
 	a.B(take)
 }
 

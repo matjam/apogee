@@ -484,8 +484,9 @@ nothing compiles.
     below the loop keep theirs throughout; the body's temporaries share by
     liveness, so a result may take the register of an operand it reads
     last, which every kernel emitter must allow by reading its operands
-    before writing its result. amd64 has 7 integer registers, and the
-    loop takes 4 of them. A live-in register the body writes starts with the type it
+    before writing its result. amd64 has 7 integer registers, and an
+    integer loop takes 3 of them: the loop variable shares the index's,
+    as the body cannot write it. A live-in register the body writes starts with the type it
     ends with; one nothing decides takes `guess`'s type, a float only
     when it meets floats more than integers (a time parameter), since a
     wrong guess costs the kernel.

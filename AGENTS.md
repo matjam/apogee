@@ -745,22 +745,24 @@ remains follows from running on Go.
     last bit.
 - **The JIT compiles only on linux and darwin, arm64 and amd64.**
   Elsewhere, Windows included, states interpret.
-- **Speed.** With the JIT, apogee takes 0.69 times C Lua 5.5's time on
+- **Speed.** With the JIT, apogee takes 0.57 times C Lua 5.5's time on
   the standard benchmarks on the 9900X3D; without it, 1.8 times. It is
-  faster on all 17, least on CD (0.86 times) and Json (0.90). The M1's results are
+  faster on all 17, least on DeltaBlue (0.90 times), Json (0.88) and
+  Richards (0.85). The M1's results are
   still against 5.4; re-measure there with `-tags clua55`
   (bench/README.md, "Reproducing").
 
 ### LuaJIT
 
 **Speed is the main gap.** On the standard benchmarks on the 9900X3D,
-LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.69: roughly
-four times faster.
-- Numeric loops: 5–16 times faster (spectral-norm, Permute, NBody,
-  Towers).
-- Object-heavy code: 1.2–2.6 times faster (Havlak, DeltaBlue, Richards).
+LuaJIT takes 0.18 times C Lua 5.5's time, against apogee's 0.57: roughly
+three times faster.
+- Numeric loops: 5–15 times faster (Permute, spectral-norm, NBody,
+  Towers), though level on Mandelbrot, whose loops are kernels.
+- Object-heavy code: 2–2.6 times faster (DeltaBlue, Richards), and level
+  on Havlak.
 - On the embedding workloads LuaJIT takes 2.3 times native Go's time,
-  apogee 5.8; with a buffer, apogee's plasma beats both.
+  apogee 5.6; with a buffer, apogee's plasma beats both.
 - On the M1, Homebrew's LuaJIT is slower than apogee on CD (329 ms
   against 58) and Json (19 ms against 6); on amd64 it is faster on both.
 
@@ -810,7 +812,7 @@ Windows. apogee's JIT covers linux and darwin on arm64 and amd64.
 bench/README.md has the current tables and charts, generated from the raw
 results: AMD Ryzen 9 9900X3D (linux/amd64) and Apple M1 Pro (arm64). On
 the standard benchmarks (Are We Fast Yet and three from the Benchmarks
-Game) apogee with the JIT takes 0.69 times as long as C Lua 5.5 on amd64
+Game) apogee with the JIT takes 0.57 times as long as C Lua 5.5 on amd64
 (pinned to one CCD), and 1.8 times without it. The M1's results
 (0.75 and 1.5 times) are still against C Lua 5.4, from before the port to
 5.5, and before the arm64 fix that compiles functions past 32 KB of code.
@@ -864,7 +866,7 @@ Measured on the 9900X3D with the JIT on (bench/README.md):
   GETTABLE and SETTABLE with keys that are not constant
   strings or array indices, CONCAT, and the sort comparator's return to
   Go.
-- CD, the standard benchmark closest to C Lua 5.5 (0.86 times), spent
+- CD (0.83 times C Lua 5.5) spent
   about a fifth of its time in `jitStep` before constructors' setmetatable
   compiled, most of that creating tables
   (`newTableAt`) and storing into their hash parts (`setTableAt`): the
@@ -941,9 +943,11 @@ In order of expected payoff for real-time scripts such as visualisers:
    of results (#143).
    Allocation itself stays in Go, so NEWTABLE and CLOSURE exits can only
    get cheaper, and in CD most of their cost is the allocation.
-2. **More in kernels.** Kernels call intrinsics, index buffers and
-   leave at anything else on a rare path (docs/jit-ir.md, phases 1 and 2);
-   phases 3 and 4 there put tables and calls on the common path in them.
+2. **More in kernels.** Kernels now take tables, calls, while loops,
+   loop nests and whole functions (docs/jit-ir.md, all five phases). What
+   stays out: calls inside a region (fib), recompiling a region whose
+   guards fail (particles), and nests that need more than amd64's seven
+   integer registers (nbody's outer loop).
 3. **Registers across ordinary code.** Keep numbers in FP registers
    across straight-line code between exits, not only in kernels, with
    type checks at the first use. This is the lever for fib, records and

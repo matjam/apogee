@@ -172,11 +172,7 @@ func (p *prototype) patchJITCounters() {
 func (l *State) jitInstruction(i bytecode.Instruction, ip pc) (bytecode.Instruction, pc) {
 	ci := l.callInfo
 	if i.OpCode() == opJITCount {
-		var frame []value // at a loop latch, what its registers hold: see planKernel
-		if ip > 1 {
-			frame = ci.frame
-		}
-		l.countJIT(ci.closure, frame)
+		l.countJIT(ci, ip)
 	} else if l.hookMask == 0 {
 		l.runJIT(ci, ip-1, nil)
 		ci = l.callInfo
@@ -196,12 +192,19 @@ func (l *State) jitInstruction(i bytecode.Instruction, ip pc) (bytecode.Instruct
 // countJIT counts one call or loop iteration of cl's prototype and compiles
 // it once it is hot. The compiler may speculate on what cl's upvalues hold,
 // checking before it relies on it.
-func (l *State) countJIT(cl *luaClosure, frame []value) {
+func (l *State) countJIT(ci *callInfo, ip pc) {
+	cl := ci.closure
 	p := cl.prototype
 	if p.hot++; p.hot <= jitThreshold || p.jit != nil {
 		return
 	}
 	copy(p.exec, p.jitOrig) // remove the counters
+	// At a loop latch, what its registers hold; at the function's entry,
+	// its parameters: see planKernel.
+	frame := ci.frame
+	if n := p.ParameterCount; ip <= 1 && n <= len(frame) {
+		frame = frame[:n]
+	}
 	code, offsets, entries, kernels := compileJIT(p, l.global, cl, frame)
 	if code == nil {
 		return

@@ -106,6 +106,9 @@ func compileJIT(p *prototype, g *globalState, cl *luaClosure, frame []value) (co
 			loops[start] = append(loops[start], c.findKernels(ip)...)
 		}
 	}
+	if functionRegion(c.p) { // entered at every call
+		loops[0] = append(loops[0], c.findKernels(len(c.p.Code))...)
+	}
 	for ip := 0; ip < len(c.code); ip++ {
 		c.a.Bind(c.pcs[ip])
 		for _, k := range loops[ip] {

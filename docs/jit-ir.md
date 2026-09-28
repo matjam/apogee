@@ -149,7 +149,16 @@ geometric mean; a phase that loses somewhere says where and why.
    not stop a nest. sieve is another 18% faster, mandelbrot 8%, nbody
    3%. On amd64 most nests with tables do not fit the seven integer
    registers (tables take them too), so nbody's outer loop stays out;
-   arm64's thirteen fit them.
+   arm64's thirteen fit them. Then whole functions: one without loops
+   whose body is mostly numbers and tables is a region from its entry,
+   left at its returns, typed from the parameters it was called with.
+   bounce, whose `Ball:bounce` is one, is 17% faster; nothing else
+   changes in one binary. Two cases the design aimed at stay out. fib's
+   body is a call and little else, and a kernel around each call was
+   slower (`minCallWork`), so it needs calls inside the region, which
+   this tier does not do. particles' fields turn from integers to floats
+   after the first step, and a region typed once at compile time switches
+   itself off; it would need recompiling on a failed guard.
 
 ## What this does not change
 

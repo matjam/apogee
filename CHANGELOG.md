@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.2](https://github.com/matjam/apogee/compare/v1.1.1...v1.1.2) (2026-09-28)
+
+
+### Performance Improvements
+
+* **jit:** compile kernels through an IR (phase 1) ([#159](https://github.com/matjam/apogee/issues/159)) ([f7623a9](https://github.com/matjam/apogee/commit/f7623a9a3871738cf7e11921c278b60d8551ad72))
+* **jit:** kernels inline small numeric Lua functions (IR phase 4) ([#163](https://github.com/matjam/apogee/issues/163)) ([7d0cf36](https://github.com/matjam/apogee/commit/7d0cf361020bc11d7daf54db03e58e902d156969))
+* **jit:** kernels leave locally and spill (IR phase 2) ([#161](https://github.com/matjam/apogee/issues/161)) ([2f7d574](https://github.com/matjam/apogee/commit/2f7d574578307f78f7324894d3aa2e38eaa6217e))
+* **jit:** kernels resume after calls (IR phase 4) ([#164](https://github.com/matjam/apogee/issues/164)) ([964ad4c](https://github.com/matjam/apogee/commit/964ad4ca600fab1de073e6fe1a32e6e4cdef9ec7))
+* **jit:** loop nests in kernels (IR phase 5) ([#166](https://github.com/matjam/apogee/issues/166)) ([cd7a1d2](https://github.com/matjam/apogee/commit/cd7a1d222b88e46673d243489754302b287d90aa))
+* **jit:** tables in kernels (IR phase 3) ([#162](https://github.com/matjam/apogee/issues/162)) ([5a45dbd](https://github.com/matjam/apogee/commit/5a45dbdcd4c4bcb0a62f1aeca272e14d21eef520))
+* **jit:** while loops and booleans in kernels (IR phase 5) ([#165](https://github.com/matjam/apogee/issues/165)) ([9d1cb2e](https://github.com/matjam/apogee/commit/9d1cb2ed243196421b36de2f638ad202b7a5d93d))
+* **jit:** whole functions as kernels (IR phase 5) ([#167](https://github.com/matjam/apogee/issues/167)) ([edfd3f2](https://github.com/matjam/apogee/commit/edfd3f28649b69b394ca14e1c7167fc1e5aa4599))
+
 ## [1.1.1](https://github.com/matjam/apogee/compare/v1.1.0...v1.1.1) (2026-09-27)
 
 

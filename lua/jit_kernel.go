@@ -56,6 +56,7 @@ type kernelPlan struct {
 	start, latch int             // the body's first pc, and the FORLOOP's, or the JMP's back to start
 	base         int             // the FORLOOP's A, or for while, the locals active at start
 	while        bool            // a loop that a JMP closes, with no loop registers
+	fn           bool            // a whole function without loops: see functionRegion
 	intLoop      bool            // an integer loop, or a float one
 	floats       bool            // guess floats where nothing decides: see kernelEnv
 	shareVar     bool            // the body does not write the loop variable
@@ -84,6 +85,7 @@ type kernelPlan struct {
 	tabUses  map[int]bool
 	loads    map[int]numKind
 	observed func(r int) numKind
+	env      *kernelEnv
 
 	// Calls the kernel leaves at, for the ordinary code to make, and
 	// resumes after (resumes); GETUPVAL pcs of functions, which a kernel
@@ -193,6 +195,21 @@ func kernelDivisor(v value) bool {
 // differ. A long body gets no more than one plan of each kind, as its
 // code, of an exit for each access, is long too.
 func planKernels(p *prototype, latch int, env *kernelEnv, observed bool) []*kernelPlan {
+	if latch == len(p.Code) { // a function: see functionRegion
+		var plans []*kernelPlan
+		plan := planKernel(p, latch, true, env)
+		if plan != nil {
+			plans = append(plans, plan)
+		}
+		if !observed {
+			env.floats = true
+			if alt := planKernel(p, latch, true, env); alt != nil && !alt.sameTypes(plan) {
+				plans = append(plans, alt)
+			}
+			env.floats = false
+		}
+		return plans
+	}
 	kinds := []bool{true, false}
 	switch i := p.Code[latch]; {
 	case i.OpCode() == bytecode.OpJump: // a while loop has no loop registers to be floats
@@ -221,6 +238,44 @@ func planKernels(p *prototype, latch int, env *kernelEnv, observed bool) []*kern
 	return plans
 }
 
+// functionRegion reports whether p's whole code may be a kernel's region
+// (latch len(p.Code), entered at pc 0): a function without loops, which a
+// call then runs in registers, left at its returns. It is worth that only
+// for enough work, which planKernel's caller checks: see minFunctionWork.
+func functionRegion(p *prototype) bool {
+	if p.IsVarArg || len(p.Code) < minFunctionWork {
+		return false
+	}
+	// Planning costs, at every function that compiles: only one with the
+	// work in its code, and little a kernel leaves at, such as tables made.
+	work, other := 0, 0
+	for ip, i := range p.Code {
+		switch op := i.OpCode(); op {
+		case bytecode.OpForPrep, bytecode.OpForLoop, bytecode.OpTForCall, bytecode.OpTForLoop:
+			return false
+		case bytecode.OpJump:
+			if i.SBx() < 0 && !isExtraArg(p.Code, ip) {
+				return false
+			}
+		case bytecode.OpAdd, bytecode.OpSub, bytecode.OpMul, bytecode.OpDiv, bytecode.OpMod, bytecode.OpIDiv,
+			bytecode.OpUnaryMinus, bytecode.OpGetTable, bytecode.OpSetTable, bytecode.OpEqual,
+			bytecode.OpLessThan, bytecode.OpLessOrEqual, bytecode.OpBitwise:
+			work++
+		case bytecode.OpMove, bytecode.OpLoadConstant, bytecode.OpLoadBool, bytecode.OpTest, bytecode.OpNot,
+			bytecode.OpGetUpValue, bytecode.OpReturn:
+		default:
+			other++
+		}
+	}
+	return work >= minFunctionWork && other*4 <= work
+}
+
+// minFunctionWork is how many operations a function's kernel must do in
+// registers to be made: entering it checks and loads the parameters, and
+// each return writes registers back, which a short function spends more
+// on than it saves.
+const minFunctionWork = 12
+
 // longBody is how many instructions make a loop's body long: see
 // planKernels.
 const longBody = 100
@@ -242,7 +297,8 @@ type kernelEnv struct {
 	closure   func(n int) *luaClosure
 	callable  func(n int) bool
 	floor     bool
-	floats    bool // guess floats where nothing decides: see findKernels
+	floats    bool              // guess floats where nothing decides: see findKernels
+	value     func(r int) value // what register r held when the function compiled, or nil: see guessLoad
 	observed  func(r int) numKind
 }
 
@@ -274,6 +330,12 @@ func newKernelEnv(cl *luaClosure, frame []value, constOK func(k int) bool, fns [
 			return v.luaClosure() != nil || v.goFunction() != nil
 		},
 		floor: floor,
+		value: func(r int) value {
+			if r < len(frame) {
+				return frame[r]
+			}
+			return value{}
+		},
 		observed: func(r int) numKind {
 			if r >= len(frame) {
 				return kindAny
@@ -320,10 +382,16 @@ const maxExits = 8
 func planKernelWith(p *prototype, latch int, intLoop bool, env *kernelEnv, exits map[int]bool) (*kernelPlan, int) {
 	constOK, intrinsic, upValue, floor, observed := env.constOK, env.intrinsic, env.upValue, env.floor, env.observed
 	code := p.Code
-	fl := code[latch]
+	fn := latch == len(code) // the whole of a function without loops
+	var fl bytecode.Instruction
+	if !fn {
+		fl = code[latch]
+	}
 	start := latch + 1 + fl.SBx()
 	base, while := fl.A(), fl.OpCode() == bytecode.OpJump
-	if while { // a loop that jumps back to its start, as while loops do
+	if fn { // as a while loop's body, with nothing outliving it and no latch reached
+		start, base, while = 0, 0, true
+	} else if while { // a loop that jumps back to its start, as while loops do
 		if base = activeLocals(p, start); fl.A() != 0 || start >= latch || base < 0 {
 			return nil, -1
 		}
@@ -331,11 +399,11 @@ func planKernelWith(p *prototype, latch int, intLoop bool, env *kernelEnv, exits
 	if start > latch {
 		return nil, -1
 	}
-	k := &kernelPlan{start: start, latch: latch, base: base, while: while, intLoop: intLoop, floats: env.floats, types: map[int]numKind{},
+	k := &kernelPlan{start: start, latch: latch, base: base, while: while, fn: fn, intLoop: intLoop, floats: env.floats, types: map[int]numKind{},
 		calls: map[int]kernelCall{}, virtual: map[int]bool{}, buffers: map[int]bool{},
 		upLoads: map[int]int{}, bufFrom: map[int]int{}, floor: floor, exits: map[int]bool{}, unreached: map[int]bool{}, breaks: map[int]bool{},
 		tables: map[int]bool{}, tabUses: map[int]bool{}, loads: map[int]numKind{}, observed: observed,
-		resumes: map[int]bool{}, upCopies: map[int]bool{}, upFields: map[int]int{}}
+		resumes: map[int]bool{}, upCopies: map[int]bool{}, upFields: map[int]int{}, env: env}
 	wrote := map[int]bool{} // registers the body writes, which cannot hold buffers
 	used := map[int]bool{}  // registers holding numbers
 	use := func(r int) { used[r] = true }
@@ -422,6 +490,12 @@ func planKernelWith(p *prototype, latch int, intLoop bool, env *kernelEnv, exits
 		}
 		if !live || isExtraArg(code, ip) {
 			k.exits[ip], k.unreached[ip] = true, true
+			continue
+		}
+		if fn && (i.OpCode() == bytecode.OpReturn || i.OpCode() == bytecode.OpTailCall) {
+			// A function's end, for the ordinary code to return: no short run.
+			k.exits[ip], k.breaks[ip] = true, true
+			live = false
 			continue
 		}
 		if exits[ip] || !kernelOp(i.OpCode()) {
@@ -1296,6 +1370,21 @@ func (k *kernelPlan) numericUseFrom(p *prototype, r int, seen map[int]bool) bool
 	return false
 }
 
+// observedKind is the type a kernel holds v as, or kindAny.
+func observedKind(v value) numKind {
+	switch {
+	case v.isFloat():
+		return kindFloat
+	case v.isInteger():
+		return kindInt
+	case v.table() != nil:
+		return kindTable
+	case v.p == boolPtr():
+		return kindBool
+	}
+	return kindAny
+}
+
 // undecidedLoad returns the first GETTABLE of a table whose value's type
 // is undecided, or -1.
 func (k *kernelPlan) undecidedLoad() int {
@@ -1319,7 +1408,15 @@ func (k *kernelPlan) undecidedLoad() int {
 func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) (numKind, bool) {
 	code := p.Code
 	r := code[ip].A()
-	used, meets := false, kindAny
+	used, meets, sureMeets := false, kindAny, false
+	// A field of a table the loop was entered with, as a method's self is:
+	// what that table holds there when the function compiled.
+	hint := kindAny
+	if i := code[ip]; i.OpCode() == bytecode.OpGetTable && slices.Contains(k.liveIn, i.B()) && k.env != nil {
+		if t := k.env.value(i.B()).table(); t != nil && bytecode.IsConstant(i.C()) {
+			hint = observedKind(t.at(p.Constants[bytecode.ConstantIndex(i.C())]))
+		}
+	}
 	seen := map[int]bool{}
 	work := []int{ip + 1}
 	for len(work) > 0 {
@@ -1356,8 +1453,10 @@ func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) (numK
 			for _, f := range [][2]int{{i.B(), i.C()}, {i.C(), i.B()}} {
 				if reads(f[0]) {
 					used = true
-					if t := other(f[1]); isNumKind(t) && meets == kindAny {
-						meets = t
+					// A register's type decides; a constant's is only a
+					// hint: 0 and 0.0 are the same to a comparison.
+					if t := other(f[1]); isNumKind(t) && (meets == kindAny || !sureMeets && !bytecode.IsConstant(f[1])) {
+						meets, sureMeets = t, !bytecode.IsConstant(f[1])
 					}
 				}
 			}
@@ -1415,11 +1514,13 @@ func (k *kernelPlan) guessLoad(p *prototype, at []map[int]numKind, ip int) (numK
 	switch t := k.observed(r); {
 	case !used:
 		return kindBoxed, true
+	case isRegKind(hint):
+		return hint, true
 	case isNumKind(t):
 		return t, true
 	case meets == kindInt && k.floats:
 	case meets != kindAny:
-		return meets, true
+		return meets, sureMeets
 	}
 	return kindFloat, false
 }

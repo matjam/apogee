@@ -1301,6 +1301,49 @@ func TestJITKernelNests(t *testing.T) {
 	}
 }
 
+// A function without loops and with enough to do in registers is a kernel
+// of its own, entered at every call and left at its returns.
+func TestJITKernelFunctions(t *testing.T) {
+	skipWithoutJIT(t)
+	step := `
+		local P = {} P.__index = P
+		function P.new(i) return setmetatable({x = i % 20 + 0.5, y = i % 10 + 0.25, vx = (i % 7) - 3.0, vy = (i % 5) - 2.0, life = 100.0}, P) end
+		function P:step(dt)
+		  self.x = self.x + self.vx * dt
+		  self.y = self.y + self.vy * dt
+		  if self.x < 0 or self.x >= 20 then self.vx = -self.vx end
+		  if self.y < 0 or self.y >= 10 then self.vy = -self.vy end
+		  self.life = self.life - dt
+		  if self.life <= 0 then self.life = 100 end
+		end`
+	tests := []struct{ name, src string }{
+		{"particle steps", step + `
+			function run() local ps = {} for i = 1, 30 do ps[i] = P.new(i) end
+			  for f = 1, 50 do for i = 1, #ps do ps[i]:step(0.5) end end
+			  return ps[1].x, ps[7].vy, ps[30].life end`},
+		{"returns on two paths", `
+			local function clamp(x, lo, hi) local d = hi - lo; local m = (lo + hi) * 0.5
+			  if x < lo then return lo + d * 0.0 end if x > hi then return hi - d * 0.0 end return (x - m) * 1.0 + m end
+			function run() local s = 0.0 for i = 1, 100 do s = s + clamp(i * 0.37, 5.0, 20.0) end return s end`},
+		{"a parameter changes type", step + `
+			function run() local p = P.new(3) for i = 1, 40 do p:step(i < 20 and 0.5 or 1) end return p.x, p.life end`},
+		{"a field turns into a string", step + `
+			function run() local p = P.new(3) local ok = pcall(function() for i = 1, 40 do if i == 30 then p.vx = "fast" end p:step(0.5) end end) return ok, p.x end`},
+		{"a short function is not a kernel", `local function add(a, b) return a + b end
+			function run() local s = 0 for i = 1, 10 do s = add(s, i) end return s end`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime.GC()
+			defer debug.SetGCPercent(debug.SetGCPercent(-1)) // kernels run while the barrier is off
+			jit, interp, _ := runBoth(t, tt.src)
+			if jit != interp {
+				t.Fatalf("JIT %q, interpreter %q", jit, interp)
+			}
+		})
+	}
+}
+
 // Kernels needing more registers than the machine has spill the rest to
 // their stack slots, and agree with the interpreter.
 func TestJITKernelSpills(t *testing.T) {

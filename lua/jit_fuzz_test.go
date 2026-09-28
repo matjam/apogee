@@ -175,6 +175,7 @@ local function vn(...) local n = 0 for _, v in ipairs({...}) do n = n + 1 end re
 local small = {1, 2.5, 3}
 local function sum(t) local s = 0 for _, v in ipairs(t) do s = s + v end return s end
 local function psum(t) local s = 0 for _, v in pairs(t) do s = s + v end return s end
+local function wk(o, d) local x = o.x + d * 0.5 local y = o.y * 2 + d if x > y then x = x - y else y = y - x end o.x = x * 0.25 + y * 0.125 return x + y * 0.5 end
 local scale = 0.75
 function run(n)
   local i1, i2, f1, f2 = 3, -7, 0.25, -1.5
@@ -216,6 +217,8 @@ func (g *fuzzGen) stmt(depth int) string {
 			"f2 = f2 + psum(small)",
 			"small[i % 3 + 1] = nil; small[i % 3 + 1] = "+g.floatExpr(1),
 			"tab[i % 64 + 1] = nil; tab[i % 64 + 1] = "+g.floatExpr(1),
+			"f1 = wk(obj, "+g.floatExpr(1)+")",
+			"f2 = f2 + wk(obj, i)",
 		)
 	case n == 10 && depth < 2:
 		// On a rare path, or one taken every time a compiler cannot tell:

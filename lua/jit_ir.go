@@ -259,7 +259,7 @@ func (f *irFunc) snapshot(p *prototype, ip int) int {
 	}
 	// An instruction the ordinary code runs whose values run to l.top,
 	// after a call of all results the kernel computed, which has one.
-	switch i := p.Code[ip]; i.OpCode() {
+	switch i := p.Code[min(ip, len(p.Code)-1)]; i.OpCode() {
 	case bytecode.OpCall, bytecode.OpTailCall, bytecode.OpReturn:
 		if _, ok := f.calls[ip-1]; ok && i.B() == 0 && ip > f.start && p.Code[ip-1].C() == 0 {
 			s.top = p.Code[ip-1].A() + 1
@@ -834,6 +834,19 @@ func (f *irFunc) colour(conflict [][]bool, limitF, limitI int, spill, loopSpill 
 		}
 	}
 	return floats, ints
+}
+
+// works reports how many operations f does in registers.
+func (f *irFunc) works() int {
+	work := 0
+	for _, in := range f.insts {
+		switch in.op {
+		case irLabel, irMove, irConst, irHoist, irJump, irExit, irCopyUp, irCopy:
+		default:
+			work++
+		}
+	}
+	return work
 }
 
 // worksBetweenCalls reports whether f does enough in registers for the

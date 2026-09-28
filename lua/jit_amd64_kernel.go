@@ -44,12 +44,13 @@ func (c *amd64Compiler) findKernels(latch int) []*kernel {
 	constOK := func(k int) bool { _, ok := c.constant(k); return ok }
 	env := newKernelEnv(c.cl, c.frame, constOK, fns, c.sse41)
 	var ks []*kernel
-	for _, plan := range planKernels(c.p, latch, env, c.frame != nil) {
+	observed := len(c.frame) > c.p.ParameterCount // at a latch: all the registers, not the parameters
+	for _, plan := range planKernels(c.p, latch, env, observed) {
 		if plan == nil {
 			continue
 		}
 		f := buildIR(c.p, plan)
-		if !f.worksBetweenCalls() || !f.allocate(kernelCount, len(kernelInts)) {
+		if !f.worksBetweenCalls() || plan.fn && f.works() < minFunctionWork || !f.allocate(kernelCount, len(kernelInts)) {
 			continue
 		}
 		k := &kernel{irFunc: f, exits: make([]Label, len(f.snaps)), counted: make([]Label, len(f.snaps))}
@@ -849,6 +850,10 @@ func (c *amd64Compiler) kernelInstruction(k *kernel, in *irInst, label func(int)
 	case irLen:
 		c.kernelLen(k, in)
 	case irExit: // a call's is not a short run: the kernel resumes after it
+		if k.fn && in.flag && k.runs != nil { // a function's return: a run, not short, done
+			a.MovImm(rTmp, uint64(uintptr(unsafe.Pointer(k.runs))))
+			a.StoreZero(rTmp, 0)
+		}
 		a.Jmp(c.kernelSideExit(k, in.snap, !in.flag))
 	case irHoist: // a number, from the context
 		if isInt {

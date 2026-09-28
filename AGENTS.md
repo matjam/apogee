@@ -574,6 +574,16 @@ nothing compiles.
     of each kind for a long body (`longBody`), whose exits' code is long;
     on arm64 a function too long for its branches compiles again without
     kernels.
+  - **Functions.** A function without loops or varargs whose body is
+    mostly numbers and tables (`functionRegion`, at least
+    `minFunctionWork` operations, and as many in the IR) is a kernel from
+    pc 0 to its end (`kernelPlan.fn`): a while-like region with base 0,
+    whose RETURNs and TAILCALLs leave uncounted, as breaks do. A function
+    compiled at entry is observed through its parameters only
+    (`countJIT` passes them), so fields read from a parameter take the
+    type the table held then. Leaving at a RETURN resets the short-run
+    count, since every run ends at one. fib is not one: its calls
+    outnumber its work (`minCallWork`).
   - **Liveness.** `kernelPlan.liveness` finds the registers live before
     each pc, conservatively where the kernel does not follow (anything it
     leaves at reads all, and the locals below the loop are always live:

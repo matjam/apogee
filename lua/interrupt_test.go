@@ -22,6 +22,7 @@ func TestInterrupt(t *testing.T) {
 		"Lua calls":        `local function f(x) return x + 1 end; local n = 0; while true do n = f(n) end`,
 		"calls into Go":    `local s = 0; while true do s = s + math.abs(-1) + #tostring(s) end`,
 		"interpreted step": `local s; while true do s = "x" .. "y" end`,
+		"pattern matching": `string.find(string.rep("a", 3000), ".-.-.-.-.-b")`,
 	}
 	for name, src := range loops {
 		for _, jit := range []bool{true, false} {
@@ -67,5 +68,33 @@ func TestInterruptWhileIdle(t *testing.T) {
 	}
 	if err := l.DoString(`for i = 1, 10 do end`); err != nil {
 		t.Fatalf("a dropped interrupt stopped a later call: %v", err)
+	}
+}
+
+// CountInstructions advances the count hook, calling it at most once per
+// call, and checks for an interrupt, so a long Go function can be stopped.
+func TestCountInstructions(t *testing.T) {
+	l := lua.NewState()
+	calls := 0
+	l.SetHook(func(*lua.State, lua.Debug) { calls++ }, lua.MaskCount, 10)
+	for _, step := range []struct{ n, want int }{
+		{0, 0}, {-5, 0}, {9, 0}, {1, 1}, {25, 2}, {9, 2}, {1, 3},
+	} {
+		l.CountInstructions(step.n)
+		if calls != step.want {
+			t.Fatalf("after CountInstructions(%d): hook ran %d times, want %d", step.n, calls, step.want)
+		}
+	}
+
+	l.SetHook(nil, 0, 0)
+	l.Register("work", func(l *lua.State) int {
+		for range 100 {
+			l.CountInstructions(1000)
+		}
+		return 0
+	})
+	l.Interrupt()
+	if err := l.DoString(`work()`); err == nil || !strings.Contains(err.Error(), "interrupted!") {
+		t.Fatalf("got %v, want interrupted!", err)
 	}
 }

@@ -3,6 +3,7 @@ package stdlib_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/matjam/apogee/lua"
 	"github.com/matjam/apogee/stdlib"
@@ -174,4 +175,36 @@ func TestStringBytes(t *testing.T) {
 		assert(string.upper("é\255a") == "é\255A")
 		assert(string.lower("É\255A") == "É\255a")
 	`)
+}
+
+// Backtracking in a pattern match runs the count hook, so a hook can stop
+// a match that would otherwise run for an exponentially long time.
+func TestPatternMatchingRunsTheCountHook(t *testing.T) {
+	for _, call := range []string{
+		`string.find(s, ".-.-.-.-.-b")`,
+		`string.match(s, ".-.-.-.-.-b")`,
+		`for _ in string.gmatch(s, ".-.-.-.-.-b") do end`,
+		`string.gsub(s, ".-.-.-.-.-b", "")`,
+	} {
+		t.Run(call, func(t *testing.T) {
+			l := lua.NewState()
+			stdlib.Open(l)
+			calls := 0
+			l.SetHook(func(l *lua.State, _ lua.Debug) {
+				if calls++; calls == 100 {
+					l.Errorf("stopped by the hook")
+				}
+			}, lua.MaskCount, 1000)
+			done := make(chan error, 1)
+			go func() { done <- l.DoString(`local s = string.rep("a", 3000); ` + call) }()
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "stopped by the hook") {
+					t.Fatalf("got %v, want the hook's error", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the hook did not stop the match")
+			}
+		})
+	}
 }

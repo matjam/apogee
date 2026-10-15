@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.0](https://github.com/matjam/apogee/compare/v1.1.2...v1.2.0) (2026-10-15)
+
+
+### Features
+
+* **lua:** add WithoutFinalizers to turn __gc off ([#170](https://github.com/matjam/apogee/issues/170)) ([875c105](https://github.com/matjam/apogee/commit/875c105122ad4184c13da24804f5f735ab5ce9cf))
+* **lua:** let count hooks and Interrupt stop pattern matching ([#169](https://github.com/matjam/apogee/issues/169)) ([e232f4f](https://github.com/matjam/apogee/commit/e232f4fd4231da1234f5866d4366424ec9a8c58d))
+
 ## [1.1.2](https://github.com/matjam/apogee/compare/v1.1.1...v1.1.2) (2026-09-28)
 
 

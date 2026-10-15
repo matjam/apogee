@@ -29,6 +29,13 @@ const (
 	goClosureBytes = int(unsafe.Sizeof(goClosure{}))
 	userDataBytes  = int(unsafe.Sizeof(userData{}))
 	threadBytes    = int(unsafe.Sizeof(State{})) + basicStackSize*slotBytes
+
+	// A call frame's record: callInfo, and the Lua or Go part a frame of
+	// that kind adds. A state keeps the records it has made for reuse, so
+	// only a call deeper than any before it makes, and counts, new ones.
+	callInfoBytes    = int(unsafe.Sizeof(callInfo{}))
+	luaCallInfoBytes = int(unsafe.Sizeof(luaCallInfo{}))
+	goCallInfoBytes  = int(unsafe.Sizeof(goCallInfo{}))
 )
 
 // SetAllocationLimit limits what the state and its threads may allocate

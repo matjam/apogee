@@ -193,14 +193,22 @@ func (l *State) Replace(index int) {
 }
 
 // CheckStack ensures that there are at least size free stack slots in the
-// stack. This call will not panic(), unlike the other Check*() functions.
+// stack, and reports whether it could. Unlike the other Check*() functions
+// it doesn't raise an error when the stack can't grow, with one exception:
+// when growing would pass the limit SetAllocationLimit set, it raises the
+// memory error, so that running out of the allocation budget can't be
+// caught as an ordinary failure, such as unpack's "too many results".
 //
 // https://www.lua.org/manual/5.5/manual.html#lua_checkstack
 func (l *State) CheckStack(size int) bool {
 	callInfo := l.callInfo
 	ok := l.stackLast-l.top > size
 	if !ok && l.top+extraStack <= maxStack-size {
-		ok = l.protect(func() { l.growStack(size) }) == nil
+		err := l.protect(func() { l.growStack(size) })
+		if err == ErrMemory {
+			l.throw(ErrMemory)
+		}
+		ok = err == nil
 	}
 	if ok && callInfo.top < l.top+size {
 		callInfo.setTop(l.top + size)

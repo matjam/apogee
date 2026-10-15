@@ -80,6 +80,10 @@ Differences from C Lua:
   heap.
 - As in C, files a script opens are buffered, and `os.exit` flushes them;
   a host that ends its process otherwise should call `State.Close`.
+- `lua.NewState(lua.WithoutFinalizers())` makes a state that never calls
+  `__gc`. A host running untrusted scripts wants it: a finalizer runs
+  outside the host's calls with hooks off, so a count hook or `Interrupt`
+  can't stop one that loops, and `Close` waits for it.
 
 ## Performance
 

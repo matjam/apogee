@@ -71,6 +71,7 @@ type globalState struct {
 	finalizerThread      *State            // runs finalizers; see callFinalizer
 	gcStopped            bool              // collectgarbage "stop"
 	closed               bool              // Close has begun
+	noFinalizers         bool              // never call __gc; see WithoutFinalizers
 	gcWatch              bool              // a metatable with __mode or __gc was set
 	gcBusy               bool              // collecting or finalizing: no nested collection
 	gcParams             [gcParamCount]int // collectgarbage "param"; apogee's collector uses only the pause

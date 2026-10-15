@@ -153,6 +153,12 @@ func TestCharge(t *testing.T) {
 		l.CheckAllocation(int(l.CheckInteger(1)))
 		return 0
 	})
+	// Call frames count when a call first reaches a depth, so make the
+	// frames this test uses before the limit, to count only what Charge does.
+	if err := l.DoString(`check(0) pcall(check, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	l.SetTop(0)
 	err := l.LoadString(`
 		check(1000) check(1000) -- checking counts nothing
 		charge(600)

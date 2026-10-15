@@ -166,9 +166,11 @@ func (l *State) pushLuaFrame(function, base, resultCount int, c *luaClosure) *ca
 	p := c.prototype
 	ci := l.callInfo.next
 	if ci == nil {
+		l.charge(callInfoBytes + luaCallInfoBytes)
 		ci = &callInfo{previous: l.callInfo, luaCallInfo: &luaCallInfo{}}
 		l.callInfo.next = ci
 	} else if ci.luaCallInfo == nil {
+		l.charge(luaCallInfoBytes)
 		ci.luaCallInfo = &luaCallInfo{}
 	}
 	ci.savedPC, ci.code, ci.closure = 0, p.Code, c
@@ -186,9 +188,11 @@ func (l *State) pushLuaFrame(function, base, resultCount int, c *luaClosure) *ca
 func (l *State) pushGoFrame(function, resultCount int) {
 	ci := l.callInfo.next
 	if ci == nil {
+		l.charge(callInfoBytes + goCallInfoBytes)
 		ci = &callInfo{previous: l.callInfo, goCallInfo: &goCallInfo{}}
 		l.callInfo.next = ci
 	} else if ci.goCallInfo == nil {
+		l.charge(goCallInfoBytes)
 		ci.goCallInfo = &goCallInfo{}
 	}
 	ci.function = function

@@ -63,6 +63,26 @@ func tableCreate(l *lua.State) int {
 	return 1
 }
 
+// loopBatch is how many iterations a table function's element loop runs
+// between reports to CountInstructions. The loops in insert, remove and
+// move run in Go for as many elements as the script's table, length or
+// range asks, so without the reports a count hook or Interrupt couldn't
+// stop them.
+const loopBatch = 256
+
+// loopCounter reports a Go loop's iterations to CountInstructions.
+type loopCounter struct {
+	l *lua.State
+	n int
+}
+
+func (c *loopCounter) step() {
+	if c.n++; c.n == loopBatch {
+		c.n = 0
+		c.l.CountInstructions(loopBatch)
+	}
+}
+
 func tableInsert(l *lua.State) int {
 	e := tableLen(l, 1, tableRead|tableWrite) + 1 // the first empty element
 	pos := e
@@ -71,9 +91,11 @@ func tableInsert(l *lua.State) int {
 	case 3:
 		pos = l.CheckInteger(2)
 		l.ArgumentCheck(uint64(pos)-1 < uint64(e), 2, "position out of bounds")
+		c := loopCounter{l: l}
 		for i := e; i > pos; i-- { // move up
 			l.FieldInt(1, i-1)
 			l.SetFieldInt(1, i)
+			c.step()
 		}
 	default:
 		l.Errorf("wrong number of arguments to 'insert'")
@@ -89,9 +111,11 @@ func tableRemove(l *lua.State) int {
 		l.ArgumentCheck(uint64(pos)-1 <= uint64(size), 2, "position out of bounds")
 	}
 	l.FieldInt(1, pos) // the result
+	c := loopCounter{l: l}
 	for ; pos < size; pos++ {
 		l.FieldInt(1, pos+1)
 		l.SetFieldInt(1, pos)
+		c.step()
 	}
 	l.PushNil()
 	l.SetFieldInt(1, pos)
@@ -112,15 +136,18 @@ func tableMove(l *lua.State) int {
 		l.ArgumentCheck(f > 0 || e < math.MaxInt64+f, 3, "too many elements to move")
 		n := e - f + 1
 		l.ArgumentCheck(t <= math.MaxInt64-n+1, 4, "destination wrap around")
+		c := loopCounter{l: l}
 		if t > e || t <= f || (tt != 1 && !l.Compare(1, tt, lua.OpEq)) {
 			for i := int64(0); i < n; i++ {
 				l.FieldInt(1, f+i)
 				l.SetFieldInt(tt, t+i)
+				c.step()
 			}
 		} else {
 			for i := n - 1; i >= 0; i-- {
 				l.FieldInt(1, f+i)
 				l.SetFieldInt(tt, t+i)
+				c.step()
 			}
 		}
 	}

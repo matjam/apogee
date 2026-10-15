@@ -563,7 +563,10 @@ func (ms *matchState) addValue(b *strings.Builder, s, e int, tr lua.Type, repl s
 }
 
 // addString appends repl with its %0 to %9 replaced by the match and its
-// captures.
+// captures. It checks the allocation limit before copying a match or a
+// capture: one replacement can copy the match many times, as "%0%0%0..."
+// does, so checking once the replacement is built could let it grow to
+// many times the limit first. Literal text is bounded by repl itself.
 func (ms *matchState) addString(b *strings.Builder, s, e int, repl string) {
 	for i := 0; i < len(repl); i++ {
 		c := repl[i]
@@ -583,10 +586,12 @@ func (ms *matchState) addString(b *strings.Builder, s, e int, repl string) {
 			}
 			b.WriteByte(d)
 		case d == '0':
+			ms.l.CheckAllocation(b.Len() + e - s)
 			b.WriteString(ms.src[s:e])
 		default:
 			ms.pushCapture(int(d-'1'), s, e)
 			r, _ := ms.l.ToString(-1)
+			ms.l.CheckAllocation(b.Len() + len(r))
 			b.WriteString(r)
 			ms.l.Pop(1)
 		}

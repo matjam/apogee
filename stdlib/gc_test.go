@@ -183,3 +183,37 @@ func TestFinalizersRunByDefault(t *testing.T) {
 		t.Fatalf("finalizers ran %v, want [collected closed]", log)
 	}
 }
+
+// A chain of ephemeron entries, each key the previous entry's value, stays
+// alive while its head is reachable and goes when it isn't. Marking it
+// takes time in proportion to its length: a 40,000-key chain, ordered so
+// each key is found only after the entry before it, once took minutes.
+func TestEphemeronChains(t *testing.T) {
+	l := lua.NewState()
+	stdlib.Open(l)
+	start := time.Now()
+	err := l.DoString(`
+		local n = 40000
+		local eph = setmetatable({}, {__mode = "k"})
+		local keys = {}
+		for i = 1, n + 1 do keys[i] = {} end
+		for i = n, 1, -1 do eph[keys[i]] = keys[i + 1] end -- reversed: the worst order to scan
+		head = keys[1]
+		keys = nil
+		collectgarbage()
+		local count = 0
+		for _ in pairs(eph) do count = count + 1 end
+		assert(count == n, "the chain lost entries: " .. count)
+		head = nil
+		collectgarbage()
+		collectgarbage()
+		assert(next(eph) == nil, "the chain outlived its head")
+	`)
+	if err != nil {
+		msg, _ := l.ToString(-1)
+		t.Fatal(err, msg)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("collecting a 40,000-key ephemeron chain took %v", d)
+	}
+}

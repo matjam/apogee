@@ -3,6 +3,7 @@ package stdlib_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/matjam/apogee/lua"
 	"github.com/matjam/apogee/stdlib"
@@ -133,4 +134,52 @@ func TestAutomaticCollection(t *testing.T) {
 		assert(done)
 		assert(collectgarbage("step", 1e6) == true)
 	`)
+}
+
+// WithoutFinalizers: __gc never runs, in a collection or at Close, so a
+// finalizer that loops can't hang the host. Weak tables still work.
+func TestWithoutFinalizers(t *testing.T) {
+	l := lua.NewState(lua.WithoutFinalizers())
+	stdlib.Open(l)
+	err := l.DoString(`
+		ran = false
+		setmetatable({}, {__gc = function() ran = true end})
+		setmetatable({}, {__gc = function() while true do end end})
+		local wv = setmetatable({}, {__mode = "v"})
+		wv[1] = {}
+		collectgarbage()
+		collectgarbage()
+		assert(not ran, "a finalizer ran")
+		assert(wv[1] == nil, "weak tables still clear")
+	`)
+	if err != nil {
+		msg, _ := l.ToString(-1)
+		t.Fatal(err, msg)
+	}
+	done := make(chan struct{})
+	go func() { l.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close ran a finalizer")
+	}
+}
+
+// By default a finalizer still runs, in a collection or at Close.
+func TestFinalizersRunByDefault(t *testing.T) {
+	l := lua.NewState()
+	stdlib.Open(l)
+	var log []string
+	l.Register("note", func(l *lua.State) int { log = append(log, l.CheckString(1)); return 0 })
+	if err := l.DoString(`
+		setmetatable({}, {__gc = function() note("collected") end})
+		collectgarbage()
+		keep = setmetatable({}, {__gc = function() note("closed") end})
+	`); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	if strings.Join(log, ",") != "collected,closed" {
+		t.Fatalf("finalizers ran %v, want [collected closed]", log)
+	}
 }

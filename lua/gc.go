@@ -248,6 +248,19 @@ func (l *State) checkGC() {
 // 2^maxGCBackoff of their pace.
 const maxGCBackoff = 6
 
+// WithoutFinalizers turns __gc finalizers off: the State never calls a __gc
+// metamethod, in a collection or at Close. A metatable with __gc can still
+// be set; its __gc is ignored, as C Lua ignores a __gc added after the
+// metatable was set. Files the io library opens are then closed only by
+// file:close, io.close or os.exit.
+//
+// A host that runs untrusted scripts wants this: a finalizer runs outside
+// the calls the host makes, with hooks off, so neither a count hook nor
+// Interrupt can stop one that never returns, and Close waits for it.
+func WithoutFinalizers() Option {
+	return func(l *State) { l.global.noFinalizers = true }
+}
+
 // noteMetaTable records what a new metatable mt for v asks of the
 // collector: v's finalizer, if mt has __gc, and automatic collections, if
 // it has __mode or __gc.
@@ -259,7 +272,7 @@ func (l *State) noteMetaTable(v value, mt *table) {
 	if !mt.atString("__mode").isNil() {
 		g.gcWatch, g.gcBackoff = true, 0
 	}
-	if mt.atString("__gc").isNil() || g.closed { // no finalizers once Close has begun, as in C
+	if mt.atString("__gc").isNil() || g.closed || g.noFinalizers { // no finalizers once Close has begun, as in C
 		return
 	}
 	g.gcWatch = true

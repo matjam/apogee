@@ -31,6 +31,32 @@ func (l *State) pollInterrupt() {
 	}
 }
 
+// CountInstructions counts n steps of work that a Go function does for Lua
+// as if they were n VM instructions. It advances the count hook that
+// SetHook set with MaskCount, calling the hook when the count runs out,
+// and checks for an Interrupt as a loop does. A Go function that can run
+// for a long time calls it from its loop, so that a hook or Interrupt can
+// stop it as they stop Lua code; string matching calls it as it
+// backtracks. An error the hook raises, or the interrupt's, is raised from
+// here, as if by the Go function. The hook runs at most once per call.
+// n <= 0 counts nothing.
+func (l *State) CountInstructions(n int) {
+	if n <= 0 {
+		return
+	}
+	if l.hookMask&MaskCount != 0 {
+		if l.hookCount -= n; l.hookCount <= 0 {
+			l.resetHookCount()
+			l.hook(HookCount, -1)
+		}
+	}
+	if int(l.interruptPoll) <= n {
+		l.checkInterrupt()
+	} else {
+		l.interruptPoll -= int32(n)
+	}
+}
+
 //go:noinline
 func (l *State) checkInterrupt() {
 	l.interruptPoll = interruptPoll

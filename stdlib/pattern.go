@@ -12,8 +12,13 @@ import (
 // NUL there.
 
 const (
-	maxCaptures     = 32  // LUA_MAXCAPTURES
-	maxMatchCalls   = 200 // MAXCCALLS
+	maxCaptures   = 32  // LUA_MAXCAPTURES
+	maxMatchCalls = 200 // MAXCCALLS
+	// matchStepBatch is how many match calls run between reports to
+	// CountInstructions. A pattern such as ".-.-.-.-b" backtracks through
+	// exponentially many of them, so without the reports a count hook or
+	// Interrupt couldn't stop it.
+	matchStepBatch  = 256
 	capUnfinished   = -1
 	capPosition     = -2
 	patternSpecials = "^$*+?.([%-"
@@ -24,6 +29,7 @@ type matchState struct {
 	src     string
 	pat     string
 	depth   int // match calls left before "pattern too complex"
+	steps   int // match calls not yet reported to CountInstructions
 	level   int // captures started
 	capture [maxCaptures]struct{ init, len int }
 }
@@ -281,6 +287,10 @@ func (ms *matchState) matchCapture(s int, c byte) int {
 func (ms *matchState) match(s, p int) int {
 	if ms.depth == 0 {
 		ms.errorf("pattern too complex")
+	}
+	if ms.steps++; ms.steps == matchStepBatch {
+		ms.steps = 0
+		ms.l.CountInstructions(matchStepBatch)
 	}
 	ms.depth--
 	s = ms.doMatch(s, p)

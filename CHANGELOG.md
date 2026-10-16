@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.2.1](https://github.com/matjam/apogee/compare/v1.2.0...v1.2.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* keep table loops, call frames and stack growth within a host's limits ([#172](https://github.com/matjam/apogee/issues/172)) ([0abd0c9](https://github.com/matjam/apogee/commit/0abd0c99d462a24394cb590d6bdce57d9fd0de2b))
+* **lua:** mark ephemeron chains in linear time ([#174](https://github.com/matjam/apogee/issues/174)) ([8e47540](https://github.com/matjam/apogee/commit/8e47540f8e72dde4baf5dca91cb8296ba5c75d52))
+* **lua:** stop tables of sparse integer keys rescanning on every key ([#175](https://github.com/matjam/apogee/issues/175)) ([ca78bca](https://github.com/matjam/apogee/commit/ca78bcac8d8d1398563b21cecba26f75cac74a4d))
+* **stdlib:** check the allocation limit as gsub copies matches ([#173](https://github.com/matjam/apogee/issues/173)) ([f13bb8a](https://github.com/matjam/apogee/commit/f13bb8aef07b5df413aabac47318aa50bd262ad3))
+
 ## [1.2.0](https://github.com/matjam/apogee/compare/v1.1.2...v1.2.0) (2026-10-15)
 
 

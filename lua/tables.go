@@ -26,6 +26,10 @@ type tableExtra struct {
 	buried        int         // how many of them a collection buried: see shape.buried
 	iterationKeys []hashValue // snapshot of hash keys for next
 	iterationNext int         // index in iterationKeys after the key next last returned
+	// resizeScanAt is how many entries the table must hold before
+	// maybeResizeArray scans for a key that isn't the next in the array,
+	// after a scan failed. See maybeResizeArray.
+	resizeScanAt int
 }
 
 // Tables with a few string keys are allocated together with their slots.
@@ -224,8 +228,27 @@ func (t *table) atInt(k int) value {
 	return t.hash[hashKey(integerValue(int64(k)))]
 }
 
+// maybeResizeArray extends the array part to take key, and the integer
+// keys in the hash part, if at least half the slots up to key would be in
+// use. It returns whether it did.
+//
+// Counting the slots in use scans the table, so two rules keep a table
+// filled one key at a time from scanning on every key, which would take
+// time in the square of its size:
+//   - the count can't reach key/2 when the whole table has fewer entries
+//     than that, so a large or sparse key, such as an ID, skips it;
+//   - after a scan fails, the next one waits until the table has doubled,
+//     unless key is the next slot after the array. Until then the keys go
+//     in the hash part, where they read the same; a later scan moves them.
 func (t *table) maybeResizeArray(l *State, key int) bool {
 	// Precondition: key > len(t.array).
+	entries := len(t.array) + len(t.hash)
+	if key/2 > entries {
+		return false
+	}
+	if key != len(t.array)+1 && t.extra != nil && entries < t.extra.resizeScanAt {
+		return false
+	}
 	occupancy := 0
 	for _, v := range t.array {
 		if !v.isNil() {
@@ -241,6 +264,7 @@ func (t *table) maybeResizeArray(l *State, key int) bool {
 		t.extendArray(l, max(occupancy*2, key)) // TODO Tune growth function.
 		return true
 	}
+	t.ext().resizeScanAt = 2 * entries
 	return false
 }
 

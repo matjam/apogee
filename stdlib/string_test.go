@@ -1,6 +1,8 @@
 package stdlib_test
 
 import (
+	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -204,6 +206,32 @@ func TestPatternMatchingRunsTheCountHook(t *testing.T) {
 				}
 			case <-time.After(10 * time.Second):
 				t.Fatal("the hook did not stop the match")
+			}
+		})
+	}
+}
+
+// A replacement that copies a long match many times stops at the
+// allocation limit, before building a result many times the limit.
+func TestGsubReplacementStaysWithinTheLimit(t *testing.T) {
+	for name, repl := range map[string]string{
+		"the match": `("%0"):rep(300)`,
+		"a capture": `("%1"):rep(300)`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			const limit = 4 << 20
+			l := lua.NewState()
+			stdlib.Open(l)
+			l.SetAllocationLimit(limit)
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			err := l.DoString(`local s = ("x"):rep(1 << 18); s:gsub("(.+)", ` + repl + `)`)
+			runtime.ReadMemStats(&after)
+			if !errors.Is(err, lua.ErrMemory) {
+				t.Fatalf("got %v, want ErrMemory", err)
+			}
+			if used := after.TotalAlloc - before.TotalAlloc; used > 4*limit {
+				t.Fatalf("gsub allocated %d MB under a %d MB limit", used>>20, limit>>20)
 			}
 		})
 	}

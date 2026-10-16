@@ -407,9 +407,17 @@ func (l *State) callFinalizer(o value) {
 
 // A collector marks the objects a Lua collection reaches.
 type collector struct {
-	marked     map[unsafe.Pointer]struct{}
-	cleared    int // weak entries removed
-	gray       []value
+	marked  map[unsafe.Pointer]struct{}
+	cleared int // weak entries removed
+	gray    []value
+	// waiting holds the values of ephemeron entries whose keys are not
+	// marked yet, by key, once convergeEphemerons has begun (converging).
+	// Marking a key moves its values to ready, which propagate marks. Each
+	// entry waits at most once, so marking ephemerons takes time in
+	// proportion to their entries, however their keys chain.
+	waiting    map[unsafe.Pointer][]value
+	ready      []value
+	converging bool
 	weakValues []*table // reached tables with weak values only
 	ephemerons []*table // with weak keys only
 	allWeak    []*table // with weak keys and values
@@ -438,11 +446,30 @@ func (c *collector) mark(v value) {
 	if !c.isMarked(v) {
 		c.marked[v.p] = struct{}{}
 		c.gray = append(c.gray, v)
+		if c.waiting != nil {
+			c.release(v)
+		}
 	}
 }
 
-// propagate traverses the objects marked but not yet traversed.
+// propagate traverses the objects marked but not yet traversed, and marks
+// the ephemeron values their keys' marking released.
 func (c *collector) propagate() {
+	for {
+		c.traverseGray()
+		if len(c.ready) == 0 {
+			return
+		}
+		ready := c.ready
+		c.ready = nil
+		for _, v := range ready {
+			c.mark(v)
+		}
+	}
+}
+
+// traverseGray traverses the objects marked but not yet traversed.
+func (c *collector) traverseGray() {
 	for len(c.gray) > 0 {
 		v := c.gray[len(c.gray)-1]
 		c.gray = c.gray[:len(c.gray)-1]
@@ -512,6 +539,8 @@ func (c *collector) traverseTable(t *table) {
 		t.forEach(func(k, v value) {
 			if c.isMarked(k) {
 				c.mark(v)
+			} else if c.converging {
+				c.wait(k, v)
 			}
 		})
 	default:
@@ -523,20 +552,43 @@ func (c *collector) traverseTable(t *table) {
 }
 
 // convergeEphemerons marks the values of ephemeron tables whose keys are
-// marked, until marking them reaches no more keys.
+// marked, until marking them reaches no more keys. The first call scans
+// the ephemeron tables found so far once, when the ordinary marking has
+// marked most keys, and leaves each entry whose key is still unmarked
+// waiting for it; tables found after that wait as they are traversed.
 func (c *collector) convergeEphemerons() {
-	for changed := true; changed; {
-		changed = false
-		for i := 0; i < len(c.ephemerons); i++ { // propagate may add some
-			c.ephemerons[i].forEach(func(k, v value) {
-				if c.isMarked(k) && !c.isMarked(v) {
+	if !c.converging {
+		c.converging = true
+		for _, t := range c.ephemerons {
+			t.forEach(func(k, v value) {
+				if c.isMarked(k) {
 					c.mark(v)
-					changed = true
+				} else {
+					c.wait(k, v)
 				}
 			})
-			c.propagate()
 		}
 	}
+	c.propagate()
+}
+
+// release readies the ephemeron values that were waiting for key k.
+func (c *collector) release(k value) {
+	if vs, ok := c.waiting[k.p]; ok {
+		delete(c.waiting, k.p)
+		c.ready = append(c.ready, vs...)
+	}
+}
+
+// wait leaves the ephemeron value v to be marked when its key k is.
+func (c *collector) wait(k, v value) {
+	if !collectable(v) {
+		return
+	}
+	if c.waiting == nil {
+		c.waiting = map[unsafe.Pointer][]value{}
+	}
+	c.waiting[k.p] = append(c.waiting[k.p], v)
 }
 
 // clearValues removes the entries of weak-valued tables whose values the
